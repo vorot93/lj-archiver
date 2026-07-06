@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            formats: deb,appimage
+          - os: macos-latest
+            formats: dmg
+          - os: windows-latest
+            formats: nsis,wix
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@main
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install AppImage runtime deps
+        if: runner.os == 'Linux'
+        # ubuntu-latest (24.04) renamed libfuse2 -> libfuse2t64; try both.
+        run: sudo apt-get update && (sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64)
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager
+
+      - name: Build GUI (release)
+        run: cargo build --release -p lj-archiver-gui
+
+      - name: Package installers
+        run: cargo packager --release -p lj-archiver-gui --formats ${{ matrix.formats }}
+
+      - name: List built artifacts
+        shell: bash
+        run: ls -la target/release/ || true
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/*.dmg
+            target/release/*.deb
+            target/release/*.AppImage
+            target/release/*-setup.exe
+            target/release/*.msi

@@ -1,0 +1,735 @@
+use scraper::{Html, Selector};
+use std::sync::LazyLock;
+use url::Url;
+
+use crate::{
+    client::LjClient,
+    error::{LjError, Result},
+    progress::Progress,
+};
+
+static ANCHOR_HREF: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("a[href]").expect("static selector must parse"));
+
+pub fn journal_calendar_url(journal: &str, base_url: &Url) -> Result<Url> {
+    validate_journal(journal)?;
+
+    if is_production_base_url(base_url) {
+        let calendar_url = if journal.contains('_') {
+            format!("https://users.livejournal.com/{journal}/calendar")
+        } else {
+            format!("https://{journal}.livejournal.com/calendar")
+        };
+        Url::parse(&calendar_url).map_err(|error| discovery_error(journal, error.to_string()))
+    } else {
+        base_url
+            .join(&format!("{journal}/calendar"))
+            .map_err(|error| discovery_error(journal, error.to_string()))
+    }
+}
+
+fn collect_archive_links(
+    html: &str,
+    base_url: &Url,
+    journal: &str,
+    is_expected: impl Fn(&str, &Url, &str) -> bool,
+) -> Vec<Url> {
+    let document = Html::parse_document(html);
+    let mut urls: Vec<_> = document
+        .select(&ANCHOR_HREF)
+        .filter_map(|element| element.value().attr("href"))
+        .filter_map(|href| base_url.join(href).ok())
+        .filter(|url| same_origin(url, base_url))
+        .filter(|url| is_expected(url.path(), base_url, journal))
+        .collect();
+
+    urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    urls.dedup();
+    urls
+}
+
+pub fn parse_month_links(html: &str, base_url: &Url, journal: &str) -> Vec<Url> {
+    collect_archive_links(html, base_url, journal, is_expected_month_path)
+}
+
+pub fn parse_year_links(html: &str, base_url: &Url, journal: &str) -> Vec<Url> {
+    collect_archive_links(html, base_url, journal, is_expected_year_path)
+}
+
+pub fn parse_post_ids(html: &str, base_url: &Url, journal: &str) -> Vec<u64> {
+    let document = Html::parse_document(html);
+    let mut ids: Vec<_> = document
+        .select(&ANCHOR_HREF)
+        .filter_map(|element| element.value().attr("href"))
+        .filter_map(|href| base_url.join(href).ok())
+        .filter_map(|url| post_id_from_url(&url, base_url, journal))
+        .collect();
+
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Discovers post IDs by walking the journal's calendar, its per-year pages,
+/// and the month pages linked from them.
+///
+/// The calendar links months directly for the current year (and, on small or
+/// legacy journals, for every year), plus one link per year. Older years are
+/// reached by fetching each year page and reading its month links. Year links
+/// are read from the calendar only — year pages re-expose the whole year nav,
+/// so recursing would re-crawl every year.
+///
+/// Returns the discovered post IDs and the number of archive pages (year or
+/// month) that failed to fetch (0 when every attempted page succeeded). A page
+/// failure is surfaced as `Err` only when it left discovery with no month pages
+/// to read at all, or when every attempted month page failed; otherwise the
+/// failure count is returned so callers can still exit nonzero on a partial
+/// discovery failure.
+pub async fn discover_post_ids(
+    client: &LjClient,
+    journal: &str,
+    base_url: &Url,
+    progress: &Progress,
+) -> Result<(Vec<u64>, usize)> {
+    let calendar_url = journal_calendar_url(journal, base_url)?;
+    let calendar_html = client.fetch_text(&calendar_url).await?;
+
+    let mut month_urls = parse_month_links(&calendar_html, &calendar_url, journal);
+    let year_urls = parse_year_links(&calendar_html, &calendar_url, journal);
+
+    let mut ids = Vec::new();
+    let mut year_failed = 0usize;
+    for year_url in year_urls {
+        match client.fetch_text(&year_url).await {
+            Ok(year_html) => {
+                month_urls.extend(parse_month_links(&year_html, &year_url, journal));
+                progress.discovery_tick(year_url.path(), month_urls.len());
+            }
+            Err(error) => {
+                year_failed += 1;
+                tracing::warn!(url = %year_url, %error, "skipping year page after fetch failure");
+            }
+        }
+    }
+
+    month_urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    month_urls.dedup();
+
+    if month_urls.is_empty() {
+        if year_failed > 0 {
+            return Err(discovery_error(
+                journal,
+                "all archive pages failed to fetch",
+            ));
+        }
+        return Ok((Vec::new(), 0));
+    }
+
+    let mut attempted = 0usize;
+    let mut month_failed = 0usize;
+    for month_url in month_urls {
+        attempted += 1;
+        match client.fetch_text(&month_url).await {
+            Ok(month_html) => {
+                ids.extend(parse_post_ids(&month_html, &month_url, journal));
+                progress.discovery_tick(month_url.path(), ids.len());
+            }
+            Err(error) => {
+                month_failed += 1;
+                tracing::warn!(url = %month_url, %error, "skipping month page after fetch failure");
+            }
+        }
+    }
+    if month_failed == attempted {
+        return Err(discovery_error(journal, "all month pages failed to fetch"));
+    }
+
+    ids.sort_unstable();
+    ids.dedup();
+    Ok((ids, year_failed + month_failed))
+}
+
+fn is_production_base_url(base_url: &Url) -> bool {
+    base_url.scheme() == "https" && base_url.host_str() == Some("livejournal.com")
+}
+
+fn validate_journal(journal: &str) -> Result<()> {
+    if crate::target::is_valid_journal_name(journal) {
+        Ok(())
+    } else {
+        Err(discovery_error(
+            journal,
+            "journal name contains unsupported characters",
+        ))
+    }
+}
+
+fn is_month_path(path: &str) -> bool {
+    // Matches only the observed LiveJournal shape: /YYYY/MM/ (9 bytes total).
+    // Note: is_expected_month_path extends this to handle the users.livejournal.com
+    // prefix form (/journal/YYYY/MM/) where journal is part of the path. If a real
+    // calendar links month URLs in a different shape, this check would need widening.
+    let bytes = path.as_bytes();
+    bytes.len() == 9
+        && bytes[0] == b'/'
+        && bytes[5] == b'/'
+        && bytes[8] == b'/'
+        && bytes[1..5].iter().all(|byte| byte.is_ascii_digit())
+        && bytes[6..8].iter().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_expected_month_path(path: &str, base_url: &Url, journal: &str) -> bool {
+    if is_month_path(path) {
+        return true;
+    }
+    // users.livejournal.com links month/year pages under a /<journal> prefix, on
+    // both the calendar and the per-year pages. The journal is known by the caller
+    // (like parse_post_ids), so strip it directly rather than requiring a /calendar base.
+    if is_users_livejournal_url(base_url) {
+        let prefix = format!("/{journal}");
+        return path.strip_prefix(&prefix).is_some_and(is_month_path);
+    }
+    false
+}
+
+fn is_year_path(path: &str) -> bool {
+    // Matches only the observed LiveJournal shape: /YYYY/ (6 bytes total).
+    let bytes = path.as_bytes();
+    bytes.len() == 6
+        && bytes[0] == b'/'
+        && bytes[5] == b'/'
+        && bytes[1..5].iter().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_expected_year_path(path: &str, base_url: &Url, journal: &str) -> bool {
+    if is_year_path(path) {
+        return true;
+    }
+    if is_users_livejournal_url(base_url) {
+        let prefix = format!("/{journal}");
+        return path.strip_prefix(&prefix).is_some_and(is_year_path);
+    }
+    false
+}
+
+fn post_id_from_url(url: &Url, base_url: &Url, journal: &str) -> Option<u64> {
+    let host = url.host_str()?;
+    let journal_host = format!("{journal}.livejournal.com");
+
+    if host.eq_ignore_ascii_case(&journal_host) {
+        id_from_root_post_path(url.path())
+    } else if host.eq_ignore_ascii_case("users.livejournal.com") {
+        id_from_users_post_path(url.path(), journal)
+    } else if crate::net::is_loopback_test_server(base_url) && same_origin(url, base_url) {
+        id_from_test_server_post_path(url.path(), journal)
+    } else {
+        None
+    }
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && hosts_equal(left.host_str(), right.host_str())
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn hosts_equal(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+fn is_users_livejournal_url(url: &Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("users.livejournal.com"))
+}
+
+fn id_from_root_post_path(path: &str) -> Option<u64> {
+    let id = path.strip_prefix('/')?.strip_suffix(".html")?;
+    parse_positive_id(id)
+}
+
+fn id_from_users_post_path(path: &str, journal: &str) -> Option<u64> {
+    let prefix = format!("/{journal}/");
+    let id = path.strip_prefix(&prefix)?.strip_suffix(".html")?;
+    parse_positive_id(id)
+}
+
+fn id_from_test_server_post_path(path: &str, journal: &str) -> Option<u64> {
+    id_from_users_post_path(path, journal).or_else(|| id_from_root_post_path(path))
+}
+
+fn parse_positive_id(value: &str) -> Option<u64> {
+    if value.is_empty() || value.contains('/') {
+        return None;
+    }
+
+    let id = value.parse::<u64>().ok()?;
+    (id > 0).then_some(id)
+}
+
+fn discovery_error(journal: &str, reason: impl Into<String>) -> LjError {
+    LjError::Discovery {
+        journal: journal.to_string(),
+        reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_month_links_from_calendar() {
+        let base = Url::parse("https://news.livejournal.com/calendar").unwrap();
+        let months = parse_month_links(
+            include_str!("../tests/fixtures/journal_calendar.html"),
+            &base,
+            "news",
+        );
+        assert_eq!(
+            months,
+            vec![
+                Url::parse("https://news.livejournal.com/2024/12/").unwrap(),
+                Url::parse("https://news.livejournal.com/2025/01/").unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_post_ids_from_month() {
+        let base = Url::parse("https://news.livejournal.com/2024/12/").unwrap();
+        let ids = parse_post_ids(
+            include_str!("../tests/fixtures/journal_month.html"),
+            &base,
+            "news",
+        );
+        assert_eq!(ids, vec![166511, 166512]);
+    }
+
+    #[test]
+    fn builds_production_calendar_url() {
+        let base = Url::parse("https://livejournal.com").unwrap();
+        let url = journal_calendar_url("news", &base).unwrap();
+        assert_eq!(url.as_str(), "https://news.livejournal.com/calendar");
+    }
+
+    #[test]
+    fn builds_production_calendar_url_for_underscore_journal() {
+        let base = Url::parse("https://livejournal.com").unwrap();
+        let url = journal_calendar_url("example_user", &base).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://users.livejournal.com/example_user/calendar"
+        );
+    }
+
+    #[test]
+    fn builds_test_server_calendar_url() {
+        let base = Url::parse("http://127.0.0.1:4567").unwrap();
+        let url = journal_calendar_url("news", &base).unwrap();
+        assert_eq!(url.as_str(), "http://127.0.0.1:4567/news/calendar");
+    }
+
+    #[test]
+    fn ignores_off_journal_month_links() {
+        let base = Url::parse("https://news.livejournal.com/calendar").unwrap();
+        let months = parse_month_links(
+            r#"<a href="https://elsewhere.example/2024/12/">x</a>"#,
+            &base,
+            "news",
+        );
+        assert!(months.is_empty());
+    }
+
+    #[test]
+    fn parses_month_links_from_underscore_journal_calendar() {
+        let base = Url::parse("https://users.livejournal.com/example_user/calendar").unwrap();
+        let months = parse_month_links(
+            r#"<a href="/example_user/2024/12/">December</a>"#,
+            &base,
+            "example_user",
+        );
+        assert_eq!(
+            months,
+            vec![Url::parse("https://users.livejournal.com/example_user/2024/12/").unwrap()]
+        );
+    }
+
+    #[test]
+    fn parses_month_links_from_underscore_journal_year_page() {
+        // Regression (final-review Important #1): on a users.livejournal.com journal the
+        // month links are the prefixed form /<journal>/YYYY/MM/ and appear on YEAR pages
+        // whose base path is /<journal>/YYYY/ (NOT /calendar). Discovery must still extract
+        // them — previously they were dropped because the journal was recoverable only from
+        // a /calendar base, so underscore journals silently archived only the current year.
+        let base = Url::parse("https://users.livejournal.com/example_user/2012/").unwrap();
+        let months = parse_month_links(
+            r#"<a href="/example_user/2012/07/">July</a>"#,
+            &base,
+            "example_user",
+        );
+        assert_eq!(
+            months,
+            vec![Url::parse("https://users.livejournal.com/example_user/2012/07/").unwrap()]
+        );
+    }
+
+    #[test]
+    fn ignores_test_server_post_paths_on_production_hosts() {
+        let base = Url::parse("https://elsewhere.example/2024/12/").unwrap();
+        let ids = parse_post_ids(r#"<a href="/news/166512.html">post</a>"#, &base, "news");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn parses_post_ids_from_users_journal_month() {
+        let base = Url::parse("https://users.livejournal.com/example_user/2024/12/").unwrap();
+        let ids = parse_post_ids(
+            r#"<a href="/example_user/166512.html">post</a>"#,
+            &base,
+            "example_user",
+        );
+        assert_eq!(ids, vec![166512]);
+    }
+
+    #[test]
+    fn accepts_test_server_post_paths_on_loopback_hosts() {
+        let base = Url::parse("http://127.0.0.1:4567/2024/12/").unwrap();
+        let ids = parse_post_ids(r#"<a href="/news/166512.html">post</a>"#, &base, "news");
+        assert_eq!(ids, vec![166512]);
+    }
+
+    #[test]
+    fn accepts_root_post_paths_on_loopback_hosts() {
+        let base = Url::parse("http://127.0.0.1:4567/2024/12/").unwrap();
+        let ids = parse_post_ids(r#"<a href="/166511.html">post</a>"#, &base, "news");
+        assert_eq!(ids, vec![166511]);
+    }
+
+    #[tokio::test]
+    async fn discovers_post_ids_from_calendar_months() {
+        use crate::client::LjClient;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/2024/12/">December 2024</a><a href="/2025/01/">January 2025</a>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/news/166512.html">two</a><a href="/news/166511.html">one</a>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2025/01/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/news/166512.html">duplicate</a><a href="/profile">Profile</a>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let client = LjClient::new(None).unwrap();
+        let base = Url::parse(&server.uri()).unwrap();
+        let (ids, failed_months) = discover_post_ids(&client, "news", &base, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec![166511, 166512]);
+        assert_eq!(failed_months, 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_continues_past_failed_month() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/2024/12/">Dec</a><a href="/2025/01/">Jan</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/news/166511.html">one</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2025/01/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = LjClient::new(None).unwrap();
+        let base = Url::parse(&server.uri()).unwrap();
+        let (ids, failed_months) = discover_post_ids(&client, "news", &base, &Progress::hidden())
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![166511]);
+        assert_eq!(failed_months, 1);
+    }
+
+    #[tokio::test]
+    async fn errors_when_all_month_pages_fail() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/2024/12/">Dec</a><a href="/2025/01/">Jan</a>"#),
+            )
+            .mount(&server)
+            .await;
+        // Both month pages fail => total failure.
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2025/01/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = LjClient::new(None).unwrap();
+        let base = Url::parse(&server.uri()).unwrap();
+        let result = discover_post_ids(&client, "news", &base, &Progress::hidden()).await;
+        assert!(
+            matches!(result, Err(LjError::Discovery { .. })),
+            "all month pages failing must surface as a total-failure error, not Ok(empty)"
+        );
+    }
+
+    #[test]
+    fn is_year_path_matches_only_bare_year() {
+        assert!(is_year_path("/2024/"));
+        assert!(!is_year_path("/2024/12/"));
+        assert!(!is_year_path("/abc/"));
+        assert!(!is_year_path("/24/"));
+        assert!(!is_year_path("/2024"));
+    }
+
+    #[test]
+    fn parses_year_links_from_calendar() {
+        let base = Url::parse("https://news.livejournal.com/calendar").unwrap();
+        let years = parse_year_links(
+            r#"<a href="/2011/">2011</a><a href="/2012/">2012</a><a href="/2012/07/">July</a>"#,
+            &base,
+            "news",
+        );
+        assert_eq!(
+            years,
+            vec![
+                Url::parse("https://news.livejournal.com/2011/").unwrap(),
+                Url::parse("https://news.livejournal.com/2012/").unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_year_links_ignores_month_and_offsite_links() {
+        let base = Url::parse("https://news.livejournal.com/calendar").unwrap();
+        let years = parse_year_links(
+            r#"<a href="/2012/07/">month</a><a href="https://elsewhere.example/2011/">off</a>"#,
+            &base,
+            "news",
+        );
+        assert!(years.is_empty());
+    }
+
+    #[test]
+    fn parses_year_links_from_underscore_journal_calendar() {
+        let base = Url::parse("https://users.livejournal.com/example_user/calendar").unwrap();
+        let years = parse_year_links(
+            r#"<a href="/example_user/2012/">2012</a>"#,
+            &base,
+            "example_user",
+        );
+        assert_eq!(
+            years,
+            vec![Url::parse("https://users.livejournal.com/example_user/2012/").unwrap()]
+        );
+    }
+
+    #[test]
+    fn parses_years_and_current_months_from_real_shape_calendar() {
+        let base = Url::parse("https://example.livejournal.com/calendar").unwrap();
+        let html = include_str!("../tests/fixtures/journal_calendar_years.html");
+        let years = parse_year_links(html, &base, "example");
+        let months = parse_month_links(html, &base, "example");
+        assert_eq!(
+            years,
+            vec![
+                Url::parse("https://example.livejournal.com/2011/").unwrap(),
+                Url::parse("https://example.livejournal.com/2012/").unwrap(),
+                Url::parse("https://example.livejournal.com/2013/").unwrap(),
+            ]
+        );
+        assert_eq!(
+            months,
+            vec![
+                Url::parse("https://example.livejournal.com/2013/06/").unwrap(),
+                Url::parse("https://example.livejournal.com/2013/07/").unwrap(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovers_post_ids_across_year_pages() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        // Calendar: two YEAR links + one current-year MONTH link (also under /2012/).
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/2011/">2011</a><a href="/2012/">2012</a><a href="/2012/07/">Jul</a>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2011/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2011/03/">Mar</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2012/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2012/07/">Jul</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2011/03/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/111.html">a</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2012/07/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/222.html">b</a>"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LjClient::new(None).unwrap();
+        let base = Url::parse(&server.uri()).unwrap();
+        let (ids, failed) = discover_post_ids(&client, "news", &base, &Progress::hidden())
+            .await
+            .unwrap();
+
+        // /2012/07/ is linked both directly and via the year page: deduped, fetched once.
+        assert_eq!(ids, vec![111, 222]);
+        assert_eq!(failed, 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_continues_past_failed_year_page() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/2011/">2011</a><a href="/2012/">2012</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2011/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2012/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2012/07/">Jul</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2012/07/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/222.html">b</a>"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = LjClient::new(None).unwrap();
+        let base = Url::parse(&server.uri()).unwrap();
+        let (ids, failed) = discover_post_ids(&client, "news", &base, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec![222]);
+        assert_eq!(failed, 1);
+    }
+
+    #[tokio::test]
+    async fn errors_when_all_year_pages_fail_with_no_direct_months() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        // Calendar has only year links (no direct month links); every year page fails.
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/2011/">2011</a><a href="/2012/">2012</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2011/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2012/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = LjClient::new(None).unwrap();
+        let base = Url::parse(&server.uri()).unwrap();
+        let result = discover_post_ids(&client, "news", &base, &Progress::hidden()).await;
+
+        assert!(
+            matches!(result, Err(LjError::Discovery { .. })),
+            "reaching no month pages because all year pages failed must be a discovery error"
+        );
+    }
+}

@@ -1,0 +1,864 @@
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
+
+use futures::{StreamExt, stream};
+use url::Url;
+
+use crate::{
+    Result,
+    adoc::render_post,
+    archive::Archive,
+    cli::Cli,
+    client::LjClient,
+    discover::discover_post_ids,
+    error::LjError,
+    links::LinkRewriter,
+    media::rewrite_inline_media,
+    models::{ArchiveTarget, ArchivedPost, Post, PostFailure, RunOptions},
+    parser::parse_post_page,
+    progress::Progress,
+    target::{journal_base_url, parse_target, post_url},
+};
+
+/// The result of a completed archive run. `Ok(RunOutcome)` means the run wrote
+/// what it could; a journal run with some failed posts/pages still returns
+/// `Ok` with the counts here. Only a hard failure (target parse, single-post
+/// fetch/parse, discovery navigation) yields `Err`.
+#[derive(Debug, Clone)]
+pub struct RunOutcome {
+    pub root: PathBuf,
+    pub archived: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub failed_pages: usize,
+    pub failures: Vec<PostFailure>,
+    pub journal: Option<String>,
+}
+
+pub async fn run(cli: Cli) -> Result<()> {
+    crate::progress::init_logging(cli.verbose, cli.quiet);
+    let progress = Progress::detect(cli.quiet);
+    let options = cli.options();
+    let outcome = run_archive(&cli.target, &options, &progress).await?;
+
+    if outcome.failed_pages == 0 && outcome.failures.is_empty() {
+        Ok(())
+    } else {
+        Err(LjError::Discovery {
+            journal: outcome.journal.unwrap_or_default(),
+            reason: failure_reason(outcome.failed_pages, &outcome.failures),
+        })
+    }
+}
+
+/// Parse `target` and archive it. Reusable by the CLI and the GUI. See
+/// [`RunOutcome`] for the partial-failure contract.
+pub async fn run_archive(
+    target: &str,
+    options: &RunOptions,
+    progress: &Progress,
+) -> Result<RunOutcome> {
+    match parse_target(target, options.journal_context.as_deref())? {
+        ArchiveTarget::Post { journal, id, url } => {
+            archive_post(options, progress, journal, id, url).await
+        }
+        ArchiveTarget::Journal { journal } => archive_journal(options, progress, journal).await,
+    }
+}
+
+async fn archive_post(
+    options: &RunOptions,
+    progress: &Progress,
+    journal: String,
+    id: u64,
+    url: Url,
+) -> Result<RunOutcome> {
+    progress.single_started(id);
+    let client = LjClient::new(options.user_agent.as_deref())?;
+    let root = output_dir(options, &journal);
+    let archive = Archive::new(root.clone(), journal);
+    let post = fetch_and_write_post(&client, options, &archive, url, None).await?;
+    progress.single_done(post.id, &post.path);
+    archive.write_index(&[post])?;
+
+    Ok(RunOutcome {
+        root,
+        archived: 1,
+        skipped: 0,
+        failed: 0,
+        failed_pages: 0,
+        failures: Vec::new(),
+        journal: None,
+    })
+}
+
+async fn archive_journal(
+    options: &RunOptions,
+    progress: &Progress,
+    journal: String,
+) -> Result<RunOutcome> {
+    let start = std::time::Instant::now();
+    let client = LjClient::new(options.user_agent.as_deref())?;
+    let root = output_dir(options, &journal);
+    let archive = Archive::new(root.clone(), journal.clone());
+
+    progress.discovery_started();
+    let (ids, failed_pages) =
+        discover_post_ids(&client, &journal, &options.base_url, progress).await?;
+    progress.archiving_started(ids.len());
+
+    let id_set: HashSet<u64> = ids.iter().copied().collect();
+    let rewriter = Arc::new(LinkRewriter::new(
+        journal.clone(),
+        id_set,
+        journal_base_url(&journal)?,
+    ));
+
+    let outcomes: Vec<_> = stream::iter(ids)
+        .map(|id| {
+            let archive = archive.clone();
+            let client = client.clone();
+            let journal = journal.clone();
+            let options = options.clone();
+            let rewriter = Arc::clone(&rewriter);
+            let progress = progress.clone();
+
+            async move {
+                archive_journal_post(
+                    client,
+                    options,
+                    archive,
+                    journal,
+                    id,
+                    Some(rewriter),
+                    &progress,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(options.concurrency)
+        .collect()
+        .await;
+
+    progress.archiving_finished();
+
+    let mut posts = Vec::new();
+    let mut failures = Vec::new();
+    let mut skipped = 0usize;
+    for outcome in outcomes {
+        match outcome {
+            JournalPostOutcome::Archived(post) => posts.push(post),
+            JournalPostOutcome::Skipped(post) => {
+                skipped += 1;
+                posts.push(post);
+            }
+            JournalPostOutcome::Failed(failure) => failures.push(failure),
+        }
+    }
+
+    posts.sort_by_key(|post| post.id);
+    failures.sort_by_key(|failure| failure.id);
+    archive.write_index(&posts)?;
+
+    for failure in &failures {
+        eprintln!(
+            "failed to archive post {} ({}): {}",
+            failure.id, failure.url, failure.message
+        );
+    }
+
+    let archived = posts.len() - skipped;
+    progress.summary(archived, skipped, failures.len(), start.elapsed());
+
+    Ok(RunOutcome {
+        root,
+        archived,
+        skipped,
+        failed: failures.len(),
+        failed_pages,
+        failures,
+        journal: Some(journal),
+    })
+}
+
+async fn archive_journal_post(
+    client: LjClient,
+    options: RunOptions,
+    archive: Archive,
+    journal: String,
+    id: u64,
+    rewriter: Option<Arc<LinkRewriter>>,
+    progress: &Progress,
+) -> JournalPostOutcome {
+    if options.resume && archive.post_exists(id) {
+        let title = archived_post_title(&archive, id).unwrap_or_else(|| format!("Post {id}"));
+        progress.post_skipped(id);
+        return JournalPostOutcome::Skipped(ArchivedPost {
+            id,
+            title,
+            path: archive.post_path(id),
+        });
+    }
+
+    let url = match journal_post_url(&journal, id, &options.base_url) {
+        Ok(url) => url,
+        Err(error) => {
+            progress.post_failed(id);
+            return JournalPostOutcome::Failed(PostFailure {
+                id,
+                url: options.base_url,
+                message: error.to_string(),
+            });
+        }
+    };
+
+    match fetch_and_write_post(
+        &client,
+        &options,
+        &archive,
+        url.clone(),
+        rewriter.as_deref(),
+    )
+    .await
+    {
+        Ok(post) => {
+            progress.post_done(post.id, &post.title);
+            JournalPostOutcome::Archived(post)
+        }
+        Err(error) => {
+            progress.post_failed(id);
+            JournalPostOutcome::Failed(PostFailure {
+                id,
+                url,
+                message: error.to_string(),
+            })
+        }
+    }
+}
+
+fn archived_post_title(archive: &Archive, id: u64) -> Option<String> {
+    let contents = std::fs::read_to_string(archive.post_path(id)).ok()?;
+    let title = contents.lines().next()?.strip_prefix("= ")?.trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+async fn fetch_and_write_post(
+    client: &LjClient,
+    options: &RunOptions,
+    archive: &Archive,
+    url: Url,
+    link_rewriter: Option<&LinkRewriter>,
+) -> Result<ArchivedPost> {
+    let html = client.fetch_text(&url).await?;
+    let mut post = parse_post_page(&html, &url)?;
+    rewrite_post_media(&mut post, options, archive).await?;
+    let rendered = render_post(&post, options.include_comments, link_rewriter);
+    let path = archive.write_post(post.id, &rendered)?;
+
+    Ok(ArchivedPost {
+        id: post.id,
+        title: post.title.clone(),
+        path,
+    })
+}
+
+fn output_dir(options: &RunOptions, journal: &str) -> std::path::PathBuf {
+    options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("archive").join(journal))
+}
+
+fn journal_post_url(journal: &str, id: u64, base_url: &Url) -> Result<Url> {
+    if crate::net::is_loopback_test_server(base_url) {
+        return base_url
+            .join(&format!("{journal}/{id}.html"))
+            .map_err(|error| LjError::Discovery {
+                journal: journal.to_string(),
+                reason: error.to_string(),
+            });
+    }
+
+    post_url(journal, id)
+}
+
+fn failure_summary(failures: &[PostFailure]) -> String {
+    let ids = failures
+        .iter()
+        .map(|failure| failure.id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{} post(s) failed: {ids}", failures.len())
+}
+
+/// Builds the combined discovery-error reason from archive-page failures
+/// and/or post failures. Callers must only invoke this when at least one of
+/// `failed_pages` or `failures` is non-empty.
+fn failure_reason(failed_pages: usize, failures: &[PostFailure]) -> String {
+    debug_assert!(failed_pages > 0 || !failures.is_empty());
+
+    let mut reasons = Vec::new();
+    if failed_pages > 0 {
+        reasons.push(format!(
+            "{failed_pages} archive page(s) failed to fetch; archive may be incomplete"
+        ));
+    }
+    if !failures.is_empty() {
+        reasons.push(failure_summary(failures));
+    }
+    reasons.join("; ")
+}
+
+enum JournalPostOutcome {
+    Archived(ArchivedPost),
+    Skipped(ArchivedPost),
+    Failed(PostFailure),
+}
+
+async fn rewrite_post_media(
+    post: &mut Post,
+    options: &RunOptions,
+    archive: &Archive,
+) -> Result<()> {
+    let assets_dir = archive.assets_dir();
+
+    let rewritten = rewrite_inline_media(
+        &post.body_html,
+        &post.url,
+        &assets_dir,
+        options.download_media,
+        options.user_agent.as_deref(),
+    )
+    .await?;
+    post.body_html = rewritten.html;
+
+    if options.include_comments {
+        for comment in &mut post.comments {
+            let rewritten = rewrite_inline_media(
+                &comment.body_html,
+                &post.url,
+                &assets_dir,
+                options.download_media,
+                options.user_agent.as_deref(),
+            )
+            .await?;
+            comment.body_html = rewritten.html;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{archive::Archive, cli::Cli};
+    use tempfile::tempdir;
+    use url::Url;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[test]
+    fn failure_reason_reports_failed_archive_pages() {
+        let reason = failure_reason(2, &[]);
+        assert!(
+            reason.contains("2 archive page(s) failed to fetch"),
+            "unexpected reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn reads_archived_title_from_post_file() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        archive
+            .write_post(166511, "= Real Title\n\n:lj-id: 166511\n")
+            .unwrap();
+        assert_eq!(
+            archived_post_title(&archive, 166511).as_deref(),
+            Some("Real Title")
+        );
+        assert_eq!(archived_post_title(&archive, 999999), None);
+    }
+
+    #[tokio::test]
+    async fn archives_single_post_from_local_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/166511.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/post_basic.html")),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let cli = Cli {
+            target: format!("{}/news/166511.html", server.uri()),
+            output_dir: Some(dir.path().join("out")),
+            no_comments: false,
+            no_media: true,
+            concurrency: 2,
+            resume: false,
+            journal: None,
+            verbose: false,
+            quiet: false,
+            user_agent: None,
+            base_url: Url::parse(&server.uri()).unwrap(),
+        };
+
+        run(cli).await.unwrap();
+
+        let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
+        assert!(post.contains("= Post Title"));
+        assert!(post.contains("Hello *world*."));
+    }
+
+    #[tokio::test]
+    async fn archives_journal_and_skips_existing_posts_with_resume() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/journal_calendar.html")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/journal_month.html")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/166511.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/post_basic.html")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/166512.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/post_with_comments.html")),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let cli = Cli {
+            target: "news".to_string(),
+            output_dir: Some(dir.path().join("out")),
+            no_comments: false,
+            no_media: true,
+            concurrency: 2,
+            resume: true,
+            journal: None,
+            verbose: false,
+            quiet: false,
+            user_agent: None,
+            base_url: Url::parse(&server.uri()).unwrap(),
+        };
+
+        run(cli).await.unwrap();
+
+        assert!(dir.path().join("out/posts/166511.adoc").exists());
+        assert!(dir.path().join("out/posts/166512.adoc").exists());
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert!(index.contains("xref:posts/166511.adoc"));
+        assert!(index.contains("xref:posts/166512.adoc"));
+    }
+
+    #[tokio::test]
+    async fn resume_skips_existing_journal_posts_without_fetching_them() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/2024/12/">December 2024</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/news/166511.html">Existing</a><a href="/news/166512.html">New</a>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/166512.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/post_with_comments.html")),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let existing_post = dir.path().join("out/posts/166511.adoc");
+        std::fs::create_dir_all(existing_post.parent().unwrap()).unwrap();
+        std::fs::write(&existing_post, "= Existing\n\nBody\n").unwrap();
+        let cli = journal_cli(&server, dir.path(), true);
+
+        run(cli).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&existing_post).unwrap(),
+            "= Existing\n\nBody\n"
+        );
+        assert!(dir.path().join("out/posts/166512.adoc").exists());
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert!(index.contains("xref:posts/166511.adoc[Existing]"));
+        assert!(index.contains("xref:posts/166512.adoc"));
+
+        let requests = server.received_requests().await.unwrap();
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(!paths.contains(&"/news/166511.html".to_string()));
+        assert!(paths.contains(&"/news/166512.html".to_string()));
+    }
+
+    #[tokio::test]
+    async fn journal_archiving_continues_after_post_failure_and_summarizes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/2024/12/">December 2024</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/news/166511.html">Good</a><a href="/news/166512.html">Bad</a>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/166511.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/post_basic.html")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/166512.html"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let cli = journal_cli(&server, dir.path(), false);
+
+        let error = run(cli).await.unwrap_err();
+
+        match error {
+            LjError::Discovery { journal, reason } => {
+                assert_eq!(journal, "news");
+                assert!(reason.contains("1 post(s) failed"));
+                assert!(reason.contains("166512"));
+            }
+            other => panic!("expected discovery error, got {other:?}"),
+        }
+        assert!(dir.path().join("out/posts/166511.adoc").exists());
+        assert!(!dir.path().join("out/posts/166512.adoc").exists());
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert!(index.contains("xref:posts/166511.adoc"));
+        assert!(!index.contains("xref:posts/166512.adoc"));
+    }
+
+    #[tokio::test]
+    async fn run_archive_returns_outcome_for_single_post() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/166511.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/post_basic.html")),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let options = RunOptions {
+            output_dir: Some(dir.path().join("out")),
+            include_comments: true,
+            download_media: false,
+            concurrency: 2,
+            resume: false,
+            journal_context: None,
+            user_agent: None,
+            base_url: Url::parse(&server.uri()).unwrap(),
+        };
+        let progress = Progress::hidden();
+
+        let outcome = run_archive(
+            &format!("{}/news/166511.html", server.uri()),
+            &options,
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.root, dir.path().join("out"));
+    }
+
+    #[tokio::test]
+    async fn run_archive_is_ok_with_failed_count_on_partial_journal_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/news/166511.html">Good</a><a href="/news/166512.html">Bad</a>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/166511.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("../tests/fixtures/post_basic.html")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/166512.html"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let options = RunOptions {
+            output_dir: Some(dir.path().join("out")),
+            include_comments: true,
+            download_media: true,
+            concurrency: 2,
+            resume: false,
+            journal_context: None,
+            user_agent: None,
+            base_url: Url::parse(&server.uri()).unwrap(),
+        };
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.failed, 1);
+        assert!(outcome.failures.iter().any(|f| f.id == 166512));
+        assert_eq!(outcome.journal.as_deref(), Some("news"));
+        assert!(dir.path().join("out/posts/166511.adoc").exists());
+    }
+
+    #[test]
+    fn builds_users_livejournal_post_url_for_underscore_journal() {
+        let base_url = Url::parse("https://livejournal.com").unwrap();
+        let url = journal_post_url("example_user", 166511, &base_url).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://users.livejournal.com/example_user/166511.html"
+        );
+    }
+
+    #[tokio::test]
+    async fn archives_single_post_media_relative_to_post_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/166511.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "166511",
+                r#"<p>Post image <img src="pic.jpg" alt="Picture"></p>"#,
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/pic.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let cli = test_cli(&server, dir.path(), "166511", false, false);
+
+        run(cli).await.unwrap();
+
+        let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
+        assert!(post.contains("../assets/"));
+        assert!(
+            !post.contains("../assets/166511/"),
+            "asset ref must have no per-post segment: {post}"
+        );
+        assert!(
+            !dir.path().join("out/assets/166511").exists(),
+            "assets are flat, no per-post subdir"
+        );
+        assert!(asset_dir_entries(dir.path().join("out/assets")).len() == 1);
+    }
+
+    #[tokio::test]
+    async fn skips_comment_media_rewriting_when_comments_are_disabled() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/166512.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "166512",
+                "<p>Post body.</p>",
+                r#"
+                <div id="comments">
+                  <div class="comment" id="t1">
+                    <span class="comment-author">reader</span>
+                    <div class="comment-content">
+                      <p>Comment image <img src="comment.jpg" alt="Comment picture"></p>
+                    </div>
+                  </div>
+                </div>
+                "#,
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let cli = test_cli(&server, dir.path(), "166512", true, false);
+
+        run(cli).await.unwrap();
+
+        let post = std::fs::read_to_string(dir.path().join("out/posts/166512.adoc")).unwrap();
+        assert!(!post.contains("== Comments"));
+        assert!(!post.contains("reader"));
+        assert!(!dir.path().join("out/assets/166512").exists());
+
+        let requests = server.received_requests().await.unwrap();
+        let paths: Vec<_> = requests.iter().map(|request| request.url.path()).collect();
+        assert_eq!(paths, vec!["/news/166512.html"]);
+    }
+
+    #[tokio::test]
+    async fn rewrites_in_journal_links_to_xref_on_bulk_export() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/news/166511.html">a</a><a href="/news/166512.html">b</a>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/166511.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "166511",
+                r#"<p>Link to <a href="https://news.livejournal.com/166512.html">the other</a>.</p>"#,
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/166512.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "166512",
+                "<p>Other body.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let cli = journal_cli(&server, dir.path(), false);
+        run(cli).await.unwrap();
+
+        let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
+        assert!(post.contains("xref:166512.adoc[the other]"), "got: {post}");
+        assert!(
+            !post.contains("news.livejournal.com/166512.html"),
+            "got: {post}"
+        );
+    }
+
+    fn test_cli(
+        server: &MockServer,
+        temp_dir: &std::path::Path,
+        post_id: &str,
+        no_comments: bool,
+        no_media: bool,
+    ) -> Cli {
+        Cli {
+            target: format!("{}/news/{post_id}.html", server.uri()),
+            output_dir: Some(temp_dir.join("out")),
+            no_comments,
+            no_media,
+            concurrency: 2,
+            resume: false,
+            journal: None,
+            verbose: false,
+            quiet: false,
+            user_agent: None,
+            base_url: Url::parse(&server.uri()).unwrap(),
+        }
+    }
+
+    fn journal_cli(server: &MockServer, temp_dir: &std::path::Path, resume: bool) -> Cli {
+        Cli {
+            target: "news".to_string(),
+            output_dir: Some(temp_dir.join("out")),
+            no_comments: false,
+            no_media: true,
+            concurrency: 2,
+            resume,
+            journal: None,
+            verbose: false,
+            quiet: false,
+            user_agent: None,
+            base_url: Url::parse(&server.uri()).unwrap(),
+        }
+    }
+
+    fn post_html(id: &str, body_html: &str, comments_html: &str) -> String {
+        format!(
+            r#"<!doctype html>
+<html>
+  <head><title>Post Title</title></head>
+  <body>
+    <article class="lj-post" data-journal="news" data-itemid="{id}">
+      <h1 class="entry-title">Post Title</h1>
+      <a class="entry-author" href="https://news.livejournal.com/">news</a>
+      <div class="entry-content">{body_html}</div>
+    </article>
+    {comments_html}
+  </body>
+</html>"#
+        )
+    }
+
+    fn asset_dir_entries(path: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+}

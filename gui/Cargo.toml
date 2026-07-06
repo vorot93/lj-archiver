@@ -1,0 +1,31 @@
+[package]
+name = "lj-archiver-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lj-archiver-gui"
+path = "src/main.rs"
+
+[dependencies]
+lj-archiver = { path = ".." }
+iced = { version = "0.14", features = ["tokio"] }
+rfd = "0.17"
+open = "5"
+futures = "0.3"
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[package.metadata.packager]
+product-name = "LJ Archiver"
+identifier = "me.vorotnikov.lj-archiver"
+description = "Archive public LiveJournal journals and posts to AsciiDoc"
+authors = ["Artem Vorotnikov <artem@vorotnikov.me>"]
+icons = ["icons/icon.png"]
+
+[[package.metadata.packager.binaries]]
+path = "lj-archiver-gui"
+main = true

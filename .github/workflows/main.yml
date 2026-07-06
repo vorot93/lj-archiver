@@ -1,0 +1,38 @@
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+name: CI
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check -- --config=imports_granularity=Crate
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - run: cargo hack clippy -p lj-archiver --each-feature -- -D warnings
+      - run: cargo hack test -p lj-archiver --each-feature
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  gui:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy -p lj-archiver-gui --all-targets -- -D warnings
+      - run: cargo build -p lj-archiver-gui

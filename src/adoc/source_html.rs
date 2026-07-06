@@ -1,0 +1,307 @@
+use ego_tree::NodeId;
+use scraper::{ElementRef, Html, node::Node};
+use std::collections::HashMap;
+
+use super::{MAX_RENDER_DEPTH, RenderCtx, classify::is_stripped_chrome};
+
+pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+    if is_stripped_chrome(element) {
+        return String::new();
+    }
+
+    let html = source_preserving_html(element, ctx);
+
+    if contains_script_or_style_tag(&html) {
+        return render_source_listing(&html);
+    }
+
+    let delimiter = safe_block_delimiter(&html, '+');
+
+    format!("{delimiter}\n{html}\n{delimiter}\n\n")
+}
+
+fn render_source_listing(content: &str) -> String {
+    let delimiter = safe_block_delimiter(content, '-');
+
+    format!("{delimiter}\n{content}\n{delimiter}\n\n")
+}
+
+fn contains_script_or_style_tag(source_html: &str) -> bool {
+    let mut search_start = 0;
+
+    while let Some(relative_start) = source_html[search_start..].find('<') {
+        let start = search_start + relative_start;
+        let Some(tag) = parse_source_tag(source_html, start) else {
+            search_start = start + 1;
+            continue;
+        };
+
+        if !tag.is_closing && matches!(tag.name.to_ascii_lowercase().as_str(), "script" | "style") {
+            return true;
+        }
+
+        search_start = tag.end;
+    }
+
+    false
+}
+
+pub(crate) fn safe_block_delimiter(content: &str, character: char) -> String {
+    let mut delimiter = character.to_string().repeat(4);
+
+    while content.lines().any(|line| line == delimiter) {
+        delimiter.push(character);
+    }
+
+    delimiter
+}
+
+fn source_preserving_html(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+    let html = element.html();
+    let name = element.value().name();
+
+    if let Some(source) = ctx.source_map.get(&element.id()) {
+        return source.clone();
+    }
+
+    if name == "table" {
+        let without_inserted_tbody = html.replace("<tbody>", "").replace("</tbody>", "");
+        if ctx.source_html.contains(&without_inserted_tbody) {
+            return without_inserted_tbody;
+        }
+    }
+
+    html
+}
+
+/// Precompute the original source substring of every element in the document
+/// with one linear scan of the source plus one walk of the DOM, instead of
+/// rescanning the whole tree and source once per passthrough (which was O(n^2)
+/// for deeply nested content).
+///
+/// Each element maps to the source substring of the k-th source element of the
+/// same (lowercased) tag name, where k is the element's document-order ordinal
+/// among elements of that name. Because the DOM is parsed from the source, the
+/// k-th element of a given name in DOM document order is the k-th of that name in
+/// source document order, so this reproduces the former
+/// `(name, serialized-html)` matching byte-for-byte: the html refinement only
+/// partitioned each name's elements without reordering them, and source/DOM order
+/// already align 1:1 per name. Parser-inserted elements (e.g. `<tbody>`) have no
+/// source counterpart, so the DOM holds more elements of that name than the
+/// source recovered; the counter runs past the recovered spans and those
+/// elements get no entry, falling back through `source_preserving_html` exactly
+/// as before. No `element.html()` and no per-candidate re-parse are performed.
+///
+/// One intentional, content-preserving deviation from "byte-for-byte": a
+/// self-closing tag on a non-void element (e.g. `<div/>`) is *not* treated as
+/// closed here (see `collect_source_spans`), because html5ever does not treat
+/// it as closed either — the following flow content is nested inside it. Such
+/// an element's slot is left open, so it gets no entry and falls back to
+/// `source_preserving_html`'s `element.html()`, trading a raw `<div/>` for a
+/// normalized `<div>...</div>` rather than silently dropping the nested
+/// content.
+pub(crate) fn build_source_map(document: &Html, source_html: &str) -> HashMap<NodeId, String> {
+    let source_by_name = collect_source_spans(source_html);
+    let mut counters: HashMap<String, usize> = HashMap::new();
+    let mut source_map = HashMap::new();
+
+    for node in document.tree.root().descendants() {
+        let Some(element) = ElementRef::wrap(node) else {
+            continue;
+        };
+
+        let name = element.value().name().to_ascii_lowercase();
+        let ordinal = *counters.get(&name).unwrap_or(&0);
+
+        if let Some(span) = source_by_name
+            .get(&name)
+            .and_then(|spans| spans.get(ordinal))
+        {
+            source_map.insert(element.id(), span.clone());
+        }
+
+        *counters.entry(name).or_insert(0) += 1;
+    }
+
+    source_map
+}
+
+/// Recover, in one linear scan, the original source substring of every source
+/// element grouped by lowercased tag name in document (opening) order.
+///
+/// A per-name stack pairs each opening tag with its matching closing tag exactly
+/// as the former `find_source_element_end` did — same-name depth counting, other
+/// tags ignored — but for every element at once in O(source length) rather than
+/// rescanning the remaining source once per opening tag. Only genuinely void
+/// tags (`is_source_void_tag`) are recorded immediately. A self-closing tag on
+/// a non-void element is deliberately *not* treated as immediately closed: HTML5
+/// (and html5ever) ignores the trailing `/` on non-void elements and parses the
+/// following content as its children, so treating it as closed here would make
+/// the recovered span omit content the DOM actually nests inside the element.
+/// Such a tag is instead pushed onto the opening-tag branch below like a plain
+/// opening tag, so it only resolves once (if) a real closing tag is found.
+///
+/// The former scan abandoned a tag name for the rest of the source once an
+/// opening tag had no matching close, yielding `None` for that name from the
+/// first unbalanced element onward. That is reproduced by keeping each name's
+/// spans in opening order with one slot reserved per opening tag (empty until its
+/// close is seen), then keeping only the leading run of slots that were closed:
+/// the first never-closed opening tag, and everything after it, is dropped.
+fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<String>> {
+    // Per name, one slot per opening tag in opening order; `None` until the
+    // matching close is found (and permanently `None` if it never is).
+    let mut slots: HashMap<String, Vec<Option<(usize, usize)>>> = HashMap::new();
+    // Per name, stack of (slot index, opening-tag start) awaiting a close.
+    let mut open_stacks: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut search_start = 0;
+
+    while let Some(relative_start) = source_html[search_start..].find('<') {
+        let start = search_start + relative_start;
+        let Some(tag) = parse_source_tag(source_html, start) else {
+            search_start = start + 1;
+            continue;
+        };
+
+        let name = tag.name.to_ascii_lowercase();
+
+        if tag.is_closing {
+            if let Some((slot, open_start)) = open_stacks.get_mut(&name).and_then(Vec::pop)
+                && let Some(list) = slots.get_mut(&name)
+            {
+                list[slot] = Some((open_start, tag.end));
+            }
+        } else if is_source_void_tag(&name) {
+            slots.entry(name).or_default().push(Some((start, tag.end)));
+        } else {
+            let list = slots.entry(name.clone()).or_default();
+            let slot = list.len();
+            list.push(None);
+            open_stacks.entry(name).or_default().push((slot, start));
+        }
+
+        search_start = tag.end;
+    }
+
+    slots
+        .into_iter()
+        .map(|(name, list)| {
+            let spans = list
+                .into_iter()
+                .map_while(|slot| slot)
+                .map(|(start, end)| source_html[start..end].to_string())
+                .collect();
+            (name, spans)
+        })
+        .collect()
+}
+
+struct SourceTag {
+    name: String,
+    is_closing: bool,
+    end: usize,
+}
+
+fn parse_source_tag(source_html: &str, start: usize) -> Option<SourceTag> {
+    let bytes = source_html.as_bytes();
+
+    if bytes.get(start) != Some(&b'<') || matches!(bytes.get(start + 1), Some(b'!' | b'?')) {
+        return None;
+    }
+
+    let end = find_source_tag_end(source_html, start)? + 1;
+    let mut cursor = start + 1;
+    let is_closing = bytes.get(cursor) == Some(&b'/');
+    if is_closing {
+        cursor += 1;
+    }
+
+    while matches!(bytes.get(cursor), Some(byte) if byte.is_ascii_whitespace()) {
+        cursor += 1;
+    }
+
+    let name_start = cursor;
+    while matches!(bytes.get(cursor), Some(byte) if is_source_tag_name_byte(*byte)) {
+        cursor += 1;
+    }
+
+    if cursor == name_start {
+        return None;
+    }
+
+    let name = source_html[name_start..cursor].to_string();
+
+    Some(SourceTag {
+        name,
+        is_closing,
+        end,
+    })
+}
+
+fn find_source_tag_end(source_html: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+
+    for (offset, byte) in source_html.as_bytes()[start + 1..].iter().enumerate() {
+        match (quote, *byte) {
+            (Some(active), current) if active == current => quote = None,
+            (None, b'\'' | b'"') => quote = Some(*byte),
+            (None, b'>') => return Some(start + 1 + offset),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_source_tag_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'_')
+}
+
+fn is_source_void_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+pub(crate) fn raw_text(element: ElementRef<'_>) -> String {
+    raw_text_at(element, 0)
+}
+
+fn raw_text_at(element: ElementRef<'_>, depth: usize) -> String {
+    // Bound this self-recursion at the same depth as `render_element`. At the cap
+    // we stop recursing and return the text accumulated so far, so deeply nested
+    // `<pre>`/`<code>` content degrades gracefully (truncated) instead of
+    // overflowing the stack.
+    if depth >= MAX_RENDER_DEPTH {
+        return String::new();
+    }
+
+    let mut output = String::new();
+
+    for child in element.children() {
+        match child.value() {
+            Node::Text(text) => output.push_str(text),
+            Node::Element(_) => {
+                if let Some(child_element) = ElementRef::wrap(child) {
+                    output.push_str(&raw_text_at(child_element, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    output
+}

@@ -1,0 +1,369 @@
+pub(crate) fn normalize_inline_text(text: &str) -> String {
+    let mut output = String::new();
+    let mut in_whitespace = false;
+
+    for character in text.chars() {
+        if character.is_whitespace() {
+            if !in_whitespace {
+                output.push(' ');
+                in_whitespace = true;
+            }
+        } else {
+            output.push(character);
+            in_whitespace = false;
+        }
+    }
+
+    output
+}
+
+pub(crate) fn neutralize_plain_adoc_fragment_at_line_start(
+    text: &str,
+    is_line_start: bool,
+) -> String {
+    let text = neutralize_inline_adoc_syntax(text);
+
+    if is_line_start {
+        neutralize_active_adoc_lines(&text)
+    } else {
+        text
+    }
+}
+
+pub(crate) fn neutralize_active_adoc_lines(text: &str) -> String {
+    let mut output = String::new();
+
+    for line in text.split_inclusive('\n') {
+        if starts_with_active_adoc_syntax(line.trim_end_matches('\n')) {
+            output.push('\\');
+        }
+        output.push_str(line);
+    }
+
+    output
+}
+
+fn neutralize_inline_adoc_syntax(text: &str) -> String {
+    neutralize_inline_passthrough_delimiters(&neutralize_inline_passthrough_macros(text))
+}
+
+fn neutralize_inline_passthrough_macros(text: &str) -> String {
+    let mut output = String::new();
+    let mut cursor = 0;
+
+    while let Some(relative_start) = text[cursor..].find("pass:") {
+        let start = cursor + relative_start;
+
+        if starts_inline_passthrough_macro(text, start) {
+            let next = start + "pass:".len();
+            output.push_str(&text[cursor..start]);
+            output.push('\\');
+            output.push_str(&text[start..next]);
+            cursor = next;
+        } else {
+            let next = start + "pass:".len();
+            output.push_str(&text[cursor..next]);
+            cursor = next;
+        }
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn starts_inline_passthrough_macro(text: &str, start: usize) -> bool {
+    let bytes = text.as_bytes();
+
+    if start > 0 {
+        let previous = bytes[start - 1];
+        if previous.is_ascii_alphanumeric() || matches!(previous, b'_' | b'-') {
+            return false;
+        }
+    }
+
+    let mut cursor = start + "pass:".len();
+
+    if bytes.get(cursor) == Some(&b'[') {
+        return true;
+    }
+
+    let qualifier_start = cursor;
+    while matches!(bytes.get(cursor), Some(byte) if is_inline_passthrough_qualifier_byte(*byte)) {
+        cursor += 1;
+    }
+
+    cursor > qualifier_start && bytes.get(cursor) == Some(&b'[')
+}
+
+fn is_inline_passthrough_qualifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b',' | b'_' | b'-')
+}
+
+fn neutralize_inline_passthrough_delimiters(text: &str) -> String {
+    let mut output = String::new();
+    let mut cursor = 0;
+
+    while let Some(relative_start) = text[cursor..].find("+++") {
+        let start = cursor + relative_start;
+        let content_start = start + 3;
+        let Some(relative_end) = text[content_start..].find("+++") else {
+            break;
+        };
+        let end = content_start + relative_end + 3;
+
+        output.push_str(&text[cursor..start]);
+        output.push_str(r"\+++");
+        output.push_str(&text[content_start..end]);
+        cursor = end;
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn starts_with_active_adoc_syntax(text: &str) -> bool {
+    let trimmed = text.trim_start();
+
+    starts_with_block_macro(trimmed)
+        || starts_with_document_attribute(trimmed)
+        || starts_with_heading(trimmed)
+        || starts_with_list_marker(trimmed)
+        || starts_with_admonition_label(trimmed)
+        || is_active_delimiter_only(trimmed)
+}
+
+fn starts_with_block_macro(text: &str) -> bool {
+    let Some(macro_separator) = text.find("::") else {
+        return false;
+    };
+
+    if macro_separator == 0 {
+        return false;
+    }
+
+    text[..macro_separator]
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        && text[macro_separator + 2..].contains('[')
+}
+
+fn starts_with_document_attribute(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix(':') else {
+        return false;
+    };
+
+    rest.chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace())
+        && rest.contains(':')
+}
+
+fn starts_with_heading(text: &str) -> bool {
+    let equals_count = text
+        .chars()
+        .take_while(|character| *character == '=')
+        .count();
+
+    equals_count > 0 && text.as_bytes().get(equals_count) == Some(&b' ')
+}
+
+fn starts_with_list_marker(text: &str) -> bool {
+    let Some(marker) = text.as_bytes().first() else {
+        return false;
+    };
+
+    if !matches!(marker, b'*' | b'.') {
+        return false;
+    }
+
+    let marker_count = text.bytes().take_while(|byte| byte == marker).count();
+
+    text.as_bytes()
+        .get(marker_count)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+}
+
+fn starts_with_admonition_label(text: &str) -> bool {
+    const ADMONITION_LABELS: [&str; 5] = ["CAUTION", "IMPORTANT", "NOTE", "TIP", "WARNING"];
+
+    ADMONITION_LABELS.iter().any(|label| {
+        text.strip_prefix(label)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    })
+}
+
+fn is_delimiter_only(text: &str, delimiter: char) -> bool {
+    text.chars().count() >= 4 && text.chars().all(|character| character == delimiter)
+}
+
+fn is_active_delimiter_only(text: &str) -> bool {
+    let Some(delimiter) = text.chars().next() else {
+        return false;
+    };
+
+    matches!(delimiter, '+' | '-' | '.' | '*' | '=' | '_' | '|' | '/')
+        && is_delimiter_only(text, delimiter)
+}
+
+pub(crate) fn render_inline_wrapper(text: &str, prefix: &str, suffix: &str) -> String {
+    if should_preserve_unwrapped_inline_output(text) {
+        return text.to_string();
+    }
+
+    render_inline_wrapper_with_label(text, text.trim(), prefix, suffix)
+}
+
+pub(crate) fn render_inline_wrapper_with_label(
+    text: &str,
+    label: &str,
+    prefix: &str,
+    suffix: &str,
+) -> String {
+    let mut output = String::new();
+
+    if label.is_empty() {
+        return output;
+    }
+
+    if text.starts_with(' ') {
+        output.push(' ');
+    }
+
+    output.push_str(prefix);
+    output.push_str(label);
+    output.push_str(suffix);
+
+    if text.ends_with(' ') {
+        output.push(' ');
+    }
+
+    output
+}
+
+pub(crate) fn should_preserve_unwrapped_inline_output(text: &str) -> bool {
+    let trimmed = text.trim();
+
+    !trimmed.is_empty()
+        && (text.contains("\n\n")
+            || trimmed
+                .lines()
+                .any(|line| is_delimiter_only(line, '+') || is_delimiter_only(line, '-')))
+}
+
+pub(crate) fn sanitize_macro_label(text: &str) -> String {
+    normalize_inline_text(&text.replace(['[', ']', '\n', '\r'], " "))
+        .trim()
+        .to_string()
+}
+
+pub(crate) fn sanitize_macro_target(text: &str) -> String {
+    let mut output = String::new();
+
+    for character in text.trim().chars() {
+        match character {
+            '[' => output.push_str("%5B"),
+            ']' => output.push_str("%5D"),
+            '\n' => output.push_str("%0A"),
+            '\r' => output.push_str("%0D"),
+            '\t' => output.push_str("%09"),
+            character if character.is_control() => {
+                for byte in character.to_string().as_bytes() {
+                    output.push_str(&format!("%{byte:02X}"));
+                }
+            }
+            character => output.push(character),
+        }
+    }
+
+    neutralize_macro_target_inline_passthrough_prefix(
+        &neutralize_macro_target_inline_passthrough_delimiters(
+            &neutralize_macro_target_block_macro_prefix(&output),
+        ),
+    )
+}
+
+fn neutralize_macro_target_block_macro_prefix(text: &str) -> String {
+    let Some(separator) = text.find("::") else {
+        return text.to_string();
+    };
+
+    if separator == 0 || !text[..separator].bytes().all(is_adoc_macro_name_byte) {
+        return text.to_string();
+    }
+
+    format!("{}%3A%3A{}", &text[..separator], &text[separator + 2..])
+}
+
+fn neutralize_macro_target_inline_passthrough_prefix(text: &str) -> String {
+    if starts_inline_passthrough_macro(&format!("{text}["), 0) {
+        text.replacen(':', "%3A", 1)
+    } else {
+        text.to_string()
+    }
+}
+
+fn neutralize_macro_target_inline_passthrough_delimiters(text: &str) -> String {
+    let mut output = String::new();
+    let mut cursor = 0;
+
+    while let Some(relative_start) = text[cursor..].find("+++") {
+        let start = cursor + relative_start;
+        let content_start = start + 3;
+        let Some(relative_end) = text[content_start..].find("+++") else {
+            break;
+        };
+        let end = content_start + relative_end + 3;
+
+        output.push_str(&text[cursor..start]);
+        output.push_str("%2B%2B%2B");
+        output.push_str(&text[content_start..end - 3]);
+        output.push_str("%2B%2B%2B");
+        cursor = end;
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn is_adoc_macro_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+
+pub(crate) fn neutralize_pending_plain_text_block_macro(output: &mut String) {
+    if output.is_empty() {
+        return;
+    }
+
+    let line_start = output.rfind('\n').map_or(0, |index| index + 1);
+    let line = &output[line_start..];
+
+    if ends_with_block_macro_prefix(line) || ends_with_inline_passthrough_macro_prefix(line) {
+        output.insert(line_start, '\\');
+    }
+}
+
+fn ends_with_block_macro_prefix(text: &str) -> bool {
+    let Some(prefix) = text.strip_suffix("::") else {
+        return false;
+    };
+
+    !prefix.is_empty()
+        && prefix.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+}
+
+fn ends_with_inline_passthrough_macro_prefix(text: &str) -> bool {
+    let Some(pass_start) = text.rfind("pass:") else {
+        return false;
+    };
+
+    starts_inline_passthrough_macro(&format!("{}[", &text[pass_start..]), 0)
+        && (pass_start == 0
+            || text.as_bytes()[..pass_start]
+                .last()
+                .is_some_and(|previous| {
+                    !previous.is_ascii_alphanumeric() && !matches!(previous, b'_' | b'-')
+                }))
+}

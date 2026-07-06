@@ -1,0 +1,172 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use crate::{
+    error::{LjError, Result},
+    models::ArchivedPost,
+};
+
+#[derive(Debug, Clone)]
+pub struct Archive {
+    root: PathBuf,
+    journal: String,
+}
+
+impl Archive {
+    pub fn new(root: impl Into<PathBuf>, journal: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            journal: journal.into(),
+        }
+    }
+
+    pub fn post_path(&self, id: u64) -> PathBuf {
+        self.root.join("posts").join(format!("{id}.adoc"))
+    }
+
+    pub fn assets_dir(&self) -> PathBuf {
+        self.root.join("assets")
+    }
+
+    pub fn post_exists(&self, id: u64) -> bool {
+        self.post_path(id).is_file()
+    }
+
+    pub fn write_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
+        let path = self.post_path(id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| LjError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        write_atomic(&path, contents)?;
+        Ok(path)
+    }
+
+    pub fn write_index(&self, posts: &[ArchivedPost]) -> Result<PathBuf> {
+        fs::create_dir_all(&self.root).map_err(|source| LjError::Write {
+            path: self.root.clone(),
+            source,
+        })?;
+        let mut contents = format!("= {} Archive\n\n", self.journal);
+        contents.push_str("|===\n|Post ID |Title\n\n");
+        for post in posts {
+            let path = self.index_path(&post.path);
+            let title = sanitize_index_label(&post.title);
+            contents.push_str(&format!(
+                "|{} |xref:{}[{}]\n",
+                post.id,
+                path.to_string_lossy(),
+                title
+            ));
+        }
+        contents.push_str("|===\n");
+        let path = self.root.join("index.adoc");
+        write_atomic(&path, &contents)?;
+        Ok(path)
+    }
+
+    fn index_path(&self, path: &Path) -> PathBuf {
+        path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
+    }
+}
+
+fn sanitize_index_label(label: &str) -> String {
+    label
+        .split(|ch: char| matches!(ch, '|' | '[' | ']' | '\n' | '\r') || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, contents).map_err(|source| LjError::Write {
+        path: tmp.clone(),
+        source,
+    })?;
+    fs::rename(&tmp, path).map_err(|source| LjError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ArchivedPost;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    #[test]
+    fn writes_post_file_and_index() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        archive.write_post(166511, "= Title\n\nBody\n").unwrap();
+        archive
+            .write_index(&[ArchivedPost {
+                id: 166511,
+                title: "Title".to_string(),
+                path: PathBuf::from("posts/166511.adoc"),
+            }])
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("archive/posts/166511.adoc")).unwrap(),
+            "= Title\n\nBody\n"
+        );
+        let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
+        assert!(index.contains("= news Archive"));
+        assert!(index.contains("xref:posts/166511.adoc[Title]"));
+    }
+
+    #[test]
+    fn detects_existing_posts_for_resume() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        assert!(!archive.post_exists(166511));
+        archive.write_post(166511, "= Title\n").unwrap();
+        assert!(archive.post_exists(166511));
+    }
+
+    #[test]
+    fn sanitizes_index_title_labels() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        archive
+            .write_index(&[ArchivedPost {
+                id: 166511,
+                title: "A | tricky\n[title]".to_string(),
+                path: PathBuf::from("posts/166511.adoc"),
+            }])
+            .unwrap();
+
+        let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
+        let row = index
+            .lines()
+            .find(|line| line.starts_with("|166511 "))
+            .unwrap();
+        assert_eq!(row, "|166511 |xref:posts/166511.adoc[A tricky title]");
+    }
+
+    #[test]
+    fn writes_index_paths_relative_to_archive_root() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        let path = archive.write_post(166511, "= Title\n").unwrap();
+        archive
+            .write_index(&[ArchivedPost {
+                id: 166511,
+                title: "Title".to_string(),
+                path,
+            }])
+            .unwrap();
+
+        let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
+        assert!(index.contains("xref:posts/166511.adoc[Title]"));
+        assert!(!index.contains(dir.path().to_str().unwrap()));
+    }
+}
