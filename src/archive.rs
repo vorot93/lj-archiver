@@ -47,10 +47,7 @@ impl Archive {
     }
 
     pub fn write_index(&self, posts: &[ArchivedPost]) -> Result<PathBuf> {
-        fs::create_dir_all(&self.root).map_err(|source| LjError::Write {
-            path: self.root.clone(),
-            source,
-        })?;
+        self.ensure_root()?;
         let mut contents = format!("= {} Archive\n\n", self.journal);
         contents.push_str("|===\n|Post ID |Title\n\n");
         for post in posts {
@@ -70,10 +67,7 @@ impl Archive {
     }
 
     pub fn write_book(&self, posts: &[ArchivedPost]) -> Result<PathBuf> {
-        fs::create_dir_all(&self.root).map_err(|source| LjError::Write {
-            path: self.root.clone(),
-            source,
-        })?;
+        self.ensure_root()?;
         let mut contents = format!("= {} Archive\n:doctype: book\n:toc:\n\n", self.journal);
         contents.push_str("include::index.adoc[leveloffset=+1]\n");
         for post in posts {
@@ -86,6 +80,13 @@ impl Archive {
         let path = self.root.join("book.adoc");
         write_atomic(&path, &contents)?;
         Ok(path)
+    }
+
+    fn ensure_root(&self) -> Result<()> {
+        fs::create_dir_all(&self.root).map_err(|source| LjError::Write {
+            path: self.root.clone(),
+            source,
+        })
     }
 
     fn index_path(&self, path: &Path) -> PathBuf {

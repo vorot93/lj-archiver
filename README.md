@@ -160,13 +160,15 @@ assembles the whole archive into one AsciiDoc document. It `include::`s
 `index.adoc` and every archived post with `leveloffset=+1`, under `:doctype: book`
 with a generated `:toc:`:
 
-    = <journal> Archive
-    :doctype: book
-    :toc:
+```adoc
+= <journal> Archive
+:doctype: book
+:toc:
 
-    include::index.adoc[leveloffset=+1]
+include::index.adoc[leveloffset=+1]
 
-    include::posts/166511.adoc[leveloffset=+1]
+include::posts/166511.adoc[leveloffset=+1]
+```
 
 `book.adoc` is regenerated on every run (including with `--resume`) and lists
 exactly the posts `index.adoc` lists. Convert it with a tool such as `asciidoctor`
