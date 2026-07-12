@@ -90,7 +90,8 @@ lj-archiver --user-agent "my-archiver/1.0" news
 
 A desktop GUI is available alongside the command-line tool. It lets you enter a
 target (a journal name, `journal/id`, or a post URL), choose an output folder,
-toggle comments and media, watch archiving progress, and open the finished
+toggle comments and media, optionally generate a single-file `book.adoc`, watch
+archiving progress, and open the finished
 archive folder. Any posts that fail to archive are listed with clickable links.
 
 Download an installer for your platform from the project's GitHub Releases:

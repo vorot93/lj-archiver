@@ -80,6 +80,9 @@ impl App {
             checkbox(self.config.download_media)
                 .label("Download media")
                 .on_toggle(Message::ToggleMedia),
+            checkbox(self.config.generate_book)
+                .label("Generate book.adoc")
+                .on_toggle(Message::ToggleBook),
             self.start_button(),
             self.status_view(),
         ]

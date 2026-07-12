@@ -18,6 +18,7 @@ pub struct RunConfig {
     pub folder: Option<PathBuf>,
     pub include_comments: bool,
     pub download_media: bool,
+    pub generate_book: bool,
 }
 
 impl Default for RunConfig {
@@ -27,6 +28,7 @@ impl Default for RunConfig {
             folder: None,
             include_comments: true,
             download_media: true,
+            generate_book: false,
         }
     }
 }
@@ -61,6 +63,7 @@ pub enum Message {
     FolderChosen(Option<PathBuf>),
     ToggleComments(bool),
     ToggleMedia(bool),
+    ToggleBook(bool),
     Start,
     Progress(ProgressEvent),
     Finished(Result<RunOutcome, String>),
@@ -88,6 +91,7 @@ impl App {
             }
             Message::ToggleComments(on) => self.config.include_comments = *on,
             Message::ToggleMedia(on) => self.config.download_media = *on,
+            Message::ToggleBook(on) => self.config.generate_book = *on,
             Message::Start => self.state = State::Running(Phase::Discovering { found: 0 }),
             Message::Progress(event) => self.apply_progress(event),
             Message::Finished(Ok(outcome)) => {
@@ -161,7 +165,7 @@ impl App {
             download_media: self.config.download_media,
             concurrency: 4,
             resume,
-            generate_book: false,
+            generate_book: self.config.generate_book,
             journal_context: None,
             user_agent: None,
             base_url: Url::parse("https://livejournal.com").expect("static url is valid"),
@@ -206,6 +210,7 @@ mod tests {
         assert!(matches!(app.state, State::Idle));
         assert!(app.config.include_comments);
         assert!(app.config.download_media);
+        assert!(!app.config.generate_book);
     }
 
     #[test]
@@ -223,8 +228,10 @@ mod tests {
         let mut app = App::default();
         app.update_state(&Message::ToggleComments(false));
         app.update_state(&Message::ToggleMedia(false));
+        app.update_state(&Message::ToggleBook(true));
         assert!(!app.config.include_comments);
         assert!(!app.config.download_media);
+        assert!(app.config.generate_book);
     }
 
     #[test]
@@ -341,12 +348,14 @@ mod tests {
         app.update_state(&Message::TargetChanged("news".to_string()));
         app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
         app.update_state(&Message::ToggleMedia(false));
+        app.update_state(&Message::ToggleBook(true));
 
         let (target, options) = app.run_request().unwrap();
         assert_eq!(target, "news");
         assert_eq!(options.output_dir.as_deref(), Some(dir.path()));
         assert!(options.resume); // posts/ already has a .adoc
         assert!(!options.download_media);
+        assert!(options.generate_book);
         assert!(options.include_comments);
         assert_eq!(options.concurrency, 4);
     }
