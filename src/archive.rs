@@ -69,6 +69,25 @@ impl Archive {
         Ok(path)
     }
 
+    pub fn write_book(&self, posts: &[ArchivedPost]) -> Result<PathBuf> {
+        fs::create_dir_all(&self.root).map_err(|source| LjError::Write {
+            path: self.root.clone(),
+            source,
+        })?;
+        let mut contents = format!("= {} Archive\n:doctype: book\n:toc:\n\n", self.journal);
+        contents.push_str("include::index.adoc[leveloffset=+1]\n");
+        for post in posts {
+            let path = self.index_path(&post.path);
+            contents.push_str(&format!(
+                "\ninclude::{}[leveloffset=+1]\n",
+                path.to_string_lossy()
+            ));
+        }
+        let path = self.root.join("book.adoc");
+        write_atomic(&path, &contents)?;
+        Ok(path)
+    }
+
     fn index_path(&self, path: &Path) -> PathBuf {
         path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
     }
@@ -168,5 +187,44 @@ mod tests {
         let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
         assert!(index.contains("xref:posts/166511.adoc[Title]"));
         assert!(!index.contains(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn writes_book_with_index_and_post_includes() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        let path = archive
+            .write_book(&[
+                ArchivedPost {
+                    id: 166511,
+                    title: "First".to_string(),
+                    path: PathBuf::from("posts/166511.adoc"),
+                },
+                ArchivedPost {
+                    id: 166512,
+                    title: "Second".to_string(),
+                    path: PathBuf::from("posts/166512.adoc"),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(path, dir.path().join("archive/book.adoc"));
+        let book = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            book,
+            "= news Archive\n:doctype: book\n:toc:\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166511.adoc[leveloffset=+1]\n\ninclude::posts/166512.adoc[leveloffset=+1]\n"
+        );
+    }
+
+    #[test]
+    fn writes_book_with_no_posts() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        let path = archive.write_book(&[]).unwrap();
+        let book = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            book,
+            "= news Archive\n:doctype: book\n:toc:\n\ninclude::index.adoc[leveloffset=+1]\n"
+        );
     }
 }

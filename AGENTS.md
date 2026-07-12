@@ -26,7 +26,7 @@ The current tool is public-content only. Do not add login, private-content acces
 - `src/links.rs` resolves same-journal post URLs to local `.adoc` cross-reference targets for bulk-export link rewriting.
 - `src/media.rs` finds inline media, downloads allowed assets, rewrites HTML references, validates redirects, and rejects unsafe media URLs based on scheme, host presence, literal `localhost` hosts, and restricted IP literals.
 - `src/adoc/` converts supported HTML into AsciiDoc and preserves unsupported structures with passthrough output (submodules `mod`, `classify`, `source_html`, `escape`).
-- `src/archive.rs` owns archive paths, per-post writes, index writes, and resume checks.
+- `src/archive.rs` owns archive paths, per-post writes, index writes, the optional single-file `book.adoc` assembly (`write_book`), and resume checks.
 - `src/run.rs` orchestrates target parsing, discovery, fetching, parsing, media rewriting, rendering, and archive writes.
 - `src/progress.rs` owns user-facing progress output: a `Progress` handle with Interactive (indicatif bar/spinner via `tracing-indicatif`), Plain (stderr lines), and Quiet modes, plus `init_logging`. Progress is stderr-only UI, independent of the log level; `--verbose` keeps the bar and prints logs above it, `--quiet` suppresses progress.
 - `tests/fixtures/post_basic.html` covers a basic post fixture.
