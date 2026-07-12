@@ -161,6 +161,7 @@ impl App {
             download_media: self.config.download_media,
             concurrency: 4,
             resume,
+            generate_book: false,
             journal_context: None,
             user_agent: None,
             base_url: Url::parse("https://livejournal.com").expect("static url is valid"),

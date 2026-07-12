@@ -26,6 +26,9 @@ pub struct Cli {
     #[arg(long)]
     pub resume: bool,
 
+    #[arg(long)]
+    pub book: bool,
+
     #[arg(long, value_name = "NAME")]
     pub journal: Option<String>,
 
@@ -50,6 +53,7 @@ impl Cli {
             download_media: !self.no_media,
             concurrency: self.concurrency.max(1),
             resume: self.resume,
+            generate_book: self.book,
             journal_context: self.journal.clone(),
             user_agent: self.user_agent.clone(),
             base_url: self.base_url.clone(),

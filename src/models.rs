@@ -16,6 +16,7 @@ pub struct RunOptions {
     pub download_media: bool,
     pub concurrency: usize,
     pub resume: bool,
+    pub generate_book: bool,
     pub journal_context: Option<String>,
     /// Optional `User-Agent` header sent on every request. `None` (the default)
     /// sends no `User-Agent`.

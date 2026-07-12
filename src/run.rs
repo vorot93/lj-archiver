@@ -78,7 +78,11 @@ async fn archive_post(
     let archive = Archive::new(root.clone(), journal);
     let post = fetch_and_write_post(&client, options, &archive, url, None).await?;
     progress.single_done(post.id, &post.path);
-    archive.write_index(&[post])?;
+    let posts = [post];
+    archive.write_index(&posts)?;
+    if options.generate_book {
+        archive.write_book(&posts)?;
+    }
 
     Ok(RunOutcome {
         root,
@@ -158,6 +162,9 @@ async fn archive_journal(
     posts.sort_by_key(|post| post.id);
     failures.sort_by_key(|failure| failure.id);
     archive.write_index(&posts)?;
+    if options.generate_book {
+        archive.write_book(&posts)?;
+    }
 
     for failure in &failures {
         eprintln!(
@@ -401,6 +408,7 @@ mod tests {
             no_media: true,
             concurrency: 2,
             resume: false,
+            book: false,
             journal: None,
             verbose: false,
             quiet: false,
@@ -459,6 +467,7 @@ mod tests {
             no_media: true,
             concurrency: 2,
             resume: true,
+            book: false,
             journal: None,
             verbose: false,
             quiet: false,
@@ -598,6 +607,7 @@ mod tests {
             download_media: false,
             concurrency: 2,
             resume: false,
+            generate_book: false,
             journal_context: None,
             user_agent: None,
             base_url: Url::parse(&server.uri()).unwrap(),
@@ -656,6 +666,7 @@ mod tests {
             download_media: true,
             concurrency: 2,
             resume: false,
+            generate_book: false,
             journal_context: None,
             user_agent: None,
             base_url: Url::parse(&server.uri()).unwrap(),
@@ -814,6 +825,7 @@ mod tests {
             no_media,
             concurrency: 2,
             resume: false,
+            book: false,
             journal: None,
             verbose: false,
             quiet: false,
@@ -830,6 +842,7 @@ mod tests {
             no_media: true,
             concurrency: 2,
             resume,
+            book: false,
             journal: None,
             verbose: false,
             quiet: false,

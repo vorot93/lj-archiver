@@ -16,7 +16,7 @@ The current tool is public-content only. Do not add login, private-content acces
 - `src/lib.rs` exposes internal modules and the crate `Result` type.
 - `src/error.rs` defines typed errors and the shared `Result` type.
 - `src/cli.rs` defines the public command-line interface with `clap`.
-- `src/models.rs` defines core archive, post, comment, media, and run option data types.
+- `src/models.rs` defines core archive, post, comment, media, and run option data types. `RunOptions::generate_book` is the opt-in single-file `book.adoc` toggle, set by the `--book` flag (and the GUI checkbox).
 - `src/target.rs` parses target strings (bare journal names, `*.livejournal.com` hostnames, journal home URLs, and post URLs) and builds LiveJournal post and calendar URLs.
 - `src/client.rs` owns HTTP fetching behavior.
 - `src/net.rs` provides shared network helpers — loopback/local test-server detection and restricted IP-literal checks (used by media safety and target/discovery), plus `affirmation_cookie_jar()`, the age-affirmation cookie jar (scoped to `livejournal.com`) installed on every production client, and `configured_client_builder(user_agent)`, which applies that jar, the shared TLS config, and an optional `User-Agent` (both `LjClient` and the media client build on it).

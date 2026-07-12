@@ -125,6 +125,7 @@ To run the GUI from source: `cargo run -p lj-archiver-gui`.
 | `--no-media` | Do not download inline media; keep remote URLs in the output |
 | `--concurrency <N>` | Set the number of posts processed concurrently during journal archives. Defaults to `4` |
 | `--resume` | During full journal archives, skip posts whose `.adoc` files already exist |
+| `--book` | Also write `book.adoc` at the archive root: one AsciiDoc document that `include::`s `index.adoc` and every archived post (`leveloffset=+1`), under `:doctype: book` with a generated `:toc:` |
 | `--journal <NAME>` | Journal name for bare `@id` targets |
 | `--user-agent <STRING>` | Send this `User-Agent` header on every request. By default no `User-Agent` is sent |
 | `-v`, `--verbose` | Enable more detailed logging |
@@ -150,6 +151,25 @@ archive/<journal>/
 Each post is written to `posts/<id>.adoc`. The post file contains document metadata, the post body, and comments when comment archiving is enabled.
 
 Downloaded inline media is stored in a single `assets/` folder at the archive root. Each file is named by a hash of its source URL (`<hash>.<ext>`), so an image reused across posts is stored only once, and post files reference it with a relative path like `../assets/1d3802f42770.jpg`.
+
+### Single-file book (`--book`)
+
+With `--book`, `lj-archiver` also writes a `book.adoc` at the archive root that
+assembles the whole archive into one AsciiDoc document. It `include::`s
+`index.adoc` and every archived post with `leveloffset=+1`, under `:doctype: book`
+with a generated `:toc:`:
+
+    = <journal> Archive
+    :doctype: book
+    :toc:
+
+    include::index.adoc[leveloffset=+1]
+
+    include::posts/166511.adoc[leveloffset=+1]
+
+`book.adoc` is regenerated on every run (including with `--resume`) and lists
+exactly the posts `index.adoc` lists. Convert it with a tool such as `asciidoctor`
+or `asciidoctor-pdf` to render the journal as a single HTML page or PDF.
 
 ## Behavior
 

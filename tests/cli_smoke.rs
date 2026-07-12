@@ -248,3 +248,60 @@ async fn cli_quiet_suppresses_all_progress() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::is_empty());
 }
+
+#[tokio::test]
+async fn cli_book_flag_writes_book_adoc() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    Command::cargo_bin("lj-archiver")
+        .unwrap()
+        .arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg("--book")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .success();
+
+    let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+    assert_eq!(
+        book,
+        "= news Archive\n:doctype: book\n:toc:\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166511.adoc[leveloffset=+1]\n"
+    );
+}
+
+#[tokio::test]
+async fn cli_without_book_flag_writes_no_book_adoc() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    Command::cargo_bin("lj-archiver")
+        .unwrap()
+        .arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .success();
+
+    assert!(!dir.path().join("out/book.adoc").exists());
+}
