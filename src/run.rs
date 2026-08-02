@@ -11,7 +11,7 @@ use crate::{
     models::{ArchiveTarget, ArchivedPost, Post, PostFailure, RunOptions},
     parser::parse_post_page,
     progress::Progress,
-    target::{journal_base_url, parse_target, post_url},
+    target::{journal_base_url, journals_alias, parse_target, post_ref_from_url, post_url},
 };
 use futures::{StreamExt, stream};
 use std::{collections::HashSet, path::PathBuf};
@@ -73,8 +73,8 @@ async fn archive_post(
     progress.single_started(id);
     let client = LjClient::new(options.user_agent.as_deref())?;
     let root = output_dir(options, &journal);
-    let archive = Archive::new(root.clone(), journal);
-    let post = fetch_and_write_post(&client, options, &archive, url, None).await?;
+    let archive = Archive::new(root.clone(), &journal);
+    let post = fetch_and_write_post(&client, options, &archive, &journal, id, &url, None).await?;
     progress.single_done(post.id, &post.path);
     let posts = [post];
     archive.write_index(&posts)?;
@@ -186,8 +186,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                 progress.post_failed(post.archived.id);
                 failures.push(PostFailure {
                     id: post.archived.id,
-                    url: journal_post_url(&journal, post.archived.id, &options.base_url)
-                        .unwrap_or_else(|_| options.base_url.clone()),
+                    url: post.delivered_url,
                     message: error.to_string(),
                 });
                 cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
@@ -317,37 +316,46 @@ async fn archive_journal_post(
         }
     };
 
-    let prepared = async {
-        let html = client.fetch_text(&url).await?;
-        let mut post = parse_post_page(&html, &url)?;
-        rewrite_post_media(&mut post, &options, &archive).await?;
-        let rewriter = LinkRewriter::pending(
-            journal_context.journal,
-            journal_context.id_set,
-            journal_context.link_base_url,
-        );
-        let rendered = render_post(&post, options.include_comments, Some(&rewriter));
-        let pending_path = archive.write_pending_post(post.id, &rendered)?;
+    let prepared = match fetch_requested_post(&client, &journal_context.journal, id, &url).await {
+        Ok(mut post) => {
+            let delivered_url = post.url.clone();
+            async {
+                rewrite_post_media(&mut post, &options, &archive).await?;
+                let rewriter = LinkRewriter::pending(
+                    journal_context.journal,
+                    journal_context.id_set,
+                    journal_context.link_base_url,
+                );
+                let rendered = render_post(&post, options.include_comments, Some(&rewriter));
+                let pending_path = archive.write_pending_post(id, &rendered)?;
 
-        Result::Ok(PreparedPost {
-            archived: ArchivedPost {
-                id: post.id,
-                title: post.title,
-                path: archive.post_path(post.id),
-            },
-            pending_path,
-            links: rewriter.pending_links(),
-        })
-    }
-    .await;
+                Result::Ok(PreparedPost {
+                    archived: ArchivedPost {
+                        id,
+                        title: post.title,
+                        path: archive.post_path(id),
+                    },
+                    delivered_url: delivered_url.clone(),
+                    pending_path,
+                    links: rewriter.pending_links(),
+                })
+            }
+            .await
+            .map_err(|error| (delivered_url, error))
+        }
+        Err(error) => Err((
+            delivered_url_from_error(&error).unwrap_or_else(|| url.clone()),
+            error,
+        )),
+    };
 
     match prepared {
         Ok(post) => JournalPostOutcome::Prepared(post),
-        Err(error) => {
+        Err((failure_url, error)) => {
             progress.post_failed(id);
             JournalPostOutcome::Failed(PostFailure {
                 id,
-                url,
+                url: failure_url,
                 message: error.to_string(),
             })
         }
@@ -374,20 +382,89 @@ async fn fetch_and_write_post(
     client: &LjClient,
     options: &RunOptions,
     archive: &Archive,
-    url: Url,
+    requested_journal: &str,
+    requested_id: u64,
+    requested_url: &Url,
     link_rewriter: Option<&LinkRewriter>,
 ) -> Result<ArchivedPost> {
-    let html = client.fetch_text(&url).await?;
-    let mut post = parse_post_page(&html, &url)?;
+    let mut post =
+        fetch_requested_post(client, requested_journal, requested_id, requested_url).await?;
     rewrite_post_media(&mut post, options, archive).await?;
     let rendered = render_post(&post, options.include_comments, link_rewriter);
-    let path = archive.write_post(post.id, &rendered)?;
+    let path = archive.write_post(requested_id, &rendered)?;
 
     Ok(ArchivedPost {
-        id: post.id,
+        id: requested_id,
         title: post.title.clone(),
         path,
     })
+}
+
+async fn fetch_requested_post(
+    client: &LjClient,
+    requested_journal: &str,
+    requested_id: u64,
+    requested_url: &Url,
+) -> Result<Post> {
+    let page = client.fetch_page(requested_url).await?;
+    let post = parse_post_page(&page.text, &page.final_url)?;
+    validate_requested_post_identity(requested_journal, requested_id, &post)?;
+    Ok(post)
+}
+
+fn validate_requested_post_identity(
+    requested_journal: &str,
+    requested_id: u64,
+    post: &Post,
+) -> Result<()> {
+    let final_identity = final_post_identity(&post.url);
+    let final_matches = match &final_identity {
+        Some(FinalPostIdentity::Loopback { id }) => *id == requested_id,
+        Some(FinalPostIdentity::LiveJournal { journal, id }) => {
+            *id == requested_id && journals_alias(journal, requested_journal)
+        }
+        None => true,
+    };
+    let returned_matches = post.id == requested_id;
+
+    if final_matches && returned_matches {
+        return Ok(());
+    }
+
+    let final_identity = match final_identity {
+        Some(FinalPostIdentity::Loopback { id }) => format!("post ID {id}"),
+        Some(FinalPostIdentity::LiveJournal { journal, id }) => format!("{journal}/{id}"),
+        None => "unrecognized".to_string(),
+    };
+    Err(LjError::Parse {
+        url: post.url.to_string(),
+        reason: format!(
+            "post identity mismatch: requested {requested_journal}/{requested_id}; \
+             final URL identity {final_identity}; returned parsed identity {}/{}",
+            post.journal, post.id
+        ),
+    })
+}
+
+fn final_post_identity(url: &Url) -> Option<FinalPostIdentity> {
+    if crate::net::is_loopback_test_server(url) {
+        let segment = url.path_segments()?.rfind(|segment| !segment.is_empty())?;
+        let id = segment
+            .strip_suffix(".html")
+            .unwrap_or(segment)
+            .parse()
+            .ok()?;
+        return (id > 0).then_some(FinalPostIdentity::Loopback { id });
+    }
+
+    post_ref_from_url(url).map(|(journal, id)| FinalPostIdentity::LiveJournal { journal, id })
+}
+
+fn delivered_url_from_error(error: &LjError) -> Option<Url> {
+    match error {
+        LjError::Parse { url, .. } | LjError::AgeGated { url } => Url::parse(url).ok(),
+        _ => None,
+    }
 }
 
 fn output_dir(options: &RunOptions, journal: &str) -> std::path::PathBuf {
@@ -439,6 +516,7 @@ fn failure_reason(failed_pages: usize, failures: &[PostFailure]) -> String {
 
 struct PreparedPost {
     archived: ArchivedPost,
+    delivered_url: Url,
     pending_path: PathBuf,
     links: Vec<PendingLink>,
 }
@@ -454,6 +532,11 @@ enum JournalPostOutcome {
     Prepared(PreparedPost),
     Skipped(ArchivedPost),
     Failed(PostFailure),
+}
+
+enum FinalPostIdentity {
+    Loopback { id: u64 },
+    LiveJournal { journal: String, id: u64 },
 }
 
 async fn rewrite_post_media(
@@ -560,6 +643,239 @@ mod tests {
         let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
         assert!(post.contains("= Post Title"));
         assert!(post.contains("Hello *world*."));
+    }
+
+    #[tokio::test]
+    async fn journal_rejects_returned_identity_collision_and_uses_final_failure_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/news/1.html">One</a><a href="/news/2.html">Two</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/delivered/1.html?source=returned-2"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                "<p>Returned as post two.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                "<p>Actual post two.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let mut options = journal_cli(&server, dir.path(), false).options();
+        options.generate_book = true;
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        let failure = &outcome.failures[0];
+        assert_eq!(failure.id, 1);
+        assert_eq!(
+            failure.url.as_str(),
+            format!("{}/delivered/1.html?source=returned-2", server.uri())
+        );
+        assert!(failure.message.contains("requested news/1"), "{failure:?}");
+        assert!(
+            failure.message.contains("returned parsed identity news/2"),
+            "{failure:?}"
+        );
+
+        let mut post_files = std::fs::read_dir(dir.path().join("out/posts"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.extension().and_then(|extension| extension.to_str()) == Some("adoc"))
+                    .then_some(path.file_name().unwrap().to_owned())
+            })
+            .collect::<Vec<_>>();
+        post_files.sort();
+        assert_eq!(post_files, [std::ffi::OsString::from("2.adoc")]);
+        assert!(!dir.path().join("out/posts/1.adoc").exists());
+        let post = std::fs::read_to_string(dir.path().join("out/posts/2.adoc")).unwrap();
+        assert_eq!(post.matches(":lj-id: 2").count(), 1, "{post}");
+
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert_eq!(index.matches("|2 |xref:posts/2.adoc").count(), 1, "{index}");
+        assert!(!index.contains("|1 |xref:posts/1.adoc"), "{index}");
+        let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+        assert_eq!(book.matches("include::posts/2.adoc").count(), 1, "{book}");
+        assert!(!book.contains("include::posts/1.adoc"), "{book}");
+        assert!(pending_post_paths(dir.path().join("out/posts")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn single_post_rejects_returned_identity_without_writing_archive_files() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                "<p>Wrong post.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let mut options = test_cli(&server, dir.path(), "1", false, true).options();
+        options.generate_book = true;
+        let requested_url = format!("{}/news/1.html", server.uri());
+
+        let error = run_archive(&requested_url, &options, &Progress::hidden())
+            .await
+            .unwrap_err();
+
+        match error {
+            LjError::Parse { url, reason } => {
+                assert_eq!(url, requested_url);
+                assert!(reason.contains("requested news/1"), "{reason}");
+                assert!(reason.contains("final URL identity post ID 1"), "{reason}");
+                assert!(
+                    reason.contains("returned parsed identity news/2"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+
+        for relative in [
+            "posts/1.adoc",
+            "posts/2.adoc",
+            "index.adoc",
+            "book.adoc",
+            "posts/1.pending",
+            "posts/2.pending",
+        ] {
+            assert!(
+                !dir.path().join("out").join(relative).exists(),
+                "{relative}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_post_uses_delivered_final_url_after_redirect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/delivered/1.html?source=redirect"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Delivered body.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let options = test_cli(&server, dir.path(), "1", false, true).options();
+        let requested_url = format!("{}/news/1.html", server.uri());
+        let final_url = format!("{}/delivered/1.html?source=redirect", server.uri());
+
+        run_archive(&requested_url, &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        let post = std::fs::read_to_string(dir.path().join("out/posts/1.adoc")).unwrap();
+        assert!(post.contains(&format!(":lj-url: {final_url}")), "{post}");
+        assert!(
+            !post.contains(&format!(":lj-url: {requested_url}")),
+            "{post}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_post_rejects_wrong_numeric_final_url_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/delivered/2?source=wrong-id"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Correct article under a wrong final path.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let options = test_cli(&server, dir.path(), "1", false, true).options();
+        let requested_url = format!("{}/news/1.html", server.uri());
+        let final_url = format!("{}/delivered/2?source=wrong-id", server.uri());
+
+        let error = run_archive(&requested_url, &options, &Progress::hidden())
+            .await
+            .unwrap_err();
+
+        match error {
+            LjError::Parse { url, reason } => {
+                assert_eq!(url, final_url);
+                assert!(reason.contains("requested news/1"), "{reason}");
+                assert!(reason.contains("final URL identity post ID 2"), "{reason}");
+                assert!(
+                    reason.contains("returned parsed identity news/1"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+        assert!(!dir.path().join("out/posts/1.adoc").exists());
+        assert!(!dir.path().join("out/index.adoc").exists());
+    }
+
+    #[test]
+    fn final_livejournal_post_reference_accepts_hyphen_underscore_alias() {
+        let final_url =
+            Url::parse("https://evo-lutio.livejournal.com/240331.html?source=redirect").unwrap();
+        let (final_journal, final_id) = crate::target::post_ref_from_url(&final_url).unwrap();
+
+        assert_eq!(final_id, 240331);
+        assert!(crate::target::journals_alias("evo_lutio", &final_journal));
     }
 
     #[tokio::test]

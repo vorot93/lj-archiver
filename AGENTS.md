@@ -153,6 +153,15 @@ Real post pages use `aentry-post*` markup — body `.aentry-post__text`, title `
 
 On a bulk journal export, rendered bodies and their pending links are staged on disk as non-public `posts/*.pending` files while the fetch stream remains bounded by `RunOptions::concurrency`. Finalization first resolves every staged link to its canonical external URL and atomically writes an externally complete public `.adoc`; only those successful writes plus resume-skipped files form the final exported ID set. A best-effort atomic second pass upgrades links to successful targets in that set, so a failed upgrade retains the complete external fallback and public files never contain staging tokens. Resume-skipped posts have stale `xref:<id>.adoc[…]` links to missing IDs repaired back to canonical external URLs. Pending files are removed on both finalization success and failure, and failed posts stay out of `index.adoc` and `book.adoc`. Journal names are matched with `-`/`_` folded together (LiveJournal serves an underscore username `a_b` at the hyphen subdomain `a-b.livejournal.com`, so the two spellings denote one journal). Downloaded media is stored once in a single `assets/` folder at the archive root (filenames are a URL hash, so a reused image is stored once and referenced as `../assets/<hash>.<ext>`).
 
+Fetched posts are parsed against the delivered final response URL, which is
+preserved as `Post.url` for rendering and downstream processing. Before media
+requests or writes, the parsed post ID must match the requested post; a
+recognizable final LiveJournal post URL's ID and journal alias must also match,
+and a loopback test URL's numeric final path segment (with optional `.html`)
+must match the requested ID. Identity mismatches fail only that row during
+journal exports and fail the whole run for a single-post target; no file is
+staged or written under the returned wrong ID.
+
 ## HTTP And Media Safety
 
 Keep network behavior conservative.
