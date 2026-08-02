@@ -27,6 +27,8 @@ pub enum LjError {
     AgeGated { url: String },
     #[error("could not discover journal `{journal}`: {reason}")]
     Discovery { journal: String, reason: String },
+    #[error("invalid archive at {path}: {reason}")]
+    InvalidArchive { path: PathBuf, reason: String },
     #[error("could not write {path}: {source}")]
     Write {
         path: PathBuf,

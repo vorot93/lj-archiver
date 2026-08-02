@@ -4,8 +4,11 @@ use crate::{
     links::POST_LINK_PREFIX_ATTRIBUTE,
     models::ArchivedPost,
     storage,
+    target::{is_valid_journal_name, journals_alias},
 };
 use std::{
+    collections::BTreeMap,
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
 };
@@ -14,6 +17,19 @@ use std::{
 pub struct Archive {
     root: PathBuf,
     journal: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingArchive {
+    pub journal: String,
+    pub posts: Vec<ArchivedPost>,
+    pub has_book: bool,
+}
+
+#[derive(Debug)]
+struct ExistingEntry {
+    path: PathBuf,
+    file_type: fs::FileType,
 }
 
 impl Archive {
@@ -34,6 +50,74 @@ impl Archive {
 
     pub fn post_exists(&self, id: u64) -> bool {
         self.post_path(id).is_file()
+    }
+
+    pub fn inspect_existing(&self) -> Result<Option<ExistingArchive>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => inspect_entries(entries, &self.root)?,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(invalid_archive(
+                    &self.root,
+                    format!("could not read directory: {source}"),
+                ));
+            }
+        };
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        let index_path = self.root.join("index.adoc");
+        let index = find_entry(&entries, "index.adoc")
+            .ok_or_else(|| invalid_archive(&index_path, "missing controlled index"))?;
+        if !index.file_type.is_file() {
+            return Err(invalid_archive(&index.path, "index is not a regular file"));
+        }
+        let index_contents = read_existing_file(&index.path)?;
+        let journal = index_contents
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("= "))
+            .and_then(|line| line.strip_suffix(" Archive"))
+            .ok_or_else(|| {
+                invalid_archive(&index.path, "first line is not a controlled archive title")
+            })?;
+        if !is_valid_journal_name(journal) {
+            return Err(invalid_archive(
+                &index.path,
+                format!("archive title contains invalid journal name {journal:?}"),
+            ));
+        }
+        if !journals_alias(journal, &self.journal) {
+            return Err(invalid_archive(
+                &index.path,
+                format!(
+                    "archive journal {journal:?} does not match requested journal {:?}",
+                    self.journal
+                ),
+            ));
+        }
+
+        let posts = match find_entry(&entries, "posts") {
+            None => Vec::new(),
+            Some(posts_entry) => inspect_posts(posts_entry)?,
+        };
+        let has_book = match find_entry(&entries, "book.adoc") {
+            None => false,
+            Some(book) if book.file_type.is_file() => true,
+            Some(book) => {
+                return Err(invalid_archive(
+                    &book.path,
+                    "book.adoc is not a regular file",
+                ));
+            }
+        };
+
+        Ok(Some(ExistingArchive {
+            journal: journal.to_string(),
+            posts,
+            has_book,
+        }))
     }
 
     pub fn write_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
@@ -125,12 +209,390 @@ impl Archive {
     }
 }
 
+fn inspect_entries(entries: fs::ReadDir, directory: &Path) -> Result<Vec<ExistingEntry>> {
+    entries
+        .map(|entry| {
+            let entry = entry.map_err(|source| {
+                invalid_archive(
+                    directory,
+                    format!("could not read directory entry: {source}"),
+                )
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|source| {
+                invalid_archive(&path, format!("could not inspect entry: {source}"))
+            })?;
+            Ok(ExistingEntry { path, file_type })
+        })
+        .collect()
+}
+
+fn find_entry<'a>(entries: &'a [ExistingEntry], name: &str) -> Option<&'a ExistingEntry> {
+    entries
+        .iter()
+        .find(|entry| entry.path.file_name() == Some(OsStr::new(name)))
+}
+
+fn inspect_posts(posts_entry: &ExistingEntry) -> Result<Vec<ArchivedPost>> {
+    if !posts_entry.file_type.is_dir() {
+        return Err(invalid_archive(
+            &posts_entry.path,
+            "posts path is not a directory",
+        ));
+    }
+    let entries = fs::read_dir(&posts_entry.path).map_err(|source| {
+        invalid_archive(
+            &posts_entry.path,
+            format!("could not read posts directory: {source}"),
+        )
+    })?;
+    let entries = inspect_entries(entries, &posts_entry.path)?;
+    let mut posts_by_id = BTreeMap::new();
+
+    for entry in entries {
+        if entry.path.extension() != Some(OsStr::new("adoc")) {
+            continue;
+        }
+        if !entry.file_type.is_file() {
+            return Err(invalid_archive(
+                &entry.path,
+                "public post candidate is not a regular file",
+            ));
+        }
+        let stem = entry
+            .path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| invalid_archive(&entry.path, "post id is not valid UTF-8"))?;
+        let id = stem
+            .parse::<u64>()
+            .map_err(|_| invalid_archive(&entry.path, "post id must be a positive integer"))?;
+        if id == 0 {
+            return Err(invalid_archive(
+                &entry.path,
+                "post id must be a positive integer",
+            ));
+        }
+        let contents = read_existing_file(&entry.path)?;
+        let title = contents
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("= "))
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .ok_or_else(|| {
+                invalid_archive(&entry.path, "first line is not a nonempty level-zero title")
+            })?;
+        let post = ArchivedPost {
+            id,
+            title: title.to_string(),
+            path: entry.path.clone(),
+        };
+        if posts_by_id.insert(id, post).is_some() {
+            return Err(invalid_archive(
+                &entry.path,
+                format!("duplicate numeric post id {id}"),
+            ));
+        }
+    }
+
+    Ok(posts_by_id.into_values().collect())
+}
+
+fn read_existing_file(path: &Path) -> Result<String> {
+    fs::read_to_string(path)
+        .map_err(|source| invalid_archive(path, format!("could not read regular file: {source}")))
+}
+
+fn invalid_archive(path: &Path, reason: impl Into<String>) -> LjError {
+    LjError::InvalidArchive {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::ArchivedPost;
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
     use tempfile::tempdir;
+
+    fn write_valid_index(root: &Path, journal: &str) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("index.adoc"), format!("= {journal} Archive\n")).unwrap();
+    }
+
+    fn assert_invalid_archive(error: LjError, path: &Path, reason_fragment: &str) {
+        match error {
+            LjError::InvalidArchive {
+                path: actual_path,
+                reason,
+            } => {
+                assert_eq!(actual_path, path);
+                assert!(
+                    reason.contains(reason_fragment),
+                    "expected reason {reason:?} to contain {reason_fragment:?}"
+                );
+            }
+            other => panic!("expected InvalidArchive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspection_returns_none_without_writing_for_missing_or_empty_root() {
+        let dir = tempdir().unwrap();
+        let missing_root = dir.path().join("missing");
+        let missing = Archive::new(&missing_root, "news");
+        assert_eq!(missing.inspect_existing().unwrap(), None);
+        assert!(!missing_root.exists());
+
+        let empty_root = dir.path().join("empty");
+        fs::create_dir(&empty_root).unwrap();
+        let empty = Archive::new(&empty_root, "news");
+        assert_eq!(empty.inspect_existing().unwrap(), None);
+        assert_eq!(fs::read_dir(&empty_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn inspection_rejects_every_nonempty_root_without_index() {
+        let dir = tempdir().unwrap();
+        for (name, entry_name, is_directory) in [
+            ("unrelated", "notes.txt", false),
+            ("lone-book", "book.adoc", false),
+            ("assets-only", "assets", true),
+            ("posts-only", "posts", true),
+        ] {
+            let root = dir.path().join(name);
+            fs::create_dir(&root).unwrap();
+            let entry = root.join(entry_name);
+            if is_directory {
+                fs::create_dir(&entry).unwrap();
+            } else {
+                fs::write(&entry, "support data").unwrap();
+            }
+            if name == "posts-only" {
+                fs::write(entry.join("1.adoc"), "= Existing\n").unwrap();
+            }
+
+            let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+            assert_invalid_archive(error, &root.join("index.adoc"), "missing");
+        }
+    }
+
+    #[test]
+    fn inspection_accepts_matching_index_with_zero_posts() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "news");
+
+        assert_eq!(
+            Archive::new(&root, "news").inspect_existing().unwrap(),
+            Some(ExistingArchive {
+                journal: "news".to_string(),
+                posts: Vec::new(),
+                has_book: false,
+            })
+        );
+    }
+
+    #[test]
+    fn inspection_accepts_case_and_hyphen_underscore_journal_alias() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "Evo-Lutio");
+
+        let existing = Archive::new(&root, "evo_lutio")
+            .inspect_existing()
+            .unwrap()
+            .unwrap();
+        assert_eq!(existing.journal, "Evo-Lutio");
+        assert!(existing.posts.is_empty());
+        assert!(!existing.has_book);
+    }
+
+    #[test]
+    fn inspection_rejects_mismatched_index_journal() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "other");
+
+        let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+        assert_invalid_archive(error, &root.join("index.adoc"), "does not match");
+    }
+
+    #[test]
+    fn inspection_rejects_invalid_index_journal_syntax() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "bad.name");
+
+        let error = Archive::new(&root, "bad.name")
+            .inspect_existing()
+            .unwrap_err();
+        assert_invalid_archive(error, &root.join("index.adoc"), "invalid journal");
+    }
+
+    #[test]
+    fn inspection_rejects_malformed_index_title() {
+        let dir = tempdir().unwrap();
+        for (name, title) in [
+            ("wrong-level", "== news Archive\n"),
+            ("wrong-suffix", "= news Archives\n"),
+            ("missing-title", ""),
+        ] {
+            let root = dir.path().join(name);
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("index.adoc"), title).unwrap();
+
+            let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+            assert_invalid_archive(error, &root.join("index.adoc"), "title");
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_index_that_is_not_a_regular_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        fs::create_dir_all(root.join("index.adoc")).unwrap();
+
+        let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+        assert_invalid_archive(error, &root.join("index.adoc"), "regular file");
+    }
+
+    #[test]
+    fn inspection_returns_sorted_numeric_posts_with_exact_paths_and_titles() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "news");
+        let posts = root.join("posts");
+        fs::create_dir(&posts).unwrap();
+        fs::write(posts.join("20.adoc"), "= Twentieth title\n\nBody\n").unwrap();
+        fs::write(posts.join("3.adoc"), "= Third title\n").unwrap();
+        fs::write(posts.join("10.pending"), "= Not public\n").unwrap();
+        fs::create_dir(posts.join("11.pending")).unwrap();
+        fs::write(posts.join("support.txt"), "ignored").unwrap();
+
+        let existing = Archive::new(&root, "news")
+            .inspect_existing()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            existing.posts,
+            vec![
+                ArchivedPost {
+                    id: 3,
+                    title: "Third title".to_string(),
+                    path: posts.join("3.adoc"),
+                },
+                ArchivedPost {
+                    id: 20,
+                    title: "Twentieth title".to_string(),
+                    path: posts.join("20.adoc"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn inspection_rejects_zero_and_nonnumeric_public_post_ids() {
+        let dir = tempdir().unwrap();
+        for (name, filename, reason) in [
+            ("zero", "0.adoc", "positive"),
+            ("nonnumeric", "draft.adoc", "positive"),
+        ] {
+            let root = dir.path().join(name);
+            write_valid_index(&root, "news");
+            fs::create_dir(root.join("posts")).unwrap();
+            let post = root.join("posts").join(filename);
+            fs::write(&post, "= Title\n").unwrap();
+
+            let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+            assert_invalid_archive(error, &post, reason);
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_duplicate_numeric_post_ids() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "news");
+        fs::create_dir(root.join("posts")).unwrap();
+        fs::write(root.join("posts/1.adoc"), "= One\n").unwrap();
+        fs::write(root.join("posts/01.adoc"), "= Duplicate\n").unwrap();
+
+        let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+        match error {
+            LjError::InvalidArchive { path, reason } => {
+                assert!(path == root.join("posts/1.adoc") || path == root.join("posts/01.adoc"));
+                assert!(reason.contains("duplicate"));
+                assert!(reason.contains('1'));
+            }
+            other => panic!("expected InvalidArchive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_public_post_candidate_that_is_not_a_regular_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "news");
+        fs::create_dir_all(root.join("posts/1.adoc")).unwrap();
+
+        let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+        assert_invalid_archive(error, &root.join("posts/1.adoc"), "regular file");
+    }
+
+    #[test]
+    fn inspection_rejects_missing_malformed_and_empty_post_titles() {
+        let dir = tempdir().unwrap();
+        for (name, contents) in [
+            ("missing", ""),
+            ("malformed", "== Nested heading\n"),
+            ("empty", "=    \n\nBody\n"),
+        ] {
+            let root = dir.path().join(name);
+            write_valid_index(&root, "news");
+            fs::create_dir(root.join("posts")).unwrap();
+            let post = root.join("posts/1.adoc");
+            fs::write(&post, contents).unwrap();
+
+            let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+            assert_invalid_archive(error, &post, "title");
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_posts_path_that_is_not_a_directory() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "news");
+        fs::write(root.join("posts"), "not a directory").unwrap();
+
+        let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+        assert_invalid_archive(error, &root.join("posts"), "directory");
+    }
+
+    #[test]
+    fn inspection_reports_book_presence_and_rejects_non_file_book() {
+        let dir = tempdir().unwrap();
+        let valid_root = dir.path().join("valid");
+        write_valid_index(&valid_root, "news");
+        fs::write(valid_root.join("book.adoc"), "= news Archive\n").unwrap();
+        let existing = Archive::new(&valid_root, "news")
+            .inspect_existing()
+            .unwrap()
+            .unwrap();
+        assert!(existing.has_book);
+
+        let invalid_root = dir.path().join("invalid");
+        write_valid_index(&invalid_root, "news");
+        fs::create_dir(invalid_root.join("book.adoc")).unwrap();
+        let error = Archive::new(&invalid_root, "news")
+            .inspect_existing()
+            .unwrap_err();
+        assert_invalid_archive(error, &invalid_root.join("book.adoc"), "regular file");
+    }
 
     #[test]
     fn writes_post_file_and_index() {
