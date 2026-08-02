@@ -122,14 +122,18 @@ impl Archive {
 
     pub fn write_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
         let path = self.post_path(id);
+        self.write_post_at(&path, contents)
+    }
+
+    pub(crate) fn write_post_at(&self, path: &Path, contents: &str) -> Result<PathBuf> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| LjError::Write {
                 path: parent.to_path_buf(),
                 source,
             })?;
         }
-        storage::write_atomic(&path, contents.as_bytes())?;
-        Ok(path)
+        storage::write_atomic(path, contents.as_bytes())?;
+        Ok(path.to_path_buf())
     }
 
     pub fn write_pending_post(&self, id: u64, contents: &str) -> Result<PathBuf> {

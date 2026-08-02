@@ -15,8 +15,9 @@ use crate::{
 };
 use futures::{StreamExt, stream};
 use std::{
-    collections::{BTreeMap, HashSet},
-    path::PathBuf,
+    collections::{BTreeMap, HashMap, HashSet},
+    ffi::OsStr,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use url::Url;
@@ -80,8 +81,14 @@ async fn archive_post(
     let generate_book =
         options.generate_book || existing.as_ref().is_some_and(|existing| existing.has_book);
     let mut posts = posts_by_id(existing.as_ref());
-    let mut candidate_ids = posts.keys().copied().collect::<HashSet<_>>();
-    candidate_ids.insert(id);
+    let destination = posts
+        .get(&id)
+        .map(|post| post.path.clone())
+        .unwrap_or_else(|| archive.post_path(id));
+    let mut target_filenames = trusted_target_filenames(&posts)?;
+    target_filenames
+        .entry(id)
+        .or_insert_with(|| format!("{id}.adoc"));
 
     progress.single_started(id);
     let client = LjClient::new(options.user_agent.as_deref())?;
@@ -92,7 +99,10 @@ async fn archive_post(
         &journal,
         id,
         &url,
-        candidate_ids,
+        PostWritePolicy {
+            destination,
+            target_filenames: Arc::new(target_filenames),
+        },
     )
     .await?;
     progress.single_done(post.id, &post.path);
@@ -119,14 +129,26 @@ async fn archive_journal(
 }
 
 trait FinalPostWriter {
-    fn write_post(&self, archive: &Archive, id: u64, contents: &str) -> Result<PathBuf>;
+    fn write_post(
+        &self,
+        archive: &Archive,
+        id: u64,
+        destination: &Path,
+        contents: &str,
+    ) -> Result<PathBuf>;
 }
 
 struct AtomicFinalPostWriter;
 
 impl FinalPostWriter for AtomicFinalPostWriter {
-    fn write_post(&self, archive: &Archive, id: u64, contents: &str) -> Result<PathBuf> {
-        archive.write_post(id, contents)
+    fn write_post(
+        &self,
+        archive: &Archive,
+        _id: u64,
+        destination: &Path,
+        contents: &str,
+    ) -> Result<PathBuf> {
+        archive.write_post_at(destination, contents)
     }
 }
 
@@ -144,6 +166,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         options.generate_book || existing.as_ref().is_some_and(|existing| existing.has_book);
     let mut posts = posts_by_id(existing.as_ref());
     let trusted_posts = Arc::new(posts.clone());
+    let mut target_filenames = trusted_target_filenames(&posts)?;
     let client = LjClient::new(options.user_agent.as_deref())?;
 
     progress.discovery_started();
@@ -151,11 +174,14 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         discover_post_ids(&client, &journal, &options.base_url, progress).await?;
     progress.archiving_started(ids.len());
 
-    let mut candidate_ids = posts.keys().copied().collect::<HashSet<_>>();
-    candidate_ids.extend(ids.iter().copied());
+    for id in &ids {
+        target_filenames
+            .entry(*id)
+            .or_insert_with(|| format!("{id}.adoc"));
+    }
     let journal_context = JournalPostContext {
         journal: journal.clone(),
-        id_set: candidate_ids,
+        target_filenames: Arc::new(target_filenames),
         trusted_posts,
     };
 
@@ -188,7 +214,12 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                         .and_then(|pending| {
                             let external =
                                 resolve_pending_links(&pending, &post.links, &no_local_ids);
-                            writer.write_post(&archive, post.archived.id, &external)
+                            writer.write_post(
+                                &archive,
+                                post.archived.id,
+                                &post.archived.path,
+                                &external,
+                            )
                         });
 
                 match first_stage {
@@ -228,7 +259,9 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         match archive.read_pending_post(&post.pending_path) {
             Ok(pending) => {
                 let local = resolve_pending_links(&pending, &post.links, &final_ids);
-                if let Err(error) = writer.write_post(&archive, post.archived.id, &local) {
+                if let Err(error) =
+                    writer.write_post(&archive, post.archived.id, &post.archived.path, &local)
+                {
                     tracing::warn!(
                         post_id = post.archived.id,
                         error = %error,
@@ -254,7 +287,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         match std::fs::read_to_string(&post.path) {
             Ok(existing) => match restore_missing_xrefs(&existing, &journal, &final_ids) {
                 Ok(repaired) if repaired != existing => {
-                    if let Err(error) = archive.write_post(post.id, &repaired) {
+                    if let Err(error) = archive.write_post_at(&post.path, &repaired) {
                         tracing::warn!(
                             post_id = post.id,
                             error = %error,
@@ -338,9 +371,14 @@ async fn archive_journal_post(
             let delivered_url = post.url.clone();
             async {
                 rewrite_post_media(&mut post, &options, &archive).await?;
-                let rewriter = LinkRewriter::pending(
+                let destination = journal_context
+                    .trusted_posts
+                    .get(&id)
+                    .map(|post| post.path.clone())
+                    .unwrap_or_else(|| archive.post_path(id));
+                let rewriter = LinkRewriter::pending_with_targets(
                     journal_context.journal,
-                    journal_context.id_set,
+                    journal_context.target_filenames,
                     post.url.clone(),
                 );
                 let rendered = render_post(&post, options.include_comments, Some(&rewriter));
@@ -350,7 +388,7 @@ async fn archive_journal_post(
                     archived: ArchivedPost {
                         id,
                         title: post.title,
-                        path: archive.post_path(id),
+                        path: destination,
                     },
                     delivered_url: delivered_url.clone(),
                     pending_path,
@@ -397,6 +435,43 @@ fn posts_by_id(existing: Option<&ExistingArchive>) -> BTreeMap<u64, ArchivedPost
         .collect()
 }
 
+fn trusted_target_filenames(posts: &BTreeMap<u64, ArchivedPost>) -> Result<HashMap<u64, String>> {
+    posts
+        .values()
+        .map(|post| trusted_target_filename(post).map(|filename| (post.id, filename)))
+        .collect()
+}
+
+fn trusted_target_filename(post: &ArchivedPost) -> Result<String> {
+    let filename = post
+        .path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| invalid_trusted_post_path(post, "filename is not valid UTF-8"))?;
+    let stem = filename
+        .strip_suffix(".adoc")
+        .ok_or_else(|| invalid_trusted_post_path(post, "filename is not numeric .adoc"))?;
+    let parsed_id = stem
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| invalid_trusted_post_path(post, "filename is not positive numeric .adoc"))?;
+    if parsed_id != post.id {
+        return Err(invalid_trusted_post_path(
+            post,
+            format!("filename identifies post {parsed_id}, expected {}", post.id),
+        ));
+    }
+    Ok(filename.to_string())
+}
+
+fn invalid_trusted_post_path(post: &ArchivedPost, reason: impl Into<String>) -> LjError {
+    LjError::InvalidArchive {
+        path: post.path.clone(),
+        reason: reason.into(),
+    }
+}
+
 fn write_manifests(
     archive: &Archive,
     posts: &BTreeMap<u64, ArchivedPost>,
@@ -417,20 +492,29 @@ async fn fetch_and_write_post(
     requested_journal: &str,
     requested_id: u64,
     requested_url: &Url,
-    candidate_ids: HashSet<u64>,
+    write_policy: PostWritePolicy,
 ) -> Result<ArchivedPost> {
     let mut post =
         fetch_requested_post(client, requested_journal, requested_id, requested_url).await?;
     rewrite_post_media(&mut post, options, archive).await?;
-    let rewriter = LinkRewriter::new(requested_journal, candidate_ids, post.url.clone());
+    let rewriter = LinkRewriter::with_targets(
+        requested_journal,
+        write_policy.target_filenames,
+        post.url.clone(),
+    );
     let rendered = render_post(&post, options.include_comments, Some(&rewriter));
-    let path = archive.write_post(requested_id, &rendered)?;
+    let path = archive.write_post_at(&write_policy.destination, &rendered)?;
 
     Ok(ArchivedPost {
         id: requested_id,
         title: post.title.clone(),
         path,
     })
+}
+
+struct PostWritePolicy {
+    destination: PathBuf,
+    target_filenames: Arc<HashMap<u64, String>>,
 }
 
 async fn fetch_requested_post(
@@ -588,7 +672,7 @@ struct PreparedPost {
 #[derive(Clone)]
 struct JournalPostContext {
     journal: String,
-    id_set: HashSet<u64>,
+    target_filenames: Arc<HashMap<u64, String>>,
     trusted_posts: Arc<BTreeMap<u64, ArchivedPost>>,
 }
 
@@ -696,6 +780,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_post_same_id_update_preserves_alias_path_manifests_and_next_run() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Updated alias body.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("out");
+        let baseline = "= Existing Alias\n\nOld bytes.\n";
+        seed_existing_archive_at(
+            dir.path(),
+            &[(1, "01.adoc", "Existing Alias", baseline)],
+            true,
+        );
+        let options = test_cli(&server, dir.path(), "1", false, true).options();
+        let target = format!("{}/news/1.html", server.uri());
+        let expected_post = format!(
+            concat!(
+                "= Post Title\n\n",
+                ":lj-id: 1\n",
+                ":lj-url: {}\n",
+                ":lj-author: news\n",
+                "ifndef::lj-archiver-post-link-prefix",
+                "[:lj-archiver-post-link-prefix:]\n\n",
+                "Updated alias body.\n",
+            ),
+            target
+        );
+
+        let first = run_archive(&target, &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(first.archived, 1);
+        assert_eq!(
+            std::fs::read_to_string(output.join("posts/01.adoc")).unwrap(),
+            expected_post
+        );
+        assert!(!output.join("posts/1.adoc").exists());
+        assert_eq!(
+            std::fs::read_to_string(output.join("index.adoc")).unwrap(),
+            concat!(
+                "= news Archive\n\n",
+                "|===\n|Post ID |Title\n\n",
+                "|1 |xref:posts/01.adoc[Post Title]\n",
+                "|===\n",
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(output.join("book.adoc")).unwrap(),
+            concat!(
+                "= news Archive\n",
+                ":doctype: book\n",
+                ":toc:\n",
+                ":imagesdir: posts\n",
+                ":lj-archiver-post-link-prefix: posts/\n\n",
+                "include::index.adoc[leveloffset=+1]\n",
+                "\ninclude::posts/01.adoc[leveloffset=+1]\n",
+            )
+        );
+        let inspected = Archive::new(&output, "news")
+            .inspect_existing()
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected.posts.len(), 1);
+        assert_eq!(inspected.posts[0].id, 1);
+        assert_eq!(inspected.posts[0].path, output.join("posts/01.adoc"));
+
+        let second = run_archive(&target, &options, &Progress::hidden())
+            .await
+            .unwrap();
+        assert_eq!(second.archived, 1);
+        assert_eq!(
+            std::fs::read_to_string(output.join("posts/01.adoc")).unwrap(),
+            expected_post
+        );
+        assert!(!output.join("posts/1.adoc").exists());
+    }
+
+    #[tokio::test]
     async fn resume_does_not_skip_a_post_absent_from_the_inspected_snapshot() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -711,7 +880,7 @@ mod tests {
         let archive = Archive::new(dir.path().join("out"), "news");
         let journal_context = JournalPostContext {
             journal: "news".to_string(),
-            id_set: HashSet::from([1]),
+            target_filenames: Arc::new(HashMap::from([(1, "1.adoc".to_string())])),
             trusted_posts: Arc::new(BTreeMap::new()),
         };
 
@@ -1593,6 +1762,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_rediscovery_retains_omitted_alias_and_targets_it_from_text_and_image_links() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/2024/12/">Old</a><a href="/2025/01/">Current</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2025/01/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/2.html">Two</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                concat!(
+                    r#"<p><a href="https://news.livejournal.com/1.html">Post one</a> "#,
+                    r#"<a href="https://news.livejournal.com/1.html">"#,
+                    r#"<img src="https://cdn.example.test/photo.jpg" alt="photo"></a></p>"#,
+                ),
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let baseline = "= Existing Alias\n\nOriginal alias body.\n";
+        seed_existing_archive_at(
+            dir.path(),
+            &[(1, "01.adoc", "Existing Alias", baseline)],
+            true,
+        );
+        let options = journal_cli(&server, dir.path(), false).options();
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.failed_pages, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/posts/01.adoc")).unwrap(),
+            baseline
+        );
+        assert!(!dir.path().join("out/posts/1.adoc").exists());
+        let post_two = std::fs::read_to_string(dir.path().join("out/posts/2.adoc")).unwrap();
+        assert_eq!(
+            post_two.matches("xref:01.adoc[Post one]").count(),
+            1,
+            "{post_two}"
+        );
+        assert_eq!(
+            post_two
+                .matches("link={lj-archiver-post-link-prefix}01.adoc")
+                .count(),
+            1,
+            "{post_two}"
+        );
+        assert!(!post_two.contains("xref:1.adoc"), "{post_two}");
+        assert!(!post_two.contains("post-link-prefix}1.adoc"), "{post_two}");
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert_eq!(
+            index.matches("|1 |xref:posts/01.adoc").count(),
+            1,
+            "{index}"
+        );
+        assert_eq!(index.matches("|2 |xref:posts/2.adoc").count(), 1, "{index}");
+        let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+        assert_eq!(book.matches("include::posts/01.adoc").count(), 1, "{book}");
+        assert_eq!(book.matches("include::posts/2.adoc").count(), 1, "{book}");
+    }
+
+    #[tokio::test]
     async fn single_post_rejects_unverified_output_before_requests_or_writes() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2314,6 +2567,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journal_same_id_refetch_replaces_only_the_trusted_alias_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">One</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Journal alias replacement.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        seed_existing_archive_at(
+            dir.path(),
+            &[(1, "01.adoc", "Existing Alias", "= Existing Alias\n\nOld.\n")],
+            true,
+        );
+        let options = journal_cli(&server, dir.path(), false).options();
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.failed, 0);
+        let alias = dir.path().join("out/posts/01.adoc");
+        let expected = format!(
+            concat!(
+                "= Post Title\n\n",
+                ":lj-id: 1\n",
+                ":lj-url: {}/news/1.html\n",
+                ":lj-author: news\n",
+                "ifndef::lj-archiver-post-link-prefix",
+                "[:lj-archiver-post-link-prefix:]\n\n",
+                "Journal alias replacement.\n",
+            ),
+            server.uri()
+        );
+        assert_eq!(std::fs::read_to_string(alias).unwrap(), expected);
+        assert!(!dir.path().join("out/posts/1.adoc").exists());
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert_eq!(
+            index.matches("|1 |xref:posts/01.adoc").count(),
+            1,
+            "{index}"
+        );
+        assert_eq!(index.matches("xref:posts/1.adoc").count(), 0, "{index}");
+        let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+        assert_eq!(book.matches("include::posts/01.adoc").count(), 1, "{book}");
+        assert_eq!(book.matches("include::posts/1.adoc").count(), 0, "{book}");
+    }
+
+    #[tokio::test]
+    async fn failed_final_write_retains_alias_and_manifests_only_its_actual_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">One</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Replacement must fail.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let baseline = "= Existing Alias\n\nxref:2.adoc[Post two]\n";
+        let repaired_baseline =
+            "= Existing Alias\n\nhttps://news.livejournal.com/2.html[Post two]\n";
+        seed_existing_archive_at(
+            dir.path(),
+            &[(1, "01.adoc", "Existing Alias", baseline)],
+            true,
+        );
+        let options = journal_cli(&server, dir.path(), false).options();
+        let writer = InjectedFinalPostWriter::failing_on([(1, 1)]);
+
+        let outcome =
+            archive_journal_with_writer(&options, &Progress::hidden(), "news".to_string(), &writer)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(writer.calls_for(1), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/posts/01.adoc")).unwrap(),
+            repaired_baseline
+        );
+        assert!(!dir.path().join("out/posts/1.adoc").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap(),
+            concat!(
+                "= news Archive\n\n",
+                "|===\n|Post ID |Title\n\n",
+                "|1 |xref:posts/01.adoc[Existing Alias]\n",
+                "|===\n",
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap(),
+            concat!(
+                "= news Archive\n",
+                ":doctype: book\n",
+                ":toc:\n",
+                ":imagesdir: posts\n",
+                ":lj-archiver-post-link-prefix: posts/\n\n",
+                "include::index.adoc[leveloffset=+1]\n",
+                "\ninclude::posts/01.adoc[leveloffset=+1]\n",
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refetch_retains_only_alias_and_keeps_actual_manifest_targets() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">One</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let baseline = "= Existing Alias\n\nPublic baseline bytes.\n";
+        seed_existing_archive_at(
+            dir.path(),
+            &[(1, "01.adoc", "Existing Alias", baseline)],
+            true,
+        );
+        let options = journal_cli(&server, dir.path(), false).options();
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/posts/01.adoc")).unwrap(),
+            baseline
+        );
+        assert!(!dir.path().join("out/posts/1.adoc").exists());
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert_eq!(
+            index.matches("|1 |xref:posts/01.adoc").count(),
+            1,
+            "{index}"
+        );
+        assert_eq!(index.matches("xref:posts/1.adoc").count(), 0, "{index}");
+        let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+        assert_eq!(book.matches("include::posts/01.adoc").count(), 1, "{book}");
+        assert_eq!(book.matches("include::posts/1.adoc").count(), 0, "{book}");
+    }
+
+    #[tokio::test]
     async fn upgrade_write_failure_retains_external_fallback_and_cleans_up() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2430,6 +2879,72 @@ mod tests {
         assert!(!index.contains("xref:posts/2.adoc"), "got: {index}");
     }
 
+    #[tokio::test]
+    async fn resume_repair_replaces_only_alias_bytes_without_canonical_duplicate() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/news/1.html">One</a><a href="/news/2.html">Two</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        seed_existing_archive_at(
+            dir.path(),
+            &[(
+                1,
+                "01.adoc",
+                "Existing Alias",
+                "= Existing Alias\n\nxref:002.adoc[Post two]\n",
+            )],
+            false,
+        );
+        let options = journal_cli(&server, dir.path(), true).options();
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/posts/01.adoc")).unwrap(),
+            "= Existing Alias\n\nhttps://news.livejournal.com/2.html[Post two]\n"
+        );
+        assert!(!dir.path().join("out/posts/1.adoc").exists());
+        let inspected = Archive::new(dir.path().join("out"), "news")
+            .inspect_existing()
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected.posts.len(), 1);
+        assert_eq!(
+            inspected.posts[0].path,
+            dir.path().join("out/posts/01.adoc")
+        );
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert_eq!(
+            index.matches("|1 |xref:posts/01.adoc").count(),
+            1,
+            "{index}"
+        );
+    }
+
     fn test_cli(
         server: &MockServer,
         temp_dir: &std::path::Path,
@@ -2514,6 +3029,32 @@ mod tests {
                 id,
                 title: title.to_string(),
                 path: archive.write_post(id, contents).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        archive.write_index(&archived).unwrap();
+        if generate_book {
+            archive.write_book(&archived).unwrap();
+        }
+        archive
+    }
+
+    fn seed_existing_archive_at(
+        temp_dir: &std::path::Path,
+        posts: &[(u64, &str, &str, &str)],
+        generate_book: bool,
+    ) -> Archive {
+        let archive = Archive::new(temp_dir.join("out"), "news");
+        let archived = posts
+            .iter()
+            .map(|&(id, filename, title, contents)| {
+                let path = temp_dir.join("out/posts").join(filename);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, contents).unwrap();
+                ArchivedPost {
+                    id,
+                    title: title.to_string(),
+                    path,
+                }
             })
             .collect::<Vec<_>>();
         archive.write_index(&archived).unwrap();
@@ -2609,7 +3150,13 @@ mod tests {
     }
 
     impl FinalPostWriter for InjectedFinalPostWriter {
-        fn write_post(&self, archive: &Archive, id: u64, contents: &str) -> Result<PathBuf> {
+        fn write_post(
+            &self,
+            archive: &Archive,
+            id: u64,
+            destination: &Path,
+            contents: &str,
+        ) -> Result<PathBuf> {
             let call = {
                 let mut calls = self.calls.lock().unwrap();
                 let call = calls.entry(id).or_default();
@@ -2618,14 +3165,14 @@ mod tests {
             };
             if self.failing_calls.contains(&(id, call)) {
                 return Err(LjError::Write {
-                    path: archive.post_path(id),
+                    path: destination.to_path_buf(),
                     source: std::io::Error::other(format!(
                         "injected final post write failure for {id}, call {call}"
                     )),
                 });
             }
 
-            archive.write_post(id, contents)
+            archive.write_post_at(destination, contents)
         }
     }
 

@@ -5,7 +5,7 @@ use crate::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use url::Url;
 
@@ -33,7 +33,7 @@ enum RewriteMode {
 
 pub struct LinkRewriter {
     journal: String,
-    ids: HashSet<u64>,
+    targets: Arc<HashMap<u64, String>>,
     base_url: Url,
     mode: RewriteMode,
     pending_links: Mutex<Vec<PendingLink>>,
@@ -41,9 +41,17 @@ pub struct LinkRewriter {
 
 impl LinkRewriter {
     pub fn new(journal: impl Into<String>, ids: HashSet<u64>, base_url: Url) -> Self {
+        Self::with_targets(journal, canonical_targets(ids), base_url)
+    }
+
+    pub(crate) fn with_targets(
+        journal: impl Into<String>,
+        targets: Arc<HashMap<u64, String>>,
+        base_url: Url,
+    ) -> Self {
         Self {
             journal: journal.into(),
-            ids,
+            targets,
             base_url,
             mode: RewriteMode::Direct,
             pending_links: Mutex::new(Vec::new()),
@@ -51,9 +59,17 @@ impl LinkRewriter {
     }
 
     pub fn pending(journal: impl Into<String>, ids: HashSet<u64>, base_url: Url) -> Self {
+        Self::pending_with_targets(journal, canonical_targets(ids), base_url)
+    }
+
+    pub(crate) fn pending_with_targets(
+        journal: impl Into<String>,
+        targets: Arc<HashMap<u64, String>>,
+        base_url: Url,
+    ) -> Self {
         Self {
             journal: journal.into(),
-            ids,
+            targets,
             base_url,
             mode: RewriteMode::Pending,
             pending_links: Mutex::new(Vec::new()),
@@ -75,14 +91,15 @@ impl LinkRewriter {
     fn local_post_target(&self, href: &str, context: LocalTargetContext) -> Option<String> {
         let url = self.resolved_http_url(href)?;
         let (journal, id) = post_ref_from_url(&url)?;
-        if !journals_alias(&journal, &self.journal) || !self.ids.contains(&id) {
+        if !journals_alias(&journal, &self.journal) {
             return None;
         }
+        let filename = self.targets.get(&id)?;
 
         let local_target = match context {
-            LocalTargetContext::XrefMacro => format!("xref:{id}.adoc"),
+            LocalTargetContext::XrefMacro => format!("xref:{filename}"),
             LocalTargetContext::ImageLinkAttribute => {
-                format!("{POST_LINK_PREFIX_REFERENCE}{id}.adoc")
+                format!("{POST_LINK_PREFIX_REFERENCE}{filename}")
             }
         };
 
@@ -123,6 +140,14 @@ impl LinkRewriter {
             .expect("pending link recorder mutex poisoned")
             .clone()
     }
+}
+
+fn canonical_targets(ids: HashSet<u64>) -> Arc<HashMap<u64, String>> {
+    Arc::new(
+        ids.into_iter()
+            .map(|id| (id, format!("{id}.adoc")))
+            .collect(),
+    )
 }
 
 fn pending_external_target(url: &Url, context: LocalTargetContext) -> String {
@@ -274,6 +299,14 @@ pub(crate) fn restore_missing_xrefs(
 mod tests {
     use super::*;
 
+    fn direct_rewriter_with_targets(targets: HashMap<u64, String>, base_url: Url) -> LinkRewriter {
+        LinkRewriter::with_targets("news", Arc::new(targets), base_url)
+    }
+
+    fn pending_rewriter_with_targets(targets: HashMap<u64, String>, base_url: Url) -> LinkRewriter {
+        LinkRewriter::pending_with_targets("news", Arc::new(targets), base_url)
+    }
+
     fn pending_link(
         token: impl Into<String>,
         target_id: u64,
@@ -328,6 +361,59 @@ mod tests {
         assert_eq!(
             r.image_link_target(href),
             Some("{lj-archiver-post-link-prefix}166512.adoc".to_string())
+        );
+    }
+
+    #[test]
+    fn target_aware_direct_targets_preserve_aliases_in_text_and_image_contexts() {
+        let r = direct_rewriter_with_targets(
+            HashMap::from([(1, "01.adoc".to_string()), (2, "2.adoc".to_string())]),
+            Url::parse("https://news.livejournal.com/").unwrap(),
+        );
+
+        assert_eq!(
+            r.xref_target("https://news.livejournal.com/1.html"),
+            Some("xref:01.adoc".to_string())
+        );
+        assert_eq!(
+            r.image_link_target("https://news.livejournal.com/1.html"),
+            Some("{lj-archiver-post-link-prefix}01.adoc".to_string())
+        );
+        assert_eq!(
+            r.xref_target("https://news.livejournal.com/2.html"),
+            Some("xref:2.adoc".to_string())
+        );
+    }
+
+    #[test]
+    fn target_aware_pending_records_exact_alias_targets_for_both_contexts() {
+        let r = pending_rewriter_with_targets(
+            HashMap::from([(1, "01.adoc".to_string())]),
+            Url::parse("https://news.livejournal.com/").unwrap(),
+        );
+        let text_token = r
+            .xref_target("https://news.livejournal.com/1.html")
+            .unwrap();
+        let image_token = r
+            .image_link_target("https://news.livejournal.com/1.html")
+            .unwrap();
+        let links = r.pending_links();
+
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].token, text_token);
+        assert_eq!(links[0].local_target, "xref:01.adoc");
+        assert_eq!(links[1].token, image_token);
+        assert_eq!(
+            links[1].local_target,
+            "{lj-archiver-post-link-prefix}01.adoc"
+        );
+        assert_eq!(
+            resolve_pending_links(
+                &format!("{text_token}[One] {image_token}"),
+                &links,
+                &HashSet::from([1]),
+            ),
+            "xref:01.adoc[One] {lj-archiver-post-link-prefix}01.adoc"
         );
     }
 
@@ -744,6 +830,18 @@ mod tests {
             )
             .unwrap(),
             "https://news.livejournal.com/2.html[Two] and xref:3.adoc[Three]"
+        );
+    }
+    #[test]
+    fn restore_missing_xrefs_parses_numeric_aliases_by_id() {
+        assert_eq!(
+            restore_missing_xrefs(
+                "xref:01.adoc[One] and xref:002.adoc[Two]",
+                "news",
+                &HashSet::from([1]),
+            )
+            .unwrap(),
+            "xref:01.adoc[One] and https://news.livejournal.com/2.html[Two]"
         );
     }
 }
