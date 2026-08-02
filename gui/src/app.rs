@@ -170,7 +170,13 @@ mod tests {
         app.update_state(&Message::TargetChanged("news".to_string()));
         app.update_state(&Message::FolderChosen(Some(output)));
 
-        drop(app.update(Message::Start));
+        let task = app.update(Message::Start);
+        assert_eq!(
+            task.units(),
+            0,
+            "invalid GUI starts must not schedule archive work"
+        );
+        drop(task);
 
         assert!(!matches!(app.state, State::Running(_)));
         let State::Error { message } = &app.state else {
