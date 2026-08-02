@@ -159,7 +159,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         trusted_posts,
     };
 
-    let outcomes: Vec<_> = stream::iter(ids)
+    let outcomes = stream::iter(ids)
         .map(|id| {
             let archive = archive.clone();
             let client = client.clone();
@@ -171,57 +171,58 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                 archive_journal_post(client, options, archive, id, journal_context, &progress).await
             }
         })
-        .buffer_unordered(options.concurrency)
-        .collect()
-        .await;
+        .buffer_unordered(options.concurrency);
+    futures::pin_mut!(outcomes);
 
-    let mut prepared = Vec::new();
-    let mut skipped_posts = Vec::new();
+    let mut finalized = Vec::new();
     let mut failures = Vec::new();
     let mut skipped = 0usize;
-    for outcome in outcomes {
+    let mut archived = 0usize;
+    let no_local_ids = HashSet::new();
+    while let Some(outcome) = outcomes.next().await {
         match outcome {
-            JournalPostOutcome::Prepared(post) => prepared.push(post),
+            JournalPostOutcome::Prepared(mut post) => {
+                let first_stage =
+                    archive
+                        .read_pending_post(&post.pending_path)
+                        .and_then(|pending| {
+                            let external =
+                                resolve_pending_links(&pending, &post.links, &no_local_ids);
+                            writer.write_post(&archive, post.archived.id, &external)
+                        });
+
+                match first_stage {
+                    Ok(path) => {
+                        post.archived.path = path;
+                        posts.insert(post.archived.id, post.archived.clone());
+                        archived += 1;
+                        progress.post_done(post.archived.id, &post.archived.title);
+                        finalized.push(post);
+                    }
+                    Err(error) => {
+                        progress.post_failed(post.archived.id);
+                        failures.push(PostFailure {
+                            id: post.archived.id,
+                            url: post.delivered_url,
+                            message: error.to_string(),
+                        });
+                        cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
+                    }
+                }
+            }
             JournalPostOutcome::Skipped(post) => {
+                posts.insert(post.id, post);
                 skipped += 1;
-                skipped_posts.push(post);
             }
             JournalPostOutcome::Failed(failure) => failures.push(failure),
         }
     }
 
-    let mut finalized = Vec::new();
-    let mut archived = 0usize;
-    let no_local_ids = HashSet::new();
-    for mut post in prepared {
-        let first_stage = archive
-            .read_pending_post(&post.pending_path)
-            .and_then(|pending| {
-                let external = resolve_pending_links(&pending, &post.links, &no_local_ids);
-                writer.write_post(&archive, post.archived.id, &external)
-            });
-
-        match first_stage {
-            Ok(path) => {
-                post.archived.path = path;
-                progress.post_done(post.archived.id, &post.archived.title);
-                posts.insert(post.archived.id, post.archived.clone());
-                archived += 1;
-                finalized.push(post);
-            }
-            Err(error) => {
-                progress.post_failed(post.archived.id);
-                failures.push(PostFailure {
-                    id: post.archived.id,
-                    url: post.delivered_url,
-                    message: error.to_string(),
-                });
-                cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
-            }
-        }
-    }
-
     let final_ids = posts.keys().copied().collect::<HashSet<_>>();
+    let finalized_ids = finalized
+        .iter()
+        .map(|post| post.archived.id)
+        .collect::<HashSet<_>>();
 
     for post in &finalized {
         match archive.read_pending_post(&post.pending_path) {
@@ -246,7 +247,10 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
     }
 
-    for post in &skipped_posts {
+    for post in posts
+        .values()
+        .filter(|post| !finalized_ids.contains(&post.id))
+    {
         match std::fs::read_to_string(&post.path) {
             Ok(existing) => match restore_missing_xrefs(&existing, &journal, &final_ids) {
                 Ok(repaired) if repaired != existing => {
@@ -1852,6 +1856,223 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_post_is_public_with_external_links_before_delayed_peer_finishes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/news/1.html">One</a><a href="/news/2.html">Two</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                r#"<p><a href="https://news.livejournal.com/2.html">Post two</a></p>"#,
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(3))
+                    .set_body_string(post_html("2", "<p>Delayed post two.</p>", "")),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let options = journal_cli(&server, dir.path(), false).options();
+        let post_one_path = dir.path().join("out/posts/1.adoc");
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let progress = Progress::channel(tx);
+        let archive_task =
+            tokio::spawn(async move { run_archive("news", &options, &progress).await });
+        let mut events = Vec::new();
+
+        let early_done = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while let Some(event) = rx.next().await {
+                let post_one_done = matches!(event, ProgressEvent::PostDone { id: 1, .. });
+                events.push(event);
+                if post_one_done {
+                    return;
+                }
+            }
+            panic!("progress channel closed before post 1 completed");
+        })
+        .await;
+        if let Err(error) = early_done {
+            archive_task.abort();
+            let _ = archive_task.await;
+            panic!("post 1 was not finalized before delayed post 2: {error}");
+        }
+
+        assert!(
+            !archive_task.is_finished(),
+            "archive unexpectedly finished before delayed post 2"
+        );
+        assert!(post_one_path.exists(), "post 1 was not publicly written");
+        let external = std::fs::read_to_string(&post_one_path).unwrap();
+        assert!(
+            external.contains("https://news.livejournal.com/2.html[Post two]"),
+            "got: {external}"
+        );
+        assert!(!external.contains("xref:2.adoc"), "got: {external}");
+        assert!(!external.contains("\u{1f}"), "got: {external:?}");
+        assert!(!external.contains("lj-archiver-link"), "got: {external:?}");
+
+        let outcome = archive_task.await.unwrap().unwrap();
+        events.extend(rx.collect::<Vec<_>>().await);
+
+        assert_eq!(outcome.archived, 2);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProgressEvent::PostDone { id: 1, .. }))
+                .count(),
+            1
+        );
+        let local = std::fs::read_to_string(post_one_path).unwrap();
+        assert!(local.contains("xref:2.adoc[Post two]"), "got: {local}");
+        assert!(pending_post_paths(dir.path().join("out/posts")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_stage_failure_is_reported_before_delayed_peer_and_retains_baseline() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/news/1.html">One</a><a href="/news/2.html">Two</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Replacement that must fail first-stage finalization.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(3))
+                    .set_body_string(post_html("2", "<p>Delayed post two.</p>", "")),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let baseline = "= Baseline One\n\n:lj-id: 1\n\nKeep me.\n";
+        seed_existing_archive(dir.path(), &[(1, "Baseline One", baseline)], true);
+        let options = journal_cli(&server, dir.path(), false).options();
+        let expected_failure_url = format!("{}/news/1.html", server.uri());
+        let writer = InjectedFinalPostWriter::failing_on([(1, 1)]);
+        let task_writer = writer.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let progress = Progress::channel(tx);
+        let archive_task = tokio::spawn(async move {
+            archive_journal_with_writer(&options, &progress, "news".to_string(), &task_writer).await
+        });
+        let mut events = Vec::new();
+
+        let early_failure = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while let Some(event) = rx.next().await {
+                let post_one_failed = matches!(event, ProgressEvent::PostFailed { id: 1 });
+                events.push(event);
+                if post_one_failed {
+                    return;
+                }
+            }
+            panic!("progress channel closed before post 1 failed");
+        })
+        .await;
+        if let Err(error) = early_failure {
+            archive_task.abort();
+            let _ = archive_task.await;
+            panic!("post 1 failure was not reported before delayed post 2: {error}");
+        }
+
+        assert!(
+            !archive_task.is_finished(),
+            "archive unexpectedly finished before delayed post 2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/posts/1.adoc")).unwrap(),
+            baseline
+        );
+
+        let outcome = archive_task.await.unwrap().unwrap();
+        events.extend(rx.collect::<Vec<_>>().await);
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].id, 1);
+        assert_eq!(outcome.failures[0].url.as_str(), expected_failure_url);
+        assert_eq!(writer.calls_for(1), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        ProgressEvent::PostDone { id: 1, .. }
+                            | ProgressEvent::PostSkipped { id: 1 }
+                            | ProgressEvent::PostFailed { id: 1 }
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProgressEvent::PostFailed { id: 1 }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/posts/1.adoc")).unwrap(),
+            baseline
+        );
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert_eq!(index.matches("|1 |xref:posts/1.adoc").count(), 1, "{index}");
+        assert_eq!(index.matches("|2 |xref:posts/2.adoc").count(), 1, "{index}");
+        let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+        assert_eq!(book.matches("include::posts/1.adoc").count(), 1, "{book}");
+        assert_eq!(book.matches("include::posts/2.adoc").count(), 1, "{book}");
+        assert!(pending_post_paths(dir.path().join("out/posts")).is_empty());
+    }
+
+    #[tokio::test]
     async fn first_stage_write_failures_are_sorted_excluded_and_cleaned_up() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2271,17 +2492,22 @@ mod tests {
             .collect()
     }
 
+    #[derive(Clone)]
     struct InjectedFinalPostWriter {
         failing_calls: HashSet<(u64, usize)>,
-        calls: Mutex<HashMap<u64, usize>>,
+        calls: Arc<Mutex<HashMap<u64, usize>>>,
     }
 
     impl InjectedFinalPostWriter {
         fn failing_on(calls: impl IntoIterator<Item = (u64, usize)>) -> Self {
             Self {
                 failing_calls: calls.into_iter().collect(),
-                calls: Mutex::new(HashMap::new()),
+                calls: Arc::new(Mutex::new(HashMap::new())),
             }
+        }
+
+        fn calls_for(&self, id: u64) -> usize {
+            self.calls.lock().unwrap().get(&id).copied().unwrap_or(0)
         }
     }
 
