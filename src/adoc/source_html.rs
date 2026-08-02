@@ -1,8 +1,7 @@
+use super::{MAX_RENDER_DEPTH, RenderCtx, classify::is_stripped_chrome};
 use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
 use std::{borrow::Cow, collections::HashMap, ops::Range};
-
-use super::{MAX_RENDER_DEPTH, RenderCtx, classify::is_stripped_chrome};
 
 pub(crate) type SourceMap = HashMap<NodeId, Range<usize>>;
 
@@ -38,7 +37,7 @@ fn contains_script_or_style_tag(source_html: &str) -> bool {
             continue;
         };
 
-        if !tag.is_closing && matches!(tag.name.to_ascii_lowercase().as_str(), "script" | "style") {
+        if !tag.is_closing && matches!(tag.name.as_str(), "script" | "style") {
             return true;
         }
 
@@ -170,7 +169,7 @@ fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<Range<usize>>>
             continue;
         };
 
-        let name = tag.name.to_ascii_lowercase();
+        let name = tag.name;
         let raw_text_name =
             (!tag.is_closing && is_source_raw_text_tag(&name)).then(|| name.clone());
 
