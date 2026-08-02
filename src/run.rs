@@ -100,6 +100,27 @@ async fn archive_journal(
     progress: &Progress,
     journal: String,
 ) -> Result<RunOutcome> {
+    archive_journal_with_writer(options, progress, journal, &AtomicFinalPostWriter).await
+}
+
+trait FinalPostWriter {
+    fn write_post(&self, archive: &Archive, id: u64, contents: &str) -> Result<PathBuf>;
+}
+
+struct AtomicFinalPostWriter;
+
+impl FinalPostWriter for AtomicFinalPostWriter {
+    fn write_post(&self, archive: &Archive, id: u64, contents: &str) -> Result<PathBuf> {
+        archive.write_post(id, contents)
+    }
+}
+
+async fn archive_journal_with_writer<W: FinalPostWriter>(
+    options: &RunOptions,
+    progress: &Progress,
+    journal: String,
+    writer: &W,
+) -> Result<RunOutcome> {
     let start = std::time::Instant::now();
     let client = LjClient::new(options.user_agent.as_deref())?;
     let root = output_dir(options, &journal);
@@ -154,7 +175,7 @@ async fn archive_journal(
             .read_pending_post(&post.pending_path)
             .and_then(|pending| {
                 let external = resolve_pending_links(&pending, &post.links, &no_local_ids);
-                archive.write_post(post.archived.id, &external)
+                writer.write_post(&archive, post.archived.id, &external)
             });
 
         match first_stage {
@@ -186,7 +207,7 @@ async fn archive_journal(
         match archive.read_pending_post(&post.pending_path) {
             Ok(pending) => {
                 let local = resolve_pending_links(&pending, &post.links, &final_ids);
-                if let Err(error) = archive.write_post(post.archived.id, &local) {
+                if let Err(error) = writer.write_post(&archive, post.archived.id, &local) {
                     tracing::warn!(
                         post_id = post.archived.id,
                         error = %error,
@@ -474,7 +495,11 @@ async fn rewrite_post_media(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{archive::Archive, cli::Cli};
+    use crate::{archive::Archive, cli::Cli, progress::ProgressEvent};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Mutex,
+    };
     use tempfile::tempdir;
     use url::Url;
     use wiremock::{
@@ -996,6 +1021,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_stage_write_failures_are_sorted_excluded_and_cleaned_up() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/news/1.html">One</a><a href="/news/2.html">Two</a><a href="/news/3.html">Three</a>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Post one.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                "<p>Post two.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/3.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "3",
+                r#"<p><a href="https://news.livejournal.com/1.html">Post one</a> and <a href="https://news.livejournal.com/2.html">Post two</a></p>"#,
+                "",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let mut options = journal_cli(&server, dir.path(), false).options();
+        options.generate_book = true;
+        let writer = InjectedFinalPostWriter::failing_on([(1, 1), (2, 1)]);
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let progress = Progress::channel(tx);
+
+        let outcome = archive_journal_with_writer(&options, &progress, "news".to_string(), &writer)
+            .await
+            .unwrap();
+        drop(progress);
+        let events: Vec<_> = rx.collect().await;
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.failed, 2);
+        assert_eq!(
+            outcome
+                .failures
+                .iter()
+                .map(|failure| failure.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!dir.path().join("out/posts/1.adoc").exists());
+        assert!(!dir.path().join("out/posts/2.adoc").exists());
+        let post = std::fs::read_to_string(dir.path().join("out/posts/3.adoc")).unwrap();
+        assert!(
+            post.contains("https://news.livejournal.com/1.html[Post one]"),
+            "got: {post}"
+        );
+        assert!(
+            post.contains("https://news.livejournal.com/2.html[Post two]"),
+            "got: {post}"
+        );
+        assert!(!post.contains("xref:1.adoc"), "got: {post}");
+        assert!(!post.contains("xref:2.adoc"), "got: {post}");
+        assert!(!post.contains("lj-archiver-link"), "got: {post:?}");
+
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert!(index.contains("xref:posts/3.adoc"), "got: {index}");
+        assert!(!index.contains("xref:posts/1.adoc"), "got: {index}");
+        assert!(!index.contains("xref:posts/2.adoc"), "got: {index}");
+        let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+        assert!(book.contains("include::posts/3.adoc"), "got: {book}");
+        assert!(!book.contains("include::posts/1.adoc"), "got: {book}");
+        assert!(!book.contains("include::posts/2.adoc"), "got: {book}");
+
+        let mut failed_progress = events
+            .iter()
+            .filter_map(|event| match event {
+                ProgressEvent::PostFailed { id } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        failed_progress.sort_unstable();
+        assert_eq!(failed_progress, vec![1, 2]);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::PostDone {
+                    id: 3,
+                    title
+                } if title == "Post Title"
+            )
+        }));
+        assert!(pending_post_paths(dir.path().join("out/posts")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn upgrade_write_failure_retains_external_fallback_and_cleans_up() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/news/1.html">One</a><a href="/news/2.html">Two</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                r#"<p><a href="https://news.livejournal.com/2.html">Post two</a></p>"#,
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                "<p>Post two.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let options = journal_cli(&server, dir.path(), false).options();
+        let writer = InjectedFinalPostWriter::failing_on([(1, 2)]);
+
+        let outcome =
+            archive_journal_with_writer(&options, &Progress::hidden(), "news".to_string(), &writer)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.archived, 2);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.failures.is_empty());
+        let post = std::fs::read_to_string(dir.path().join("out/posts/1.adoc")).unwrap();
+        assert!(
+            post.contains("https://news.livejournal.com/2.html[Post two]"),
+            "got: {post}"
+        );
+        assert!(!post.contains("xref:2.adoc"), "got: {post}");
+        assert!(!post.contains("lj-archiver-link"), "got: {post:?}");
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert!(index.contains("xref:posts/1.adoc"), "got: {index}");
+        assert!(index.contains("xref:posts/2.adoc"), "got: {index}");
+        assert!(pending_post_paths(dir.path().join("out/posts")).is_empty());
+    }
+
+    #[tokio::test]
     async fn resume_repairs_xrefs_to_missing_failed_posts() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1107,6 +1308,52 @@ mod tests {
         std::fs::read_dir(path)
             .unwrap()
             .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    struct InjectedFinalPostWriter {
+        failing_calls: HashSet<(u64, usize)>,
+        calls: Mutex<HashMap<u64, usize>>,
+    }
+
+    impl InjectedFinalPostWriter {
+        fn failing_on(calls: impl IntoIterator<Item = (u64, usize)>) -> Self {
+            Self {
+                failing_calls: calls.into_iter().collect(),
+                calls: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl FinalPostWriter for InjectedFinalPostWriter {
+        fn write_post(&self, archive: &Archive, id: u64, contents: &str) -> Result<PathBuf> {
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                let call = calls.entry(id).or_default();
+                *call += 1;
+                *call
+            };
+            if self.failing_calls.contains(&(id, call)) {
+                return Err(LjError::Write {
+                    path: archive.post_path(id),
+                    source: std::io::Error::other(format!(
+                        "injected final post write failure for {id}, call {call}"
+                    )),
+                });
+            }
+
+            archive.write_post(id, contents)
+        }
+    }
+
+    fn pending_post_paths(path: impl AsRef<std::path::Path>) -> Vec<PathBuf> {
+        std::fs::read_dir(path)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.extension().and_then(|extension| extension.to_str()) == Some("pending"))
+                    .then_some(path)
+            })
             .collect()
     }
 }
