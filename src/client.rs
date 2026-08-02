@@ -42,11 +42,13 @@ impl LjClient {
 
     async fn fetch_page_capped(&self, url: &Url, max_bytes: usize) -> Result<FetchedPage> {
         let mut last_error = None;
+        let mut reached_url = None;
         for attempt in 0..=self.retries {
             match self.client.get(url.clone()).send().await {
                 Ok(response) if response.status().is_success() => {
                     let mut response = response;
                     let final_url = response.url().clone();
+                    reached_url = Some(final_url.clone());
                     let mut bytes = Vec::new();
                     let mut body_error = None;
                     loop {
@@ -54,7 +56,7 @@ impl LjClient {
                             Ok(Some(chunk)) => {
                                 if bytes.len() + chunk.len() > max_bytes {
                                     return Err(LjError::ResponseTooLarge {
-                                        url: url.to_string(),
+                                        url: final_url.to_string(),
                                         limit: max_bytes,
                                     });
                                 }
@@ -80,15 +82,23 @@ impl LjClient {
                     });
                 }
                 Ok(response) if response.status().is_server_error() && attempt < self.retries => {
+                    reached_url = Some(response.url().clone());
                     sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
                 }
                 Ok(response) => {
                     return Err(LjError::HttpStatus {
-                        url: url.to_string(),
+                        url: response.url().to_string(),
                         status: response.status().as_u16(),
                     });
                 }
                 Err(source) => {
+                    if let Some(later_url) = source
+                        .url()
+                        .filter(|source_url| *source_url != url)
+                        .cloned()
+                    {
+                        reached_url = Some(later_url);
+                    }
                     last_error = Some(source);
                     if attempt < self.retries {
                         sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
@@ -97,7 +107,7 @@ impl LjClient {
             }
         }
         Err(LjError::Http {
-            url: url.to_string(),
+            url: reached_url.unwrap_or_else(|| url.clone()).to_string(),
             source: last_error.expect("retry loop always records final error"),
         })
     }
@@ -158,6 +168,55 @@ mod tests {
         (url, server)
     }
 
+    fn persistently_interrupted_redirect_server() -> (Url, Url, thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let requested_url = Url::parse(&format!("{origin}/start")).unwrap();
+        let final_url = Url::parse(&format!(
+            "{origin}/delivered/interrupted.html?source=redirect"
+        ))
+        .unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut final_requests = 0;
+
+            while final_requests < 3 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0; 1024];
+                        let bytes_read = stream.read(&mut request).unwrap();
+                        let request = &request[..bytes_read];
+                        let response = if request.starts_with(b"GET /start ") {
+                            b"HTTP/1.1 302 Found\r\nLocation: /delivered/interrupted.html?source=redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .as_slice()
+                        } else {
+                            assert!(
+                                request.starts_with(
+                                    b"GET /delivered/interrupted.html?source=redirect "
+                                ),
+                                "unexpected request: {}",
+                                String::from_utf8_lossy(request)
+                            );
+                            final_requests += 1;
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nab"
+                                .as_slice()
+                        };
+                        stream.write_all(response).unwrap();
+                        stream.flush().unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+
+            final_requests
+        });
+        (requested_url, final_url, server)
+    }
+
     #[tokio::test]
     async fn fetch_page_reports_final_redirect_url() {
         let server = MockServer::start().await;
@@ -178,6 +237,104 @@ mod tests {
 
         assert_eq!(page.final_url.path(), "/final");
         assert_eq!(page.text, "ok");
+    }
+
+    #[tokio::test]
+    async fn status_error_reports_final_redirect_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/delivered/missing.html?source=status"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/missing.html"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = LjClient::new(None).unwrap();
+        let requested_url = Url::parse(&format!("{}/start", server.uri())).unwrap();
+        let final_url = format!("{}/delivered/missing.html?source=status", server.uri());
+
+        let error = client.fetch_page(&requested_url).await.unwrap_err();
+
+        match error {
+            LjError::HttpStatus { url, status } => {
+                assert_eq!(url, final_url);
+                assert_eq!(status, 404);
+            }
+            other => panic!("expected status error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_too_large_reports_final_redirect_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/delivered/big.html?source=size"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/big.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(100)))
+            .mount(&server)
+            .await;
+        let client = LjClient::new(None).unwrap();
+        let requested_url = Url::parse(&format!("{}/start", server.uri())).unwrap();
+        let final_url = format!("{}/delivered/big.html?source=size", server.uri());
+
+        let error = client
+            .fetch_page_capped(&requested_url, 10)
+            .await
+            .unwrap_err();
+
+        match error {
+            LjError::ResponseTooLarge { url, limit } => {
+                assert_eq!(url, final_url);
+                assert_eq!(limit, 10);
+            }
+            other => panic!("expected response-too-large error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_interrupted_body_reports_final_redirect_url() {
+        let (requested_url, final_url, server) = persistently_interrupted_redirect_server();
+        let client = LjClient::new(None).unwrap();
+
+        let error = client.fetch_page(&requested_url).await.unwrap_err();
+
+        match error {
+            LjError::Http { url, .. } => assert_eq!(url, final_url.as_str()),
+            other => panic!("expected HTTP body error, got {other:?}"),
+        }
+        assert_eq!(server.join().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn transport_error_without_response_reports_requested_url() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+        let requested_url = Url::parse(&format!(
+            "http://{}/start",
+            unavailable.local_addr().unwrap()
+        ))
+        .unwrap();
+        drop(unavailable);
+        let client = LjClient::new(None).unwrap();
+
+        let error = client.fetch_page(&requested_url).await.unwrap_err();
+
+        match error {
+            LjError::Http { url, .. } => assert_eq!(url, requested_url.as_str()),
+            other => panic!("expected transport error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

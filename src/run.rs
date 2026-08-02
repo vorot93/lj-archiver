@@ -418,24 +418,18 @@ fn validate_requested_post_identity(
     post: &Post,
 ) -> Result<()> {
     let final_identity = final_post_identity(&post.url);
-    let final_matches = match &final_identity {
-        Some(FinalPostIdentity::Loopback { id }) => *id == requested_id,
-        Some(FinalPostIdentity::LiveJournal { journal, id }) => {
-            *id == requested_id && journals_alias(journal, requested_journal)
-        }
-        None => true,
-    };
+    let final_matches = final_identity.id.is_none_or(|id| id == requested_id)
+        && final_identity
+            .journal
+            .as_deref()
+            .is_none_or(|journal| journals_alias(journal, requested_journal));
     let returned_matches = post.id == requested_id;
 
     if final_matches && returned_matches {
         return Ok(());
     }
 
-    let final_identity = match final_identity {
-        Some(FinalPostIdentity::Loopback { id }) => format!("post ID {id}"),
-        Some(FinalPostIdentity::LiveJournal { journal, id }) => format!("{journal}/{id}"),
-        None => "unrecognized".to_string(),
-    };
+    let final_identity = describe_final_post_identity(&final_identity);
     Err(LjError::Parse {
         url: post.url.to_string(),
         reason: format!(
@@ -446,23 +440,60 @@ fn validate_requested_post_identity(
     })
 }
 
-fn final_post_identity(url: &Url) -> Option<FinalPostIdentity> {
+fn final_post_identity(url: &Url) -> FinalPostIdentity {
     if crate::net::is_loopback_test_server(url) {
-        let segment = url.path_segments()?.rfind(|segment| !segment.is_empty())?;
-        let id = segment
-            .strip_suffix(".html")
-            .unwrap_or(segment)
-            .parse()
-            .ok()?;
-        return (id > 0).then_some(FinalPostIdentity::Loopback { id });
+        return FinalPostIdentity {
+            journal: None,
+            id: final_numeric_path_id(url),
+        };
     }
 
-    post_ref_from_url(url).map(|(journal, id)| FinalPostIdentity::LiveJournal { journal, id })
+    FinalPostIdentity {
+        journal: final_livejournal_journal(url),
+        id: post_ref_from_url(url).map(|(_, id)| id),
+    }
+}
+
+fn final_numeric_path_id(url: &Url) -> Option<u64> {
+    let segment = url.path_segments()?.rfind(|segment| !segment.is_empty())?;
+    let id = segment
+        .strip_suffix(".html")
+        .unwrap_or(segment)
+        .parse()
+        .ok()?;
+    (id > 0).then_some(id)
+}
+
+fn final_livejournal_journal(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    if host.eq_ignore_ascii_case("users.livejournal.com") {
+        return url
+            .path_segments()?
+            .find(|segment| !segment.is_empty())
+            .map(ToOwned::to_owned);
+    }
+
+    host.strip_suffix(".livejournal.com")
+        .filter(|journal| !journal.is_empty() && !journal.eq_ignore_ascii_case("www"))
+        .map(ToOwned::to_owned)
+}
+
+fn describe_final_post_identity(identity: &FinalPostIdentity) -> String {
+    match (identity.journal.as_deref(), identity.id) {
+        (Some(journal), Some(id)) => format!("{journal}/{id}"),
+        (Some(journal), None) => journal.to_string(),
+        (None, Some(id)) => format!("post ID {id}"),
+        (None, None) => "unrecognized".to_string(),
+    }
 }
 
 fn delivered_url_from_error(error: &LjError) -> Option<Url> {
     match error {
-        LjError::Parse { url, .. } | LjError::AgeGated { url } => Url::parse(url).ok(),
+        LjError::Http { url, .. }
+        | LjError::HttpStatus { url, .. }
+        | LjError::ResponseTooLarge { url, .. }
+        | LjError::Parse { url, .. }
+        | LjError::AgeGated { url } => Url::parse(url).ok(),
         _ => None,
     }
 }
@@ -534,9 +565,9 @@ enum JournalPostOutcome {
     Failed(PostFailure),
 }
 
-enum FinalPostIdentity {
-    Loopback { id: u64 },
-    LiveJournal { journal: String, id: u64 },
+struct FinalPostIdentity {
+    journal: Option<String>,
+    id: Option<u64>,
 }
 
 async fn rewrite_post_media(
@@ -738,6 +769,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journal_status_failure_uses_delivered_final_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">One</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/delivered/failure?source=status"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/failure"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let options = journal_cli(&server, dir.path(), false).options();
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        let failure = &outcome.failures[0];
+        assert_eq!(failure.id, 1);
+        assert_eq!(
+            failure.url.as_str(),
+            format!("{}/delivered/failure?source=status", server.uri())
+        );
+        assert!(failure.message.contains("404"), "{failure:?}");
+        assert!(!dir.path().join("out/posts/1.adoc").exists());
+    }
+
+    #[tokio::test]
     async fn single_post_rejects_returned_identity_without_writing_archive_files() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -869,13 +950,38 @@ mod tests {
     }
 
     #[test]
-    fn final_livejournal_post_reference_accepts_hyphen_underscore_alias() {
-        let final_url =
-            Url::parse("https://evo-lutio.livejournal.com/240331.html?source=redirect").unwrap();
-        let (final_journal, final_id) = crate::target::post_ref_from_url(&final_url).unwrap();
+    fn final_livejournal_journal_mismatch_is_rejected_on_non_post_path() {
+        let post = parsed_post(
+            "https://other.livejournal.com/landing?source=redirect",
+            "canonical_metadata",
+            1,
+        );
 
-        assert_eq!(final_id, 240331);
-        assert!(crate::target::journals_alias("evo_lutio", &final_journal));
+        let error = validate_requested_post_identity("news", 1, &post).unwrap_err();
+
+        match error {
+            LjError::Parse { url, reason } => {
+                assert_eq!(url, "https://other.livejournal.com/landing?source=redirect");
+                assert!(reason.contains("requested news/1"), "{reason}");
+                assert!(reason.contains("final URL identity other"), "{reason}");
+                assert!(
+                    reason.contains("returned parsed identity canonical_metadata/1"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn final_users_livejournal_journal_alias_is_accepted_on_non_post_path() {
+        let post = parsed_post(
+            "https://users.livejournal.com/evo-lutio/landing?source=redirect",
+            "canonical_metadata",
+            240331,
+        );
+
+        validate_requested_post_identity("evo_lutio", 240331, &post).unwrap();
     }
 
     #[tokio::test]
@@ -1616,6 +1722,21 @@ mod tests {
   </body>
 </html>"#
         )
+    }
+
+    fn parsed_post(url: &str, journal: &str, id: u64) -> Post {
+        Post {
+            journal: journal.to_string(),
+            id,
+            url: Url::parse(url).unwrap(),
+            title: "Title".to_string(),
+            author: journal.to_string(),
+            poster: None,
+            published_at: None,
+            tags: Vec::new(),
+            body_html: "<p>Body.</p>".to_string(),
+            comments: Vec::new(),
+        }
     }
 
     fn asset_dir_entries(path: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {

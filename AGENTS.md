@@ -156,11 +156,13 @@ On a bulk journal export, rendered bodies and their pending links are staged on 
 Fetched posts are parsed against the delivered final response URL, which is
 preserved as `Post.url` for rendering and downstream processing. Before media
 requests or writes, the parsed post ID must match the requested post; a
-recognizable final LiveJournal post URL's ID and journal alias must also match,
-and a loopback test URL's numeric final path segment (with optional `.html`)
-must match the requested ID. Identity mismatches fail only that row during
-journal exports and fail the whole run for a single-post target; no file is
-staged or written under the returned wrong ID.
+recognizable final LiveJournal journal must alias the requested journal even
+when its path is not a recognizable post path, and an independently
+recognizable final post ID must match the requested ID. A loopback test URL
+only validates its numeric final path segment (with optional `.html`) against
+the requested ID. Identity mismatches fail only that row during journal exports
+and fail the whole run for a single-post target; no file is staged or written
+under the returned wrong ID.
 
 ## HTTP And Media Safety
 
@@ -173,6 +175,11 @@ Media fetching must continue to reject non-HTTP(S) URLs, URLs without hosts, lit
 The current media checks do not resolve DNS names to block private networks. Do not document or rely on DNS-based private-network blocking unless that behavior is implemented and tested.
 
 Downloads are size-capped and enforced while streaming — 64 MiB per page fetch, 50 MiB per media asset — and a response exceeding its cap is abandoned mid-stream, never truncated into the archive. The page-fetch client retries transient 5xx responses, transport errors, and interrupted response bodies a couple of times before surfacing a failure; interrupted-body attempts discard their partial bytes before retrying.
+
+Page-fetch errors caused after a response was reached retain that response's
+final URL (including status, body-size, and exhausted interrupted-body errors).
+A transport error uses a later URL from reqwest only when the error identifies
+one; otherwise a run with no reached response reports the requested URL.
 
 When changing HTTP or media behavior, cover redirects and blocked-address cases with local test servers.
 
