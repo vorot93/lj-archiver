@@ -894,6 +894,31 @@ mod tests {
     }
 
     #[test]
+    fn quote_in_attribute_name_does_not_hide_tag_end_or_shift_real_div_source() {
+        let input = "<div \">fake</div><div data-real='yes'>real</div>";
+        let expected = concat!(
+            "++++\n<div \">fake</div>\n++++\n\n",
+            "++++\n<div data-real='yes'>real</div>\n++++\n\n"
+        );
+        let adoc = html_to_adoc(input);
+
+        assert_eq!(adoc, expected);
+        assert_eq!(adoc.matches("fake").count(), 1);
+        assert_eq!(adoc.matches(">real</div>").count(), 1);
+    }
+
+    #[test]
+    fn nul_in_tag_name_does_not_shift_following_real_div_source() {
+        let input = "<div\0x>fake</div\0x><div data-real='yes'>real</div>";
+        let expected = "fake\n\n++++\n<div data-real='yes'>real</div>\n++++\n\n";
+        let adoc = html_to_adoc(input);
+
+        assert_eq!(adoc, expected);
+        assert_eq!(adoc.matches("fake").count(), 1);
+        assert_eq!(adoc.matches(">real</div>").count(), 1);
+    }
+
+    #[test]
     fn raw_text_tags_do_not_shift_passthrough_source_spans() {
         let html = concat!(
             "<script>const x = \"<table>fake</table>\";</script>",
@@ -1555,6 +1580,27 @@ mod tests {
         assert_eq!(
             html_to_adoc("<p>image:evil.png[] xref:1.adoc[x] {secret}</p>"),
             "\\image:evil.png[] \\xref:1.adoc[x] \\{secret}\n\n"
+        );
+    }
+
+    #[test]
+    fn neutralizes_targetless_builtin_macros_but_leaves_unknown_forms_unchanged() {
+        let input = "<p>before footnote:[note] kbd:[Ctrl+C] btn:[OK] after extension:[literal]</p>";
+        let expected = concat!(
+            "before \\footnote:[note] \\kbd:[Ctrl+C] \\btn:[OK] ",
+            "after extension:[literal]\n\n"
+        );
+
+        assert_eq!(html_to_adoc(input), expected);
+    }
+
+    #[test]
+    fn does_not_double_escape_preescaped_targetless_builtin_macros() {
+        let input = r"<p>\footnote:[note] \kbd:[Ctrl+C] \btn:[OK]</p>";
+
+        assert_eq!(
+            html_to_adoc(input),
+            "\\footnote:[note] \\kbd:[Ctrl+C] \\btn:[OK]\n\n"
         );
     }
 

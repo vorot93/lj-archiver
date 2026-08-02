@@ -276,6 +276,22 @@ struct SourceTag {
     end: usize,
 }
 
+// Mirrors html5ever's tag/attribute tokenizer transitions while retaining byte
+// offsets into the immutable input. Only quoted attribute-value states hide `>`.
+#[derive(Clone, Copy)]
+enum SourceTagState {
+    TagName,
+    BeforeAttributeName,
+    AttributeName,
+    AfterAttributeName,
+    BeforeAttributeValue,
+    AttributeValueDoubleQuoted,
+    AttributeValueSingleQuoted,
+    AttributeValueUnquoted,
+    AfterAttributeValueQuoted,
+    SelfClosingStartTag,
+}
+
 fn parse_source_tag(source_html: &str, start: usize) -> Option<SourceTag> {
     let bytes = source_html.as_bytes();
 
@@ -283,7 +299,6 @@ fn parse_source_tag(source_html: &str, start: usize) -> Option<SourceTag> {
         return None;
     }
 
-    let end = find_source_tag_end(source_html, start)? + 1;
     let mut cursor = start + 1;
     let is_closing = bytes.get(cursor) == Some(&b'/');
     if is_closing {
@@ -294,29 +309,179 @@ fn parse_source_tag(source_html: &str, start: usize) -> Option<SourceTag> {
     if !first.is_ascii_alphabetic() {
         return None;
     }
-    let name_start = cursor;
-    while matches!(bytes.get(cursor), Some(byte) if !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'>' | 0))
-    {
-        cursor += 1;
-    }
-    let name = source_html[name_start..cursor].to_ascii_lowercase();
+    let mut name = String::new();
+    let mut state = SourceTagState::TagName;
 
-    Some(SourceTag {
-        name,
-        is_closing,
-        end,
-    })
-}
+    while cursor < source_html.len() {
+        let current = source_html[cursor..].chars().next()?;
+        let current_len = current.len_utf8();
 
-fn find_source_tag_end(source_html: &str, start: usize) -> Option<usize> {
-    let mut quote = None;
-
-    for (offset, byte) in source_html.as_bytes()[start + 1..].iter().enumerate() {
-        match (quote, *byte) {
-            (Some(active), current) if active == current => quote = None,
-            (None, b'\'' | b'"') => quote = Some(*byte),
-            (None, b'>') => return Some(start + 1 + offset),
-            _ => {}
+        match state {
+            SourceTagState::TagName => match current {
+                '\t' | '\n' | '\r' | '\x0C' | ' ' => {
+                    cursor += current_len;
+                    state = SourceTagState::BeforeAttributeName;
+                }
+                '/' => {
+                    cursor += current_len;
+                    state = SourceTagState::SelfClosingStartTag;
+                }
+                '>' => {
+                    cursor += current_len;
+                    return Some(SourceTag {
+                        name,
+                        is_closing,
+                        end: cursor,
+                    });
+                }
+                '\0' => {
+                    name.push('\u{fffd}');
+                    cursor += current_len;
+                }
+                _ => {
+                    name.push(current.to_ascii_lowercase());
+                    cursor += current_len;
+                }
+            },
+            SourceTagState::BeforeAttributeName => match current {
+                '\t' | '\n' | '\r' | '\x0C' | ' ' => cursor += current_len,
+                '/' => {
+                    cursor += current_len;
+                    state = SourceTagState::SelfClosingStartTag;
+                }
+                '>' => {
+                    cursor += current_len;
+                    return Some(SourceTag {
+                        name,
+                        is_closing,
+                        end: cursor,
+                    });
+                }
+                _ => {
+                    cursor += current_len;
+                    state = SourceTagState::AttributeName;
+                }
+            },
+            SourceTagState::AttributeName => match current {
+                '\t' | '\n' | '\r' | '\x0C' | ' ' => {
+                    cursor += current_len;
+                    state = SourceTagState::AfterAttributeName;
+                }
+                '/' => {
+                    cursor += current_len;
+                    state = SourceTagState::SelfClosingStartTag;
+                }
+                '=' => {
+                    cursor += current_len;
+                    state = SourceTagState::BeforeAttributeValue;
+                }
+                '>' => {
+                    cursor += current_len;
+                    return Some(SourceTag {
+                        name,
+                        is_closing,
+                        end: cursor,
+                    });
+                }
+                _ => cursor += current_len,
+            },
+            SourceTagState::AfterAttributeName => match current {
+                '\t' | '\n' | '\r' | '\x0C' | ' ' => cursor += current_len,
+                '/' => {
+                    cursor += current_len;
+                    state = SourceTagState::SelfClosingStartTag;
+                }
+                '=' => {
+                    cursor += current_len;
+                    state = SourceTagState::BeforeAttributeValue;
+                }
+                '>' => {
+                    cursor += current_len;
+                    return Some(SourceTag {
+                        name,
+                        is_closing,
+                        end: cursor,
+                    });
+                }
+                _ => state = SourceTagState::BeforeAttributeName,
+            },
+            SourceTagState::BeforeAttributeValue => match current {
+                '\t' | '\n' | '\r' | '\x0C' | ' ' => cursor += current_len,
+                '"' => {
+                    cursor += current_len;
+                    state = SourceTagState::AttributeValueDoubleQuoted;
+                }
+                '\'' => {
+                    cursor += current_len;
+                    state = SourceTagState::AttributeValueSingleQuoted;
+                }
+                '>' => {
+                    cursor += current_len;
+                    return Some(SourceTag {
+                        name,
+                        is_closing,
+                        end: cursor,
+                    });
+                }
+                _ => state = SourceTagState::AttributeValueUnquoted,
+            },
+            SourceTagState::AttributeValueDoubleQuoted => {
+                cursor += current_len;
+                if current == '"' {
+                    state = SourceTagState::AfterAttributeValueQuoted;
+                }
+            }
+            SourceTagState::AttributeValueSingleQuoted => {
+                cursor += current_len;
+                if current == '\'' {
+                    state = SourceTagState::AfterAttributeValueQuoted;
+                }
+            }
+            SourceTagState::AttributeValueUnquoted => match current {
+                '\t' | '\n' | '\r' | '\x0C' | ' ' => {
+                    cursor += current_len;
+                    state = SourceTagState::BeforeAttributeName;
+                }
+                '>' => {
+                    cursor += current_len;
+                    return Some(SourceTag {
+                        name,
+                        is_closing,
+                        end: cursor,
+                    });
+                }
+                _ => cursor += current_len,
+            },
+            SourceTagState::AfterAttributeValueQuoted => match current {
+                '\t' | '\n' | '\r' | '\x0C' | ' ' => {
+                    cursor += current_len;
+                    state = SourceTagState::BeforeAttributeName;
+                }
+                '/' => {
+                    cursor += current_len;
+                    state = SourceTagState::SelfClosingStartTag;
+                }
+                '>' => {
+                    cursor += current_len;
+                    return Some(SourceTag {
+                        name,
+                        is_closing,
+                        end: cursor,
+                    });
+                }
+                _ => state = SourceTagState::BeforeAttributeName,
+            },
+            SourceTagState::SelfClosingStartTag => {
+                if current == '>' {
+                    cursor += current_len;
+                    return Some(SourceTag {
+                        name,
+                        is_closing,
+                        end: cursor,
+                    });
+                }
+                state = SourceTagState::BeforeAttributeName;
+            }
         }
     }
 

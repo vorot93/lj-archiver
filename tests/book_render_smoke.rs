@@ -86,8 +86,11 @@ fn book_media_resolves_to_archive_root_asset() {
 fn plain_text_cannot_create_asciidoc_macros_or_expand_attributes() {
     let dir = tempdir().unwrap();
     let adoc = format!(
-        ":secret: EXPANDED\n\n{}",
-        lj_archiver::adoc::html_to_adoc("<p>image:evil.png[] xref:1.adoc[x] {secret}</p>")
+        ":experimental:\n:secret: EXPANDED\n\n{}",
+        lj_archiver::adoc::html_to_adoc(concat!(
+            "<p>image:evil.png[] xref:1.adoc[x] {secret} ",
+            "footnote:[note] kbd:[Ctrl+C] btn:[OK]</p>"
+        ))
     );
     fs::write(dir.path().join("plain-text.adoc"), adoc).unwrap();
 
@@ -121,6 +124,51 @@ fn plain_text_cannot_create_asciidoc_macros_or_expand_attributes() {
         bounded_diagnostic(html.as_bytes())
     );
     assert!(
+        html.contains("footnote:[note]"),
+        "literal footnote macro was not visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        html.contains("kbd:[Ctrl+C]"),
+        "literal kbd macro was not visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        html.contains("btn:[OK]"),
+        "literal btn macro was not visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains(r"\image:evil.png[]"),
+        "protective image backslash was visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains(r"\xref:1.adoc[x]"),
+        "protective xref backslash was visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains(r"\{secret}"),
+        "protective attribute-reference backslash was visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains(r"\footnote:[note]"),
+        "protective footnote backslash was visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains(r"\kbd:[Ctrl+C]"),
+        "protective kbd backslash was visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains(r"\btn:[OK]"),
+        "protective btn backslash was visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
         !html.match_indices("<img").any(|(start, _)| html[start..]
             .split_once('>')
             .is_some_and(|(tag, _)| tag.contains("evil.png"))),
@@ -146,6 +194,21 @@ fn plain_text_cannot_create_asciidoc_macros_or_expand_attributes() {
     assert!(
         !html.contains("EXPANDED"),
         "plain text expanded an AsciiDoc attribute; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains("class=\"footnote\""),
+        "plain text created active footnote markup; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains("<kbd"),
+        "plain text created kbd markup; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains("class=\"button\""),
+        "plain text created button markup; HTML excerpt:\n{}",
         bounded_diagnostic(html.as_bytes())
     );
 }

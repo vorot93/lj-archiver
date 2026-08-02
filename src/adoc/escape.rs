@@ -105,17 +105,37 @@ fn is_attribute_name_byte(byte: u8) -> bool {
 }
 
 fn neutralize_inline_macros(text: &str) -> String {
+    let mut scan_steps = MacroScanSteps::default();
+    neutralize_inline_macros_scanned(text, &mut scan_steps)
+}
+
+#[cfg(test)]
+fn neutralize_inline_macros_with_scan_steps(text: &str) -> (String, usize) {
+    let mut scan_steps = MacroScanSteps::default();
+    let output = neutralize_inline_macros_scanned(text, &mut scan_steps);
+    (output, scan_steps.count)
+}
+
+fn neutralize_inline_macros_scanned(text: &str, scan_steps: &mut MacroScanSteps) -> String {
     let bytes = text.as_bytes();
+    // One reverse pass makes each candidate's "`[` before whitespace" target
+    // check O(1); token-boundary name runs do not overlap in the forward pass.
+    let bracket_before_whitespace = bracket_before_whitespace(bytes, scan_steps);
     let mut output = String::new();
     let mut cursor = 0;
 
     while cursor < bytes.len() {
-        if bytes[cursor].is_ascii_alphabetic()
-            && is_inline_macro_token_boundary(bytes, cursor)
-            && is_inline_macro_at(bytes, cursor)
-            && !is_immediately_escaped(bytes, cursor)
-        {
-            output.push('\\');
+        scan_steps.add(1);
+
+        if bytes[cursor].is_ascii_alphabetic() && is_inline_macro_token_boundary(bytes, cursor) {
+            let name_end = inline_macro_name_end(bytes, cursor, scan_steps);
+            scan_steps.add(1);
+
+            if is_inline_macro_at(bytes, cursor, name_end, &bracket_before_whitespace)
+                && !is_immediately_escaped(bytes, cursor)
+            {
+                output.push('\\');
+            }
         }
 
         let character = text[cursor..]
@@ -129,35 +149,80 @@ fn neutralize_inline_macros(text: &str) -> String {
     output
 }
 
+#[derive(Default)]
+struct MacroScanSteps {
+    #[cfg(test)]
+    count: usize,
+}
+
+impl MacroScanSteps {
+    fn add(&mut self, count: usize) {
+        #[cfg(test)]
+        {
+            self.count += count;
+        }
+        #[cfg(not(test))]
+        let _ = count;
+    }
+}
+
+fn bracket_before_whitespace(bytes: &[u8], scan_steps: &mut MacroScanSteps) -> Vec<bool> {
+    let mut result = vec![false; bytes.len() + 1];
+    let mut bracket_is_next = false;
+
+    for (cursor, byte) in bytes.iter().enumerate().rev() {
+        scan_steps.add(1);
+        if *byte == b'[' {
+            bracket_is_next = true;
+        } else if byte.is_ascii_whitespace() {
+            bracket_is_next = false;
+        }
+        result[cursor] = bracket_is_next;
+    }
+
+    result
+}
+
+fn inline_macro_name_end(bytes: &[u8], start: usize, scan_steps: &mut MacroScanSteps) -> usize {
+    let mut cursor = start;
+
+    while matches!(bytes.get(cursor), Some(byte) if is_adoc_macro_name_byte(*byte)) {
+        scan_steps.add(1);
+        cursor += 1;
+    }
+
+    cursor
+}
+
 fn is_inline_macro_token_boundary(bytes: &[u8], start: usize) -> bool {
     start == 0
         || !bytes[start - 1].is_ascii_alphanumeric()
             && !matches!(bytes[start - 1], b'_' | b'.' | b'-')
 }
 
-fn is_inline_macro_at(bytes: &[u8], start: usize) -> bool {
-    let mut cursor = start + 1;
-    while matches!(bytes.get(cursor), Some(byte) if is_adoc_macro_name_byte(*byte)) {
-        cursor += 1;
-    }
-
-    if bytes.get(cursor) != Some(&b':') {
+fn is_inline_macro_at(
+    bytes: &[u8],
+    start: usize,
+    name_end: usize,
+    bracket_before_whitespace: &[bool],
+) -> bool {
+    if bytes.get(name_end) != Some(&b':') {
         return false;
     }
 
-    let target_start = cursor + 1;
-    cursor = target_start;
-    while let Some(byte) = bytes.get(cursor) {
-        if *byte == b'[' {
-            return cursor > target_start;
-        }
-        if byte.is_ascii_whitespace() {
-            return false;
-        }
-        cursor += 1;
+    let target_start = name_end + 1;
+    if bytes.get(target_start) == Some(&b'[') {
+        return is_targetless_builtin_macro(&bytes[start..name_end]);
     }
 
-    false
+    bracket_before_whitespace
+        .get(target_start)
+        .copied()
+        .unwrap_or(false)
+}
+
+fn is_targetless_builtin_macro(name: &[u8]) -> bool {
+    matches!(name, b"footnote" | b"kbd" | b"btn")
 }
 
 fn is_immediately_escaped(bytes: &[u8], start: usize) -> bool {
@@ -490,4 +555,25 @@ fn ends_with_inline_passthrough_macro_prefix(text: &str) -> bool {
                 .is_some_and(|previous| {
                     !previous.is_ascii_alphanumeric() && !matches!(previous, b'_' | b'-')
                 }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_macro_candidates_have_linear_scan_work() {
+        let candidates = 25_000;
+        let input = format!("{}z[]", "a:".repeat(candidates));
+        let expected = format!("{}z[]", "\\a:".repeat(candidates));
+
+        let (actual, scan_steps) = neutralize_inline_macros_with_scan_steps(&input);
+
+        assert_eq!(actual, expected);
+        assert!(
+            scan_steps <= 4 * input.len(),
+            "macro scanner took {scan_steps} steps for {} input bytes",
+            input.len()
+        );
+    }
 }
