@@ -5,6 +5,14 @@ use crate::{
     models::ArchiveTarget,
 };
 
+/// LiveJournal serves an underscore username `a_b` at the hyphen subdomain
+/// `a-b.livejournal.com`, so the two spellings denote the same journal. Compare
+/// with `-`/`_` folded together, case-insensitively.
+pub fn journals_alias(a: &str, b: &str) -> bool {
+    a.replace('-', "_")
+        .eq_ignore_ascii_case(&b.replace('-', "_"))
+}
+
 pub fn parse_target(input: &str, journal_context: Option<&str>) -> Result<ArchiveTarget> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -272,6 +280,13 @@ fn invalid<T>(input: &str, reason: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_aliases_fold_case_and_hyphen_underscore() {
+        assert!(journals_alias("Evo_Lutio", "evo-lutio"));
+        assert!(journals_alias("NEWS", "news"));
+        assert!(!journals_alias("news", "other"));
+    }
 
     #[test]
     fn parses_journal_name() {

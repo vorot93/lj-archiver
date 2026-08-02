@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use url::Url;
 
-use crate::target::post_ref_from_url;
+use crate::target::{journals_alias, post_ref_from_url};
 
 pub struct LinkRewriter {
     journal: String,
@@ -27,14 +27,6 @@ impl LinkRewriter {
         (journals_alias(&journal, &self.journal) && self.ids.contains(&id))
             .then(|| format!("{id}.adoc"))
     }
-}
-
-/// LiveJournal serves an underscore username `a_b` at the hyphen subdomain
-/// `a-b.livejournal.com`, so the two spellings denote the same journal. Compare
-/// with `-`/`_` folded together, case-insensitively.
-fn journals_alias(a: &str, b: &str) -> bool {
-    a.replace('-', "_")
-        .eq_ignore_ascii_case(&b.replace('-', "_"))
 }
 
 #[cfg(test)]
