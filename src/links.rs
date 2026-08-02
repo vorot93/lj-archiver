@@ -3,7 +3,10 @@ use crate::{
     adoc::sanitize_macro_target,
     target::{journals_alias, post_ref_from_url, post_url},
 };
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 use url::Url;
 
 pub(crate) const POST_LINK_PREFIX_ATTRIBUTE: &str = "lj-archiver-post-link-prefix";
@@ -135,18 +138,93 @@ pub(crate) fn resolve_pending_links(
     links: &[PendingLink],
     local_ids: &HashSet<u64>,
 ) -> String {
-    let mut resolved = text.to_string();
+    resolve_pending_links_with_scan_stats(text, links, local_ids).0
+}
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PendingLinkScanStats {
+    candidates: usize,
+    cursor_advanced_bytes: usize,
+    accounted_input_bytes: usize,
+    copied_input_bytes: usize,
+    candidate_input_bytes: usize,
+    revisited_input_bytes: usize,
+    skipped_input_bytes: usize,
+    accounted_through: usize,
+}
+
+impl PendingLinkScanStats {
+    fn account_input_range(&mut self, start: usize, end: usize, candidate: bool) {
+        if start < self.accounted_through {
+            self.revisited_input_bytes += end.min(self.accounted_through) - start;
+        } else if start > self.accounted_through {
+            self.skipped_input_bytes += start - self.accounted_through;
+        }
+
+        let bytes = end - start;
+        self.accounted_input_bytes += bytes;
+        if candidate {
+            self.candidate_input_bytes += bytes;
+        } else {
+            self.copied_input_bytes += bytes;
+        }
+        self.accounted_through = self.accounted_through.max(end);
+    }
+}
+
+fn resolve_pending_links_with_scan_stats(
+    text: &str,
+    links: &[PendingLink],
+    local_ids: &HashSet<u64>,
+) -> (String, PendingLinkScanStats) {
+    const SEPARATOR: char = '\u{1f}';
+
+    let mut replacements = HashMap::with_capacity(links.len());
     for link in links {
         let target = if local_ids.contains(&link.target_id) {
-            link.local_target.clone()
+            link.local_target.as_str()
         } else {
-            link.external_target.clone()
+            link.external_target.as_str()
         };
-        resolved = resolved.replace(&link.token, &target);
+        replacements.entry(link.token.as_str()).or_insert(target);
+    }
+    let mut resolved = String::with_capacity(text.len());
+    let mut stats = PendingLinkScanStats::default();
+    let mut cursor = 0;
+
+    while let Some(relative_start) = text[cursor..].find(SEPARATOR) {
+        let start = cursor + relative_start;
+        resolved.push_str(&text[cursor..start]);
+        stats.account_input_range(cursor, start, false);
+
+        let terminator_search_start = start + SEPARATOR.len_utf8();
+        let Some(relative_end) = text[terminator_search_start..].find(SEPARATOR) else {
+            resolved.push_str(&text[start..]);
+            stats.account_input_range(start, text.len(), false);
+            stats.cursor_advanced_bytes += text.len() - cursor;
+            cursor = text.len();
+            break;
+        };
+        let end = terminator_search_start + relative_end + SEPARATOR.len_utf8();
+        let candidate = &text[start..end];
+        if let Some(target) = replacements.get(candidate) {
+            resolved.push_str(target);
+        } else {
+            resolved.push_str(candidate);
+        }
+        stats.account_input_range(start, end, true);
+        stats.candidates += 1;
+        stats.cursor_advanced_bytes += end - cursor;
+        cursor = end;
     }
 
-    resolved
+    if cursor < text.len() {
+        resolved.push_str(&text[cursor..]);
+        stats.account_input_range(cursor, text.len(), false);
+        stats.cursor_advanced_bytes += text.len() - cursor;
+    }
+
+    (resolved, stats)
 }
 
 pub(crate) fn restore_missing_xrefs(
@@ -195,6 +273,20 @@ pub(crate) fn restore_missing_xrefs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_link(
+        token: impl Into<String>,
+        target_id: u64,
+        local_target: impl Into<String>,
+        external_target: impl Into<String>,
+    ) -> PendingLink {
+        PendingLink {
+            token: token.into(),
+            target_id,
+            local_target: local_target.into(),
+            external_target: external_target.into(),
+        }
+    }
 
     fn rewriter() -> LinkRewriter {
         LinkRewriter::new(
@@ -454,6 +546,190 @@ mod tests {
             resolve_pending_links(&rendered, &links, &HashSet::new()),
             "https://news.livejournal.com/2.html[Two]"
         );
+    }
+
+    #[test]
+    fn resolves_adjacent_local_and_external_tokens_exactly() {
+        let local = "\u{1f}lj-archiver-link:1:0\u{1f}";
+        let external = "\u{1f}lj-archiver-link:2:1\u{1f}";
+        let links = [
+            pending_link(
+                local,
+                1,
+                "xref:1.adoc",
+                "https://news.livejournal.com/1.html",
+            ),
+            pending_link(
+                external,
+                2,
+                "xref:2.adoc",
+                "https://news.livejournal.com/2.html",
+            ),
+        ];
+
+        assert_eq!(
+            resolve_pending_links(
+                &format!("before {local}{external} after"),
+                &links,
+                &HashSet::from([1]),
+            ),
+            "before xref:1.adochttps://news.livejournal.com/2.html after"
+        );
+    }
+
+    #[test]
+    fn resolves_every_repeated_occurrence_of_one_recorded_token() {
+        let token = "\u{1f}lj-archiver-link:7:0\u{1f}";
+        let links = [pending_link(
+            token,
+            7,
+            "xref:7.adoc",
+            "https://news.livejournal.com/7.html",
+        )];
+
+        assert_eq!(
+            resolve_pending_links(
+                &format!("{token}|{token}|{token}"),
+                &links,
+                &HashSet::from([7]),
+            ),
+            "xref:7.adoc|xref:7.adoc|xref:7.adoc"
+        );
+    }
+
+    #[test]
+    fn preserves_token_prefix_suffix_and_unknown_complete_lookalikes() {
+        let token = "\u{1f}lj-archiver-link:7:0\u{1f}";
+        let links = [pending_link(
+            token,
+            7,
+            "xref:7.adoc",
+            "https://news.livejournal.com/7.html",
+        )];
+        let text = concat!(
+            "\u{1f}prefix-lj-archiver-link:7:0\u{1f}",
+            "|\u{1f}lj-archiver-link:7:0-suffix\u{1f}",
+            "|\u{1f}lj-archiver-link:999:0\u{1f}",
+        );
+
+        assert_eq!(
+            resolve_pending_links(text, &links, &HashSet::from([7])),
+            text
+        );
+    }
+
+    #[test]
+    fn preserves_malformed_candidate_and_all_remaining_text() {
+        let token = "\u{1f}lj-archiver-link:7:0\u{1f}";
+        let links = [pending_link(
+            token,
+            7,
+            "xref:7.adoc",
+            "https://news.livejournal.com/7.html",
+        )];
+        let text = "before \u{1f}lj-archiver-link:7:0 and trailing bytes";
+
+        assert_eq!(
+            resolve_pending_links(text, &links, &HashSet::from([7])),
+            text
+        );
+    }
+
+    #[test]
+    fn preserves_ordinary_unit_separator_delimited_text() {
+        let token = "\u{1f}lj-archiver-link:7:0\u{1f}";
+        let links = [pending_link(
+            token,
+            7,
+            "xref:7.adoc",
+            "https://news.livejournal.com/7.html",
+        )];
+        let text = "before \u{1f}ordinary text\u{1f} and \u{1f}\u{1f} after";
+
+        assert_eq!(
+            resolve_pending_links(text, &links, &HashSet::from([7])),
+            text
+        );
+    }
+
+    #[test]
+    fn does_not_recursively_rescan_replacement_text() {
+        let first = "\u{1f}lj-archiver-link:1:0\u{1f}";
+        let second = "\u{1f}lj-archiver-link:2:1\u{1f}";
+        let links = [
+            pending_link(first, 1, "xref:1.adoc", second),
+            pending_link(
+                second,
+                2,
+                "xref:2.adoc",
+                "https://news.livejournal.com/2.html",
+            ),
+        ];
+
+        assert_eq!(
+            resolve_pending_links(first, &links, &HashSet::new()),
+            second
+        );
+    }
+
+    #[test]
+    fn keeps_first_selected_target_for_duplicate_recorded_tokens() {
+        let token = "\u{1f}lj-archiver-link:1:0\u{1f}";
+        let links = [
+            pending_link(token, 1, "xref:first.adoc", "https://example.test/first"),
+            pending_link(token, 1, "xref:second.adoc", "https://example.test/second"),
+        ];
+
+        assert_eq!(
+            resolve_pending_links(token, &links, &HashSet::from([1])),
+            "xref:first.adoc"
+        );
+    }
+
+    #[test]
+    fn resolves_twenty_five_thousand_tokens_with_one_monotonic_input_pass() {
+        const LINK_COUNT: u64 = 25_000;
+        const EXPECTED_OUTPUT_LEN: usize = 175_009;
+
+        let mut links = Vec::with_capacity(LINK_COUNT as usize);
+        let mut local_ids = HashSet::with_capacity(LINK_COUNT as usize / 2);
+        let mut text = String::from("start:");
+        let mut expected = String::from("start:");
+
+        for id in 1..=LINK_COUNT {
+            if id > 1 {
+                text.push('|');
+                expected.push('|');
+            }
+
+            let token = format!("\u{1f}scale:{id:05}\u{1f}");
+            let local_target = format!("L{id:05}");
+            let external_target = format!("E{id:05}");
+            text.push_str(&token);
+            if id % 2 == 0 {
+                local_ids.insert(id);
+                expected.push_str(&local_target);
+            } else {
+                expected.push_str(&external_target);
+            }
+            links.push(pending_link(token, id, local_target, external_target));
+        }
+        text.push_str(":end");
+        expected.push_str(":end");
+
+        let (resolved, stats) = resolve_pending_links_with_scan_stats(&text, &links, &local_ids);
+
+        assert_eq!(resolved, expected);
+        assert_eq!(resolved.len(), EXPECTED_OUTPUT_LEN);
+        assert_eq!(stats.candidates, LINK_COUNT as usize);
+        assert_eq!(stats.cursor_advanced_bytes, text.len());
+        assert_eq!(stats.accounted_input_bytes, text.len());
+        assert_eq!(
+            stats.copied_input_bytes + stats.candidate_input_bytes,
+            text.len()
+        );
+        assert_eq!(stats.revisited_input_bytes, 0);
+        assert_eq!(stats.skipped_input_bytes, 0);
     }
 
     #[test]
