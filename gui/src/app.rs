@@ -157,9 +157,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
-
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn start_routes_invalid_folder_to_error_without_launch() {
