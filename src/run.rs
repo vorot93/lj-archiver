@@ -1,8 +1,3 @@
-use std::{collections::HashSet, path::PathBuf};
-
-use futures::{StreamExt, stream};
-use url::Url;
-
 use crate::{
     Result,
     adoc::render_post,
@@ -18,6 +13,9 @@ use crate::{
     progress::Progress,
     target::{journal_base_url, parse_target, post_url},
 };
+use futures::{StreamExt, stream};
+use std::{collections::HashSet, path::PathBuf};
+use url::Url;
 
 /// The result of a completed archive run. `Ok(RunOutcome)` means the run wrote
 /// what it could; a journal run with some failed posts/pages still returns

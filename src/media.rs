@@ -1058,7 +1058,7 @@ mod tests {
             rewritten.html,
             format!(
                 r#"<p>before<img alt="x"><img src="{}"></p>"#,
-                expected_path.to_string_lossy()
+                storage::adoc_path(&expected_path)
             )
         );
         assert_eq!(rewritten.assets.len(), 1);
@@ -1093,7 +1093,10 @@ mod tests {
 
         assert_eq!(
             rewritten.html,
-            format!(r#"<p><img src="{}"></p>"#, expected_path.to_string_lossy())
+            format!(
+                r#"<p><img src="{}"></p>"#,
+                storage::adoc_path(&expected_path)
+            )
         );
         assert_eq!(rewritten.assets.len(), 1);
         assert!(assets_dir.join(expected_path.file_name().unwrap()).exists());
@@ -1132,7 +1135,7 @@ mod tests {
             rewritten.html,
             format!(
                 r#"<!-- <img src="/fake.jpg"> --><img src="{}">"#,
-                expected_path.to_string_lossy()
+                storage::adoc_path(&expected_path)
             )
         );
         assert_eq!(rewritten.assets.len(), 1);

@@ -154,3 +154,31 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn start_routes_invalid_folder_to_error_without_launch() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("output");
+        std::fs::write(&output, "not a directory\n").unwrap();
+
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("news".to_string()));
+        app.update_state(&Message::FolderChosen(Some(output)));
+
+        drop(app.update(Message::Start));
+
+        assert!(!matches!(app.state, State::Running(_)));
+        let State::Error { message } = &app.state else {
+            panic!("invalid output folder should enter the error state");
+        };
+        assert!(
+            message.contains("archive identity cannot be verified: could not inspect posts folder")
+        );
+    }
+}

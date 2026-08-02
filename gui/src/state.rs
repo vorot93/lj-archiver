@@ -1,9 +1,7 @@
 //! Pure, Elm-style state for the GUI: `App`/`State`/`Message` plus the
 //! `update_state` reducer. Deliberately free of iced (and of `rfd`/`open`) so
 //! it is fully unit-testable without a display; the iced view/update glue
-//! that actually constructs and consumes this API lives in `app.rs` (Task 5).
-
-use std::path::{Path, PathBuf};
+//! that actually constructs and consumes this API lives in `app.rs`.
 
 use lj_archiver::{
     models::{ArchiveTarget, PostFailure, RunOptions},
@@ -11,6 +9,7 @@ use lj_archiver::{
     run::RunOutcome,
     target::{is_valid_journal_name, journals_alias, parse_target},
 };
+use std::path::{Path, PathBuf};
 use url::Url;
 
 #[derive(Debug, Clone)]

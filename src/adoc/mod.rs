@@ -882,8 +882,11 @@ mod tests {
             "<script>const x = \"<table>fake</table>\";</script>",
             "<table><tr><td>real</td></tr></table>"
         );
-        assert!(html_to_adoc(html).contains("<table><tr><td>real</td></tr></table>"));
-        assert!(!html_to_adoc(html).contains("++++\n<table>fake</table>\n++++"));
+        let adoc = html_to_adoc(html);
+        assert_eq!(
+            adoc,
+            "----\nconst x = \"<table>fake</table>\";\n----\n\n++++\n<table><tr><td>real</td></tr></table>\n++++\n\n"
+        );
     }
 
     #[test]
