@@ -1,4 +1,4 @@
-use super::{MAX_RENDER_DEPTH, RenderCtx, classify::is_stripped_chrome};
+use super::{RenderCtx, classify::is_stripped_chrome};
 use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
 use std::{borrow::Cow, collections::HashMap, ops::Range};
@@ -359,28 +359,13 @@ fn is_source_raw_text_tag(name: &str) -> bool {
 }
 
 pub(crate) fn raw_text(element: ElementRef<'_>) -> String {
-    raw_text_at(element, 0)
-}
-
-fn raw_text_at(element: ElementRef<'_>, depth: usize) -> String {
-    // Bound this self-recursion at the same depth as `render_element`. At the cap
-    // we stop recursing and return the text accumulated so far, so deeply nested
-    // `<pre>`/`<code>` content degrades gracefully (truncated) instead of
-    // overflowing the stack.
-    if depth >= MAX_RENDER_DEPTH {
-        return String::new();
-    }
-
     let mut output = String::new();
+    let mut stack: Vec<_> = element.children().rev().collect();
 
-    for child in element.children() {
-        match child.value() {
+    while let Some(node) = stack.pop() {
+        match node.value() {
             Node::Text(text) => output.push_str(text),
-            Node::Element(_) => {
-                if let Some(child_element) = ElementRef::wrap(child) {
-                    output.push_str(&raw_text_at(child_element, depth + 1));
-                }
-            }
+            Node::Element(_) => stack.extend(node.children().rev()),
             _ => {}
         }
     }

@@ -2174,32 +2174,27 @@ mod tests {
     }
 
     #[test]
-    fn deeply_nested_pre_does_not_overflow() {
-        // `<pre>` listing content is collected by `raw_text`, which used to recurse
-        // uncapped over nested elements. The cap stops it past MAX_RENDER_DEPTH while
-        // preserving content collected up to the cap (the leading "keep" text here).
+    fn deeply_nested_pre_preserves_deepest_text() {
         let depth = 300;
         let html = format!(
-            "<pre>keep{}{}</pre>",
+            "<pre>{}deep-marker{}</pre>",
             "<span>".repeat(depth),
             "</span>".repeat(depth)
         );
-        let out = html_to_adoc(&html);
-        assert!(out.contains("keep"), "content must be preserved: {out:?}");
+
+        assert_eq!(html_to_adoc(&html), "----\ndeep-marker\n----\n\n");
     }
 
     #[test]
-    fn deeply_nested_code_does_not_overflow() {
-        // `<code>` inline content is also collected by `raw_text`; the same cap
-        // prevents the nested-element recursion from overflowing the stack.
+    fn deeply_nested_code_preserves_deepest_text() {
         let depth = 300;
         let html = format!(
-            "<code>keep{}{}</code>",
+            "<code>{}deep-marker{}</code>",
             "<span>".repeat(depth),
             "</span>".repeat(depth)
         );
-        let out = html_to_adoc(&html);
-        assert!(out.contains("keep"), "content must be preserved: {out:?}");
+
+        assert_eq!(html_to_adoc(&html), "`deep-marker`");
     }
 
     #[test]
