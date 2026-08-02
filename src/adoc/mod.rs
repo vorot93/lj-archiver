@@ -15,6 +15,8 @@ use classify::*;
 use escape::*;
 use source_html::*;
 
+pub(crate) use escape::sanitize_macro_target;
+
 pub fn render_post(
     post: &Post,
     include_comments: bool,
@@ -402,7 +404,7 @@ fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
             }
 
             let macro_target = match ctx.link_rewriter.and_then(|r| r.xref_target(href)) {
-                Some(adoc) => format!("xref:{adoc}"),
+                Some(target) => target,
                 None => sanitize_macro_target(href),
             };
 
