@@ -791,6 +791,25 @@ mod tests {
     }
 
     #[test]
+    fn comment_tags_do_not_shift_passthrough_source_spans() {
+        let html = "<p><!-- <div>fake</div> -->intro</p><div>real</div>";
+        assert_eq!(
+            html_to_adoc(html),
+            "intro\n\n++++\n<div>real</div>\n++++\n\n"
+        );
+    }
+
+    #[test]
+    fn raw_text_tags_do_not_shift_passthrough_source_spans() {
+        let html = concat!(
+            "<script>const x = \"<table>fake</table>\";</script>",
+            "<table><tr><td>real</td></tr></table>"
+        );
+        assert!(html_to_adoc(html).contains("<table><tr><td>real</td></tr></table>"));
+        assert!(!html_to_adoc(html).contains("++++\n<table>fake</table>\n++++"));
+    }
+
+    #[test]
     fn uses_safe_passthrough_delimiter_when_html_contains_default_delimiter() {
         let html = "<table><tr><td>before\n++++\nafter</td></tr></table>";
         let adoc = html_to_adoc(html);

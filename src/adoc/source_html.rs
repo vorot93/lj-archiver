@@ -140,6 +140,8 @@ pub(crate) fn build_source_map(document: &Html, source_html: &str) -> HashMap<No
 /// the recovered span omit content the DOM actually nests inside the element.
 /// Such a tag is instead pushed onto the opening-tag branch below like a plain
 /// opening tag, so it only resolves once (if) a real closing tag is found.
+/// Comments and raw-text/RCDATA children are advanced over as opaque regions so
+/// tag-looking text inside them does not consume element ordinals.
 ///
 /// The former scan abandoned a tag name for the rest of the source once an
 /// opening tag had no matching close, yielding `None` for that name from the
@@ -157,12 +159,22 @@ fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<String>> {
 
     while let Some(relative_start) = source_html[search_start..].find('<') {
         let start = search_start + relative_start;
+
+        if source_html[start..].starts_with("<!--") {
+            search_start = source_html[start + 4..]
+                .find("-->")
+                .map_or(source_html.len(), |end| start + 4 + end + 3);
+            continue;
+        }
+
         let Some(tag) = parse_source_tag(source_html, start) else {
             search_start = start + 1;
             continue;
         };
 
         let name = tag.name.to_ascii_lowercase();
+        let raw_text_name =
+            (!tag.is_closing && is_source_raw_text_tag(&name)).then(|| name.clone());
 
         if tag.is_closing {
             if let Some((slot, open_start)) = open_stacks.get_mut(&name).and_then(Vec::pop)
@@ -179,6 +191,21 @@ fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<String>> {
             open_stacks.entry(name).or_default().push((slot, start));
         }
 
+        if let Some(raw_text_name) = raw_text_name {
+            if raw_text_name == "plaintext" {
+                search_start = source_html.len();
+            } else {
+                let closing_prefix = format!("</{raw_text_name}");
+                search_start = find_ascii_case_insensitive(
+                    source_html.as_bytes(),
+                    tag.end,
+                    closing_prefix.as_bytes(),
+                )
+                .unwrap_or(source_html.len());
+            }
+            continue;
+        }
+
         search_start = tag.end;
     }
 
@@ -193,6 +220,19 @@ fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<String>> {
             (name, spans)
         })
         .collect()
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+    let mut cursor = start;
+
+    while cursor + needle.len() <= haystack.len() {
+        if haystack[cursor..cursor + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+
+    None
 }
 
 struct SourceTag {
@@ -273,6 +313,21 @@ fn is_source_void_tag(name: &str) -> bool {
             | "source"
             | "track"
             | "wbr"
+    )
+}
+
+fn is_source_raw_text_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "script"
+            | "style"
+            | "title"
+            | "textarea"
+            | "xmp"
+            | "iframe"
+            | "noembed"
+            | "noframes"
+            | "plaintext"
     )
 }
 
