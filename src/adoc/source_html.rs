@@ -33,10 +33,8 @@ fn contains_rejected_url_attribute(source_html: &str, ctx: RenderCtx<'_>) -> boo
         .descendants()
         .filter_map(ElementRef::wrap)
         .any(|element| {
-            ["href", "src"].iter().any(|name| {
-                element
-                    .attr(name)
-                    .is_some_and(|value| !is_safe_url_reference(value, ctx))
+            element.value().attrs().any(|(local_name, value)| {
+                matches!(local_name, "href" | "src") && !is_safe_url_reference(value, ctx)
             })
         })
 }

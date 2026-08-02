@@ -6,6 +6,9 @@ use crate::{
 use std::{collections::HashSet, sync::Mutex};
 use url::Url;
 
+pub(crate) const POST_LINK_PREFIX_ATTRIBUTE: &str = "lj-archiver-post-link-prefix";
+pub(crate) const POST_LINK_PREFIX_REFERENCE: &str = "{lj-archiver-post-link-prefix}";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingLink {
     pub token: String,
@@ -75,7 +78,9 @@ impl LinkRewriter {
 
         let local_target = match context {
             LocalTargetContext::XrefMacro => format!("xref:{id}.adoc"),
-            LocalTargetContext::ImageLinkAttribute => format!("{id}.adoc"),
+            LocalTargetContext::ImageLinkAttribute => {
+                format!("{POST_LINK_PREFIX_REFERENCE}{id}.adoc")
+            }
         };
 
         match self.mode {
@@ -219,6 +224,18 @@ mod tests {
         assert_eq!(
             users.xref_target("https://users.livejournal.com/example_user/166512.html"),
             Some("xref:166512.adoc".to_string())
+        );
+    }
+
+    #[test]
+    fn image_link_context_prefix_is_separate_from_ordinary_xref_targets() {
+        let r = rewriter();
+        let href = "https://news.livejournal.com/166512.html";
+
+        assert_eq!(r.xref_target(href), Some("xref:166512.adoc".to_string()));
+        assert_eq!(
+            r.image_link_target(href),
+            Some("{lj-archiver-post-link-prefix}166512.adoc".to_string())
         );
     }
 

@@ -982,9 +982,10 @@ fn find_html_doctype_end(bytes: &[u8], content_start: usize, scan_steps: &mut us
         };
     };
 
-    let Some(mut cursor) = find_quoted_doctype_identifier_end(bytes, cursor, quote, scan_steps)
-    else {
-        return bytes.len();
+    let mut cursor = match find_quoted_doctype_identifier_end(bytes, cursor, quote, scan_steps) {
+        QuotedDoctypeIdentifierEnd::Quote(cursor) => cursor,
+        QuotedDoctypeIdentifierEnd::Declaration(end) => return end,
+        QuotedDoctypeIdentifierEnd::Eof => return bytes.len(),
     };
 
     skip_html_whitespace(bytes, &mut cursor, scan_steps);
@@ -999,11 +1000,19 @@ fn find_html_doctype_end(bytes: &[u8], content_start: usize, scan_steps: &mut us
         };
     };
 
-    let Some(cursor) = find_quoted_doctype_identifier_end(bytes, cursor, quote, scan_steps) else {
-        return bytes.len();
+    let cursor = match find_quoted_doctype_identifier_end(bytes, cursor, quote, scan_steps) {
+        QuotedDoctypeIdentifierEnd::Quote(cursor) => cursor,
+        QuotedDoctypeIdentifierEnd::Declaration(end) => return end,
+        QuotedDoctypeIdentifierEnd::Eof => return bytes.len(),
     };
 
     finish_html_doctype(bytes, cursor, scan_steps)
+}
+
+enum QuotedDoctypeIdentifierEnd {
+    Quote(usize),
+    Declaration(usize),
+    Eof,
 }
 
 fn find_quoted_doctype_identifier_end(
@@ -1011,7 +1020,7 @@ fn find_quoted_doctype_identifier_end(
     mut cursor: usize,
     quote: u8,
     scan_steps: &mut usize,
-) -> Option<usize> {
+) -> QuotedDoctypeIdentifierEnd {
     *scan_steps += 1;
     cursor += 1;
 
@@ -1019,12 +1028,15 @@ fn find_quoted_doctype_identifier_end(
         *scan_steps += 1;
         let current = bytes[cursor];
         cursor += 1;
+        if current == b'>' {
+            return QuotedDoctypeIdentifierEnd::Declaration(cursor);
+        }
         if current == quote {
-            return Some(cursor);
+            return QuotedDoctypeIdentifierEnd::Quote(cursor);
         }
     }
 
-    None
+    QuotedDoctypeIdentifierEnd::Eof
 }
 
 fn finish_html_doctype(bytes: &[u8], mut cursor: usize, scan_steps: &mut usize) -> usize {
@@ -1760,21 +1772,86 @@ mod tests {
     }
 
     #[test]
-    fn quoted_doctype_identifiers_do_not_expose_img_looking_bytes() {
+    fn greater_than_abruptly_ends_quoted_doctype_identifiers() {
+        let cases = [
+            (
+                concat!(
+                    r#"<!DOCTYPE html PUBLIC "identifier><img src='/fake-public.jpg'>">"#,
+                    r#"<img src="/real-public.jpg">"#,
+                ),
+                ["/fake-public.jpg", "/real-public.jpg"],
+            ),
+            (
+                concat!(
+                    r#"<!DOCTYPE html SYSTEM 'identifier><img src="/fake-system.jpg">'>"#,
+                    r#"<img src='/real-system.jpg'>"#,
+                ),
+                ["/fake-system.jpg", "/real-system.jpg"],
+            ),
+        ];
+
+        for (html, expected_sources) in cases {
+            let (targets, scan_steps) = image_targets_with_scan_steps(html);
+            let sources: Vec<_> = targets
+                .iter()
+                .map(|target| target.source.as_str())
+                .collect();
+
+            assert_eq!(sources, expected_sources, "got targets for {html:?}");
+            assert!(
+                scan_steps <= 2 * html.len(),
+                "scanner took {scan_steps} steps for {} input bytes",
+                html.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn images_after_abrupt_quoted_doctype_end_are_rewritten_and_requested() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7, 8, 9]))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let assets_dir = dir.path().join("assets");
+        let base = Url::parse(&server.uri()).unwrap();
+        let fake_url = base.join("/fake.jpg").unwrap();
+        let real_url = base.join("/real.jpg").unwrap();
+        let fake_target = storage::adoc_path(&relative_asset_path(&filename_for_url(&fake_url)));
+        let real_target = storage::adoc_path(&relative_asset_path(&filename_for_url(&real_url)));
         let html = concat!(
             r#"<!DOCTYPE html PUBLIC "identifier><img src='/fake.jpg'>">"#,
             r#"<img src="/real.jpg">"#,
         );
 
-        let (targets, scan_steps) = image_targets_with_scan_steps(html);
+        let rewritten = rewrite_inline_media(html, &base, &assets_dir, true, None)
+            .await
+            .unwrap();
 
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].source, "/real.jpg");
-        assert!(
-            scan_steps <= 2 * html.len(),
-            "scanner took {scan_steps} steps for {} input bytes",
-            html.len()
+        assert_eq!(
+            rewritten.html,
+            format!(
+                r#"<!DOCTYPE html PUBLIC "identifier><img src='{fake_target}'>"><img src="{real_target}">"#
+            )
         );
+        assert_eq!(rewritten.assets.len(), 2);
+        assert!(
+            assets_dir
+                .join(fake_target.rsplit('/').next().unwrap())
+                .is_file()
+        );
+        assert!(
+            assets_dir
+                .join(real_target.rsplit('/').next().unwrap())
+                .is_file()
+        );
+        let requests = server.received_requests().await.unwrap();
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(paths, ["/fake.jpg", "/real.jpg"]);
     }
 
     #[test]

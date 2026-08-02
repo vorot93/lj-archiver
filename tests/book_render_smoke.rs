@@ -83,6 +83,74 @@ fn book_media_resolves_to_archive_root_asset() {
 
 #[test]
 #[ignore = "requires asciidoctor; exercised explicitly by CI"]
+fn linked_post_image_href_resolves_in_standalone_and_book_contexts() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("archive");
+    let archive = Archive::new(&root, "news");
+    let source = concat!(
+        "= First\n\n",
+        "ifndef::lj-archiver-post-link-prefix",
+        "[:lj-archiver-post-link-prefix:]\n\n",
+        "image:https://cdn.example.test/photo.jpg[photo,",
+        "link={lj-archiver-post-link-prefix}2.adoc]\n",
+    );
+    let first_path = archive.write_post(1, source).unwrap();
+    let second_path = archive.write_post(2, "= Second\n").unwrap();
+    let posts = [
+        ArchivedPost {
+            id: 1,
+            title: "First".to_string(),
+            path: first_path,
+        },
+        ArchivedPost {
+            id: 2,
+            title: "Second".to_string(),
+            path: second_path,
+        },
+    ];
+    archive.write_index(&posts).unwrap();
+    archive.write_book(&posts).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(root.join("posts/1.adoc")).unwrap(),
+        source
+    );
+
+    for input in ["posts/1.adoc", "book.adoc"] {
+        let output = Command::new("asciidoctor")
+            .arg(input)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "asciidoctor failed for {input}:\nstdout excerpt: {}\nstderr excerpt: {}",
+            bounded_diagnostic(&output.stdout),
+            bounded_diagnostic(&output.stderr)
+        );
+    }
+
+    let standalone = fs::read_to_string(root.join("posts/1.html")).unwrap();
+    assert!(
+        standalone.contains("href=\"2.adoc\""),
+        "standalone post used the wrong linked-image href:\n{}",
+        bounded_diagnostic(standalone.as_bytes())
+    );
+    assert!(!standalone.contains("href=\"xref:2.adoc\""));
+
+    let book = fs::read_to_string(root.join("book.html")).unwrap();
+    assert!(
+        book.contains("href=\"posts/2.adoc\""),
+        "included post used the wrong linked-image href:\n{}",
+        bounded_diagnostic(book.as_bytes())
+    );
+    assert!(!book.contains("href=\"2.adoc\""));
+    assert!(!book.contains("href=\"xref:2.adoc\""));
+    assert!(root.join("posts/2.adoc").is_file());
+}
+
+#[test]
+#[ignore = "requires asciidoctor; exercised explicitly by CI"]
 fn plain_text_cannot_create_asciidoc_macros_or_expand_attributes() {
     let dir = tempdir().unwrap();
     let adoc = format!(

@@ -1,5 +1,5 @@
 use crate::{
-    links::LinkRewriter,
+    links::{LinkRewriter, POST_LINK_PREFIX_ATTRIBUTE},
     models::{Comment, Post},
 };
 use chrono::SecondsFormat;
@@ -40,6 +40,14 @@ pub fn render_post(
 
     if !post.tags.is_empty() {
         push_attribute(&mut output, "lj-tags", &post.tags.join(", "));
+    }
+
+    if link_rewriter.is_some() {
+        output.push_str("ifndef::");
+        output.push_str(POST_LINK_PREFIX_ATTRIBUTE);
+        output.push_str("[:");
+        output.push_str(POST_LINK_PREFIX_ATTRIBUTE);
+        output.push_str(":]\n");
     }
 
     output.push('\n');
@@ -2789,6 +2797,35 @@ mod tests {
     }
 
     #[test]
+    fn generated_post_defaults_linked_image_prefix_for_standalone_rendering() {
+        let mut post = test_post_with_comments(vec![]);
+        post.body_html = concat!(
+            r#"<a href="https://news.livejournal.com/166512.html">"#,
+            r#"<img src="https://cdn.example.test/photo.jpg" alt="photo"></a>"#,
+        )
+        .to_string();
+        let r = news_rewriter();
+
+        let rendered = render_post(&post, false, Some(&r));
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "= Post Title\n\n",
+                ":lj-id: 166511\n",
+                ":lj-url: https://news.livejournal.com/166511.html\n",
+                ":lj-author: news\n",
+                ":lj-date: 2024-12-17T16:01:00Z\n",
+                "ifndef::lj-archiver-post-link-prefix",
+                "[:lj-archiver-post-link-prefix:]\n\n",
+                "image:https://cdn.example.test/photo.jpg[photo,",
+                "link={lj-archiver-post-link-prefix}166512.adoc]\n",
+            )
+        );
+        assert!(!rendered.ends_with("\n\n"), "got: {rendered:?}");
+    }
+
+    #[test]
     fn resolves_linked_image_href_and_keeps_safe_image_when_href_is_unsafe() {
         let r = LinkRewriter::new(
             "news",
@@ -2823,7 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_local_linked_image_uses_relative_uri_not_xref_macro() {
+    fn direct_local_linked_image_uses_contextual_uri_not_xref_macro() {
         let r = LinkRewriter::new(
             "news",
             HashSet::from([2u64]),
@@ -2837,12 +2874,15 @@ mod tests {
 
         assert_eq!(
             adoc,
-            "image:https://cdn.example.test/photo.jpg[photo,link=2.adoc]"
+            concat!(
+                "image:https://cdn.example.test/photo.jpg[photo,",
+                "link={lj-archiver-post-link-prefix}2.adoc]"
+            )
         );
     }
 
     #[test]
-    fn pending_local_linked_image_resolves_to_relative_uri_not_xref_macro() {
+    fn pending_local_linked_image_resolves_to_contextual_uri_not_xref_macro() {
         let r = LinkRewriter::pending(
             "news",
             HashSet::from([2u64]),
@@ -2857,7 +2897,10 @@ mod tests {
 
         assert_eq!(
             resolved,
-            "image:https://cdn.example.test/photo.jpg[photo,link=2.adoc]"
+            concat!(
+                "image:https://cdn.example.test/photo.jpg[photo,",
+                "link={lj-archiver-post-link-prefix}2.adoc]"
+            )
         );
     }
 
@@ -2901,7 +2944,9 @@ mod tests {
             Some(&r),
         );
 
-        let html = convert_with_asciidoctor(&adoc);
+        let html = convert_with_asciidoctor(&format!(
+            "ifndef::lj-archiver-post-link-prefix[:lj-archiver-post-link-prefix:]\n\n{adoc}"
+        ));
 
         assert!(html.contains("href=\"2.adoc\""), "got: {html}");
         assert!(!html.contains("href=\"xref:2.adoc\""), "got: {html}");
@@ -2940,7 +2985,14 @@ mod tests {
         let failed_adoc =
             resolve_pending_links(&failed_pending, &failed.pending_links(), &HashSet::new());
 
-        let html = convert_with_asciidoctor(&format!("{local_adoc}\n\n{failed_adoc}"));
+        let html = convert_with_asciidoctor(&format!(
+            concat!(
+                "ifndef::lj-archiver-post-link-prefix",
+                "[:lj-archiver-post-link-prefix:]\n\n",
+                "{}\n\n{}",
+            ),
+            local_adoc, failed_adoc
+        ));
 
         assert!(html.contains("href=\"2.adoc\""), "got: {html}");
         assert!(!html.contains("href=\"xref:2.adoc\""), "got: {html}");
@@ -2984,6 +3036,48 @@ mod tests {
             "news",
             HashSet::new(),
             Url::parse("https://news.livejournal.com/archive/1.html").unwrap(),
+        );
+
+        let adoc = html_to_adoc_with_links(source, Some(&r));
+
+        assert_eq!(adoc, format!("++++\n{source}\n++++\n\n"));
+    }
+
+    #[test]
+    fn unsafe_namespaced_url_attributes_degrade_exact_passthrough_to_listing() {
+        let source = concat!(
+            r#"<section data-kind='svg'><svg xmlns="http://www.w3.org/2000/svg" "#,
+            r#"xmlns:xlink="http://www.w3.org/1999/xlink">"#,
+            r#"<a xlink:href="javascript:alert(1)"><text>script label</text></a>"#,
+            r#"<a xlink:href="data:text/plain,boom"><text>data label</text></a>"#,
+            r#"<a xlink:href="file:///secret.svg"><text>file label</text></a>"#,
+            r#"<a xlink:href="mailto:reader@example.test"><text>mail label</text></a>"#,
+            r#"</svg></section>"#,
+        );
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::new(),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+
+        let adoc = html_to_adoc_with_links(source, Some(&r));
+
+        assert_eq!(adoc, format!("----\n{source}\n----\n\n"));
+        assert!(!adoc.contains("++++"), "got: {adoc:?}");
+    }
+
+    #[test]
+    fn safe_namespaced_url_attribute_keeps_exact_raw_passthrough() {
+        let source = concat!(
+            r#"<section data-kind='safe-svg'><svg xmlns="http://www.w3.org/2000/svg" "#,
+            r#"xmlns:xlink="http://www.w3.org/1999/xlink">"#,
+            r#"<a xlink:href="https://safe.example.test/page">"#,
+            r#"<text>safe svg label</text></a></svg></section>"#,
+        );
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::new(),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
         );
 
         let adoc = html_to_adoc_with_links(source, Some(&r));
@@ -3070,6 +3164,77 @@ mod tests {
             "mailto:image@example.test",
             "script label",
             "mail image",
+        ] {
+            assert!(
+                visible_text.contains(visible),
+                "missing {visible:?} in: {html}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn svg_xlink_passthrough_safety_is_inert_after_conversion() {
+        let unsafe_source = concat!(
+            r#"<section><svg xmlns="http://www.w3.org/2000/svg" "#,
+            r#"xmlns:xlink="http://www.w3.org/1999/xlink">"#,
+            r#"<a xlink:href="javascript:alert(1)"><text>script svg</text></a>"#,
+            r#"<a xlink:href="data:text/plain,boom"><text>data svg</text></a>"#,
+            r#"<a xlink:href="file:///secret.svg"><text>file svg</text></a>"#,
+            r#"<a xlink:href="mailto:reader@example.test"><text>mail svg</text></a>"#,
+            r#"</svg></section>"#,
+        );
+        let safe_source = concat!(
+            r#"<section><svg xmlns="http://www.w3.org/2000/svg" "#,
+            r#"xmlns:xlink="http://www.w3.org/1999/xlink">"#,
+            r#"<a xlink:href="https://safe.example.test/page">"#,
+            r#"<text>safe svg</text></a></svg></section>"#,
+        );
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::new(),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+        let unsafe_adoc = html_to_adoc_with_links(unsafe_source, Some(&r));
+        let safe_adoc = html_to_adoc_with_links(safe_source, Some(&r));
+
+        let html = convert_with_asciidoctor(&format!("{unsafe_adoc}\n{safe_adoc}"));
+        let document = Html::parse_document(&html);
+        let active_values: Vec<_> = document
+            .tree
+            .root()
+            .descendants()
+            .filter_map(ElementRef::wrap)
+            .flat_map(|element| {
+                element
+                    .value()
+                    .attrs()
+                    .filter(|(local_name, _)| matches!(*local_name, "href" | "src"))
+                    .map(|(_, value)| value)
+            })
+            .collect();
+
+        for value in &active_values {
+            assert!(
+                !["javascript:", "data:", "file:", "mailto:"]
+                    .iter()
+                    .any(|scheme| value.to_ascii_lowercase().starts_with(scheme)),
+                "active unsafe URL {value:?} in: {html}"
+            );
+        }
+        assert!(
+            active_values.contains(&"https://safe.example.test/page"),
+            "got: {html}"
+        );
+        let visible_text = document.root_element().text().collect::<String>();
+        for visible in [
+            "javascript:alert(1)",
+            "data:text/plain,boom",
+            "file:///secret.svg",
+            "mailto:reader@example.test",
+            "script svg",
+            "mail svg",
+            "safe svg",
         ] {
             assert!(
                 visible_text.contains(visible),

@@ -162,6 +162,9 @@ HTTP(S) references are resolved against the individual post's delivered final
 URL and written as absolute external targets. Non-HTTP(S) link and image
 schemes are kept as inert visible text rather than active AsciiDoc macros.
 Archive paths written into AsciiDoc always use portable forward slashes.
+An image that links to another exported post also stays local: its click target
+resolves correctly both from a standalone file in `posts/` and when that post
+is included in `book.adoc`.
 
 Downloaded inline media is stored in a single `assets/` folder at the archive root. Each file is named by a hash of its source URL (`<hash>.<ext>`), so an image reused across posts is stored only once, and post files reference it with a relative path like `../assets/1d3802f42770.jpg`.
 
@@ -177,6 +180,7 @@ with a generated `:toc:`:
 :doctype: book
 :toc:
 :imagesdir: posts
+:lj-archiver-post-link-prefix: posts/
 
 include::index.adoc[leveloffset=+1]
 
@@ -185,9 +189,11 @@ include::posts/166511.adoc[leveloffset=+1]
 
 `book.adoc` is regenerated on every run (including with `--resume`) and lists
 exactly the posts `index.adoc` lists. The `:imagesdir: posts` attribute preserves
-the `../assets/...` references used by included standalone posts. To keep
-downloaded media resolvable, run the converter from the archive root and leave
-its output beside `book.adoc`:
+the `../assets/...` references used by included standalone posts. The internal
+post-link prefix similarly preserves click targets on images that link to
+other archived posts. To keep downloaded media and those post targets
+resolvable, run the converter from the archive root and leave its output beside
+`book.adoc`:
 
 ```sh
 cd archive/news

@@ -276,7 +276,7 @@ async fn cli_book_flag_writes_book_adoc() {
     let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
     assert_eq!(
         book,
-        "= news Archive\n:doctype: book\n:toc:\n:imagesdir: posts\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166511.adoc[leveloffset=+1]\n"
+        "= news Archive\n:doctype: book\n:toc:\n:imagesdir: posts\n:lj-archiver-post-link-prefix: posts/\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166511.adoc[leveloffset=+1]\n"
     );
 }
 
