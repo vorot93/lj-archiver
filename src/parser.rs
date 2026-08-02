@@ -1,12 +1,11 @@
-use chrono::{DateTime, Utc};
-use scraper::{ElementRef, Html, Selector, node::Node};
-use std::{collections::HashSet, sync::LazyLock};
-use url::Url;
-
 use crate::{
     error::{LjError, Result},
     models::{Comment, Post},
 };
+use chrono::{DateTime, Utc};
+use scraper::{ElementRef, Html, Selector, node::Node};
+use std::{collections::HashSet, sync::LazyLock};
+use url::Url;
 
 static ENTRY_TITLE: LazyLock<Selector> = LazyLock::new(|| {
     Selector::parse(".aentry-post__title-text, .entry-title").expect("static selector must parse")
@@ -670,6 +669,7 @@ mod tests {
                 <script>
                 NotSite.entry = {"ditemid":1,"journal":"wrong","poster":"wrong"};
                 Site.entryExtra = {"ditemid":2,"journal":"wrong","poster":"wrong"};
+                Site.entry = {"ditemid":999,"journal":"wrong_journal","poster":"wrong_poster","eventtime":1};
                 Site.entry = {"ditemid":
                 Site.entry = {"ditemid":123,"journal":"news","poster":"winner","eventtime":1700000000};
                 </script>
