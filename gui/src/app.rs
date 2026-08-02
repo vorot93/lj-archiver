@@ -62,7 +62,7 @@ impl App {
             .active_run_id()
             .expect("validated Start should activate a run generation");
 
-        let (tx, rx) = futures::channel::mpsc::unbounded::<ProgressEvent>();
+        let (tx, rx) = futures::channel::mpsc::channel::<ProgressEvent>(128);
         let progress = Progress::channel(tx);
         let job = async move {
             run_archive(&target, &options, &progress)

@@ -52,15 +52,20 @@ Reuse seam (in the core, additive, CLI behavior unchanged):
   `LjError::Discovery` (non-zero exit) — so the CLI is byte-identical, while the
   GUI can show a completed run with a failed-links list.
 - `progress::ProgressEvent` + `Progress::channel(tx)` add a fourth sink beside
-  Interactive/Plain/Quiet, emitting typed events to a `futures::mpsc` sender.
-  `futures` is already a core dep; do not add `tokio-stream` (a `futures` mpsc
-  receiver is already a `Stream`).
+  Interactive/Plain/Quiet. Channel progress is deliberately bounded and lossy:
+  all `Progress` clones share one mutex-protected `futures::mpsc::Sender`, and
+  emission uses nonblocking `try_send`, silently dropping intermediate events
+  when the buffer is full or disconnected. `futures` is already a core dep; do
+  not add `tokio-stream` (a `futures` mpsc receiver is already a `Stream`).
 
 GUI structure: `gui/src/state.rs` is a pure reducer (`App::update_state`) with
 full unit tests; `gui/src/app.rs` is the iced glue (`boot`/`update`/`view`).
-Progress is driven by `Task::batch([Task::run(rx, Message::Progress),
-Task::perform(run_archive(...), Message::Finished)])`. The iced view is
-manual-verify only (no headless harness) — smoke-test with
+Progress is driven by a capacity-128 channel in
+`Task::batch([Task::run(rx, Message::Progress),
+Task::perform(run_archive(...), Message::Finished)])`. Both callbacks carry
+the active run generation. Progress may be dropped, so the separately delivered
+generation-tagged `Finished` result is authoritative for terminal state and
+exact counters. The iced view is manual-verify only (no headless harness) — smoke-test with
 `cargo run -p lj-archiver-gui` against a small real post.
 
 The GUI accepts a selected folder only when it is empty or a matching existing

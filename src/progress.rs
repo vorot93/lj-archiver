@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use futures::channel::mpsc::UnboundedSender;
+use futures::channel::mpsc::Sender;
 use indicatif::ProgressStyle;
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
@@ -120,7 +120,7 @@ struct Inner {
     /// it (setting `None`) closes the span and clears its bar.
     span: Mutex<Option<Span>>,
     /// When set, semantic events are forwarded here (GUI channel mode).
-    sink: Option<UnboundedSender<ProgressEvent>>,
+    sink: Option<Mutex<Sender<ProgressEvent>>>,
 }
 
 impl Progress {
@@ -148,21 +148,21 @@ impl Progress {
 
     /// A progress handle that forwards semantic events to `tx` and writes
     /// nothing to stderr. Used by the GUI.
-    pub fn channel(tx: UnboundedSender<ProgressEvent>) -> Self {
+    pub fn channel(tx: Sender<ProgressEvent>) -> Self {
         Progress {
             inner: Arc::new(Inner {
                 mode: Mode::Quiet,
                 total: AtomicUsize::new(0),
                 completed: AtomicUsize::new(0),
                 span: Mutex::new(None),
-                sink: Some(tx),
+                sink: Some(Mutex::new(tx)),
             }),
         }
     }
 
     fn emit(&self, event: ProgressEvent) {
         if let Some(tx) = &self.inner.sink {
-            let _ = tx.unbounded_send(event);
+            let _ = tx.lock().unwrap().try_send(event);
         }
     }
 
@@ -427,7 +427,7 @@ mod tests {
     fn channel_sink_emits_semantic_events() {
         use futures::StreamExt;
 
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (tx, rx) = futures::channel::mpsc::channel(16);
         let progress = Progress::channel(tx);
         progress.discovery_started();
         progress.archiving_started(2);
@@ -456,6 +456,61 @@ mod tests {
                     elapsed: Duration::from_secs(3)
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn bounded_channel_drops_excess_without_blocking() {
+        use futures::StreamExt;
+
+        let (tx, rx) = futures::channel::mpsc::channel(1);
+        let progress = Progress::channel(tx);
+        for found in 0..1_024 {
+            progress.discovery_tick("/2024/", found);
+        }
+        drop(progress);
+
+        let events: Vec<_> = futures::executor::block_on(rx.collect());
+        assert!(!events.is_empty());
+        assert!(
+            events.len() <= 2,
+            "capacity 1 plus one sender-readiness slot must stay bounded: {events:?}"
+        );
+    }
+
+    #[test]
+    fn dropped_bounded_receiver_is_harmless() {
+        let (tx, rx) = futures::channel::mpsc::channel(1);
+        let progress = Progress::channel(tx);
+        drop(rx);
+
+        progress.discovery_started();
+        progress.discovery_tick("/2024/", 1);
+        progress.archiving_started(1);
+        progress.post_done(1, "One");
+        progress.archiving_finished();
+
+        assert_eq!(progress.inner.completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cloned_progress_handles_share_one_bounded_sender_budget() {
+        use futures::StreamExt;
+
+        let (tx, rx) = futures::channel::mpsc::channel(1);
+        let progress = Progress::channel(tx);
+        let producers = vec![progress.clone(); 32];
+        for (found, producer) in producers.iter().enumerate() {
+            producer.discovery_tick("/2024/", found);
+        }
+        drop(producers);
+        drop(progress);
+
+        let events: Vec<_> = futures::executor::block_on(rx.collect());
+        assert!(!events.is_empty());
+        assert!(
+            events.len() <= 2,
+            "Progress clones must share capacity 1 plus one sender-readiness slot: {events:?}"
         );
     }
 }

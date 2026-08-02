@@ -234,7 +234,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lj_archiver::{models::PostFailure, progress::ProgressEvent, run::RunOutcome};
+    use lj_archiver::{
+        models::PostFailure,
+        progress::{Progress, ProgressEvent},
+        run::RunOutcome,
+    };
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
     use url::Url;
@@ -462,6 +466,60 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn matching_finished_is_authoritative_when_bounded_progress_is_dropped() {
+        let mut app = App::default();
+        let run_id = start_run(&mut app);
+        let (tx, rx) = futures::channel::mpsc::channel(1);
+        let progress = Progress::channel(tx);
+        for found in 0..8 {
+            progress.discovery_tick("/2024/", found);
+        }
+        drop(rx);
+        progress.archiving_started(10);
+        progress.post_done(1, "One");
+        drop(progress);
+
+        let failures = vec![PostFailure {
+            id: 9,
+            url: Url::parse("https://news.livejournal.com/9.html").unwrap(),
+            message: "failed post".to_string(),
+        }];
+        app.update_state(&Message::Finished {
+            run_id,
+            result: Ok(RunOutcome {
+                root: PathBuf::from("/archive/output"),
+                archived: 7,
+                skipped: 2,
+                failed: 1,
+                failed_pages: 3,
+                failures: failures.clone(),
+                journal: Some("news".to_string()),
+            }),
+        });
+
+        assert_eq!(app.active_run_id(), None);
+        match &app.state {
+            State::Done {
+                root,
+                archived,
+                skipped,
+                failed,
+                failed_pages,
+                failures: actual_failures,
+            } => {
+                assert_eq!(root, &PathBuf::from("/archive/output"));
+                assert_eq!((*archived, *skipped, *failed), (7, 2, 1));
+                assert_eq!(*failed_pages, 3);
+                assert_eq!(actual_failures.len(), 1);
+                assert_eq!(actual_failures[0].id, failures[0].id);
+                assert_eq!(actual_failures[0].url, failures[0].url);
+                assert_eq!(actual_failures[0].message, failures[0].message);
+            }
+            other => panic!("expected authoritative Done state, got {other:?}"),
+        }
     }
 
     #[test]

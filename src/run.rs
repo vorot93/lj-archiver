@@ -888,7 +888,7 @@ mod tests {
             .write_post(1, "= Late Unverified File\n\nMust not trigger a skip.\n")
             .unwrap();
         let options = journal_cli(&server, dir.path(), true).options();
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (tx, rx) = futures::channel::mpsc::channel(128);
         let progress = Progress::channel(tx);
 
         let outcome = archive_journal_post(
@@ -1711,7 +1711,7 @@ mod tests {
         let baseline = "= Existing One\n\n:lj-id: 1\n\nOriginal body.\n";
         seed_existing_archive(dir.path(), &[(1, "Existing One", baseline)], true);
         let options = journal_cli(&server, dir.path(), false).options();
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (tx, rx) = futures::channel::mpsc::channel(128);
         let progress = Progress::channel(tx);
 
         let outcome = run_archive("news", &options, &progress).await.unwrap();
@@ -2151,7 +2151,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let options = journal_cli(&server, dir.path(), false).options();
         let post_one_path = dir.path().join("out/posts/1.adoc");
-        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let (tx, mut rx) = futures::channel::mpsc::channel(128);
         let progress = Progress::channel(tx);
         let _release_peer_on_drop = peer_gate.release_on_drop();
         let mut archive_task =
@@ -2269,7 +2269,7 @@ mod tests {
         let expected_failure_url = format!("{}/news/1.html", server.uri());
         let writer = InjectedFinalPostWriter::failing_on([(1, 1)]);
         let task_writer = writer.clone();
-        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let (tx, mut rx) = futures::channel::mpsc::channel(128);
         let progress = Progress::channel(tx);
         let _release_peer_on_drop = peer_gate.release_on_drop();
         let mut archive_task = tokio::spawn(async move {
@@ -2412,7 +2412,7 @@ mod tests {
         let mut options = journal_cli(&server, dir.path(), false).options();
         options.generate_book = true;
         let writer = InjectedFinalPostWriter::failing_on([(1, 1), (2, 1)]);
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (tx, rx) = futures::channel::mpsc::channel(128);
         let progress = Progress::channel(tx);
 
         let outcome = archive_journal_with_writer(&options, &progress, "news".to_string(), &writer)
@@ -2519,7 +2519,7 @@ mod tests {
         seed_existing_archive(dir.path(), &[(1, "Baseline One", baseline)], true);
         let options = journal_cli(&server, dir.path(), false).options();
         let writer = InjectedFinalPostWriter::failing_on([(1, 1)]);
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (tx, rx) = futures::channel::mpsc::channel(128);
         let progress = Progress::channel(tx);
 
         let outcome = archive_journal_with_writer(&options, &progress, "news".to_string(), &writer)
