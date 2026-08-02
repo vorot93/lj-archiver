@@ -49,6 +49,7 @@ pub enum State {
         archived: usize,
         skipped: usize,
         failed: usize,
+        failed_pages: usize,
         failures: Vec<PostFailure>,
     },
     Error {
@@ -100,6 +101,7 @@ impl App {
                     archived: outcome.archived,
                     skipped: outcome.skipped,
                     failed: outcome.failed,
+                    failed_pages: outcome.failed_pages,
                     failures: outcome.failures.clone(),
                 };
             }
@@ -299,6 +301,31 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn finished_ok_retains_failed_archive_pages() {
+        let mut app = App::default();
+        let outcome = RunOutcome {
+            root: PathBuf::from("/tmp/out"),
+            archived: 3,
+            skipped: 0,
+            failed: 0,
+            failed_pages: 2,
+            failures: vec![],
+            journal: Some("news".to_string()),
+        };
+
+        app.update_state(&Message::Finished(Ok(outcome)));
+
+        assert!(matches!(
+            app.state,
+            State::Done {
+                failed_pages: 2,
+                failed: 0,
+                ..
+            }
+        ));
     }
 
     #[test]

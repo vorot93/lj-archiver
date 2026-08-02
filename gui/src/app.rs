@@ -115,6 +115,7 @@ impl App {
                 archived,
                 skipped,
                 failed,
+                failed_pages,
                 failures,
                 ..
             } => {
@@ -123,6 +124,12 @@ impl App {
                     button("Open folder").on_press(Message::OpenFolder),
                 ]
                 .spacing(10);
+
+                if *failed_pages > 0 {
+                    col = col.push(text!(
+                        "{failed_pages} archive page(s) failed; the archive may be incomplete"
+                    ));
+                }
 
                 if !failures.is_empty() {
                     let mut list = column![text("Failed posts (click to open):")].spacing(4);
