@@ -643,12 +643,12 @@ mod tests {
     use crate::{archive::Archive, cli::Cli, progress::ProgressEvent};
     use std::{
         collections::{HashMap, HashSet},
-        sync::Mutex,
+        sync::{Condvar, Mutex},
     };
     use tempfile::tempdir;
     use url::Url;
     use wiremock::{
-        Mock, MockServer, ResponseTemplate,
+        Mock, MockServer, Request, Respond, ResponseTemplate,
         matchers::{method, path},
     };
 
@@ -1855,7 +1855,7 @@ mod tests {
         assert!(pending_files.is_empty(), "got: {pending_files:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn successful_post_is_public_with_external_links_before_delayed_peer_finishes() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1883,13 +1883,15 @@ mod tests {
             )))
             .mount(&server)
             .await;
+        let peer_gate =
+            GatedResponse::closed(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                "<p>Delayed post two.</p>",
+                "",
+            )));
         Mock::given(method("GET"))
             .and(path("/news/2.html"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_secs(3))
-                    .set_body_string(post_html("2", "<p>Delayed post two.</p>", "")),
-            )
+            .respond_with(peer_gate.clone())
             .mount(&server)
             .await;
 
@@ -1898,27 +1900,34 @@ mod tests {
         let post_one_path = dir.path().join("out/posts/1.adoc");
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let progress = Progress::channel(tx);
-        let archive_task =
+        let _release_peer_on_drop = peer_gate.release_on_drop();
+        let mut archive_task =
             tokio::spawn(async move { run_archive("news", &options, &progress).await });
         let mut events = Vec::new();
 
-        let early_done = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let early_done = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while let Some(event) = rx.next().await {
                 let post_one_done = matches!(event, ProgressEvent::PostDone { id: 1, .. });
                 events.push(event);
                 if post_one_done {
-                    return;
+                    return Ok(());
                 }
             }
-            panic!("progress channel closed before post 1 completed");
+            Err("progress channel closed before post 1 completed")
         })
         .await;
+        let early_done = match early_done {
+            Ok(result) => result.map_err(str::to_owned),
+            Err(error) => Err(format!("deadlock guard elapsed: {error}")),
+        };
         if let Err(error) = early_done {
+            peer_gate.release();
             archive_task.abort();
             let _ = archive_task.await;
             panic!("post 1 was not finalized before delayed post 2: {error}");
         }
 
+        assert!(!peer_gate.is_released(), "peer gate released prematurely");
         assert!(
             !archive_task.is_finished(),
             "archive unexpectedly finished before delayed post 2"
@@ -1933,7 +1942,17 @@ mod tests {
         assert!(!external.contains("\u{1f}"), "got: {external:?}");
         assert!(!external.contains("lj-archiver-link"), "got: {external:?}");
 
-        let outcome = archive_task.await.unwrap().unwrap();
+        peer_gate.release();
+        let outcome =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut archive_task).await
+            {
+                Ok(joined) => joined.unwrap().unwrap(),
+                Err(error) => {
+                    archive_task.abort();
+                    let _ = archive_task.await;
+                    panic!("archive did not finish after releasing delayed post 2: {error}");
+                }
+            };
         events.extend(rx.collect::<Vec<_>>().await);
 
         assert_eq!(outcome.archived, 2);
@@ -1950,7 +1969,7 @@ mod tests {
         assert!(pending_post_paths(dir.path().join("out/posts")).is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn first_stage_failure_is_reported_before_delayed_peer_and_retains_baseline() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1978,13 +1997,15 @@ mod tests {
             )))
             .mount(&server)
             .await;
+        let peer_gate =
+            GatedResponse::closed(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                "<p>Delayed post two.</p>",
+                "",
+            )));
         Mock::given(method("GET"))
             .and(path("/news/2.html"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_secs(3))
-                    .set_body_string(post_html("2", "<p>Delayed post two.</p>", "")),
-            )
+            .respond_with(peer_gate.clone())
             .mount(&server)
             .await;
 
@@ -1997,28 +2018,35 @@ mod tests {
         let task_writer = writer.clone();
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let progress = Progress::channel(tx);
-        let archive_task = tokio::spawn(async move {
+        let _release_peer_on_drop = peer_gate.release_on_drop();
+        let mut archive_task = tokio::spawn(async move {
             archive_journal_with_writer(&options, &progress, "news".to_string(), &task_writer).await
         });
         let mut events = Vec::new();
 
-        let early_failure = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let early_failure = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while let Some(event) = rx.next().await {
                 let post_one_failed = matches!(event, ProgressEvent::PostFailed { id: 1 });
                 events.push(event);
                 if post_one_failed {
-                    return;
+                    return Ok(());
                 }
             }
-            panic!("progress channel closed before post 1 failed");
+            Err("progress channel closed before post 1 failed")
         })
         .await;
+        let early_failure = match early_failure {
+            Ok(result) => result.map_err(str::to_owned),
+            Err(error) => Err(format!("deadlock guard elapsed: {error}")),
+        };
         if let Err(error) = early_failure {
+            peer_gate.release();
             archive_task.abort();
             let _ = archive_task.await;
             panic!("post 1 failure was not reported before delayed post 2: {error}");
         }
 
+        assert!(!peer_gate.is_released(), "peer gate released prematurely");
         assert!(
             !archive_task.is_finished(),
             "archive unexpectedly finished before delayed post 2"
@@ -2028,7 +2056,17 @@ mod tests {
             baseline
         );
 
-        let outcome = archive_task.await.unwrap().unwrap();
+        peer_gate.release();
+        let outcome =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut archive_task).await
+            {
+                Ok(joined) => joined.unwrap().unwrap(),
+                Err(error) => {
+                    archive_task.abort();
+                    let _ = archive_task.await;
+                    panic!("archive did not finish after releasing delayed post 2: {error}");
+                }
+            };
         events.extend(rx.collect::<Vec<_>>().await);
 
         assert_eq!(outcome.archived, 1);
@@ -2490,6 +2528,65 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect()
+    }
+
+    #[derive(Clone)]
+    struct GatedResponse {
+        response: ResponseTemplate,
+        state: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl GatedResponse {
+        fn closed(response: ResponseTemplate) -> Self {
+            Self {
+                response,
+                state: Arc::new((Mutex::new(false), Condvar::new())),
+            }
+        }
+
+        fn is_released(&self) -> bool {
+            *self
+                .state
+                .0
+                .lock()
+                .expect("gated response mutex poisoned while checking release state")
+        }
+
+        fn release(&self) {
+            let (released, wake) = &*self.state;
+            let mut released = released
+                .lock()
+                .expect("gated response mutex poisoned while releasing response");
+            *released = true;
+            wake.notify_all();
+        }
+
+        fn release_on_drop(&self) -> GateReleaseGuard {
+            GateReleaseGuard(self.clone())
+        }
+    }
+
+    impl Respond for GatedResponse {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            let (released, wake) = &*self.state;
+            let mut released = released
+                .lock()
+                .expect("gated response mutex poisoned while waiting for release");
+            while !*released {
+                released = wake
+                    .wait(released)
+                    .expect("gated response mutex poisoned while blocked on release");
+            }
+            self.response.clone()
+        }
+    }
+
+    struct GateReleaseGuard(GatedResponse);
+
+    impl Drop for GateReleaseGuard {
+        fn drop(&mut self) {
+            self.0.release();
+        }
     }
 
     #[derive(Clone)]
