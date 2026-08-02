@@ -15,11 +15,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install CFF validator
+        run: |
+          python3 -m venv /tmp/lj-archiver-cff-validator
+          /tmp/lj-archiver-cff-validator/bin/pip install cffconvert
+      - name: Validate citation metadata
+        run: /tmp/lj-archiver-cff-validator/bin/cffconvert --validate
       - run: cargo fmt --all --check -- --config=imports_granularity=Crate
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack
-      - run: cargo hack clippy -p lj-archiver --each-feature -- -D warnings
+      - run: cargo hack clippy -p lj-archiver --each-feature --all-targets -- -D warnings
       - run: cargo hack test -p lj-archiver --each-feature
       - name: Install Asciidoctor
         run: |
