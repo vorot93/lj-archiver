@@ -50,14 +50,14 @@ pub fn render_post(
 
     if include_comments {
         for comment in &post.comments {
-            render_comment(&mut output, comment);
+            render_comment(&mut output, comment, link_rewriter);
         }
     }
 
     output
 }
 
-fn render_comment(output: &mut String, comment: &Comment) {
+fn render_comment(output: &mut String, comment: &Comment, link_rewriter: Option<&LinkRewriter>) {
     // Each block terminates with a single newline, so separate this comment from
     // the preceding block (the post body or an earlier comment) with a blank
     // line.
@@ -82,7 +82,10 @@ fn render_comment(output: &mut String, comment: &Comment) {
     if comment.deleted {
         output.push_str("_Deleted comment._\n");
     } else {
-        push_body(output, &html_to_adoc(&comment.body_html));
+        push_body(
+            output,
+            &html_to_adoc_with_links(&comment.body_html, link_rewriter),
+        );
     }
 }
 
@@ -259,7 +262,7 @@ fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
         "p" => render_paragraph(element, ctx),
         "br" => " +\n".to_string(),
         "a" => render_link(element, ctx),
-        "img" => render_image(element),
+        "img" => render_image(element, ctx),
         "strong" | "b" => render_inline_wrapper(&render_inline_children(element, ctx), "*", "*"),
         "em" | "i" => render_inline_wrapper(&render_inline_children(element, ctx), "_", "_"),
         "code" => render_inline_code(element),
@@ -391,7 +394,7 @@ fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     if let Some(href) = element.attr("href")
         && let Some(image) = lone_image_child(element)
     {
-        return render_linked_image(image, href);
+        return render_linked_image(image, href, ctx);
     }
 
     let text = render_inline_children(element, ctx);
@@ -402,9 +405,17 @@ fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
                 return text;
             }
 
-            let macro_target = match ctx.link_rewriter.and_then(|r| r.xref_target(href)) {
-                Some(target) => target,
-                None => sanitize_macro_target(href),
+            let macro_target = ctx.link_rewriter.map_or_else(
+                || Some(sanitize_macro_target(href)),
+                |rewriter| {
+                    rewriter
+                        .xref_target(href)
+                        .or_else(|| rewriter.absolute_target(href))
+                },
+            );
+
+            let Some(macro_target) = macro_target else {
+                return sanitize_macro_label(&text);
             };
 
             render_inline_wrapper_with_label(
@@ -418,13 +429,25 @@ fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     }
 }
 
-fn render_image(element: ElementRef<'_>) -> String {
+fn render_image(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     match element.attr("src") {
         Some(src) => {
             let alt = sanitize_macro_label(element.attr("alt").unwrap_or_default());
-            format!("image::{}[{}]", sanitize_macro_target(src), alt)
+            match image_macro_target(src, ctx) {
+                Some(target) => format!("image::{target}[{alt}]"),
+                None if !alt.is_empty() => alt,
+                None => sanitize_macro_label(src),
+            }
         }
         None => String::new(),
+    }
+}
+
+fn image_macro_target(src: &str, ctx: RenderCtx<'_>) -> Option<String> {
+    match ctx.link_rewriter {
+        Some(_) if src.starts_with("../assets/") => Some(sanitize_macro_target(src)),
+        Some(rewriter) => rewriter.absolute_target(src),
+        None => Some(sanitize_macro_target(src)),
     }
 }
 
@@ -460,11 +483,30 @@ fn lone_image_child(element: ElementRef<'_>) -> Option<ElementRef<'_>> {
 /// Renders a link that wraps a single image as an inline image with a `link=`
 /// attribute (`image:target[alt,link=href]`). The link target additionally
 /// percent-encodes commas so the URL cannot split the macro's attribute list.
-fn render_linked_image(image: ElementRef<'_>, href: &str) -> String {
+fn render_linked_image(image: ElementRef<'_>, href: &str, ctx: RenderCtx<'_>) -> String {
     let src = image.value().attr("src").unwrap_or_default();
     let alt = sanitize_macro_label(image.value().attr("alt").unwrap_or_default());
-    let target = sanitize_macro_target(src);
-    let link = sanitize_macro_target(href).replace(',', "%2C");
+    let Some(target) = image_macro_target(src, ctx) else {
+        return if alt.is_empty() {
+            sanitize_macro_label(src)
+        } else {
+            alt
+        };
+    };
+
+    let link = ctx.link_rewriter.map_or_else(
+        || Some(sanitize_macro_target(href)),
+        |rewriter| {
+            rewriter
+                .xref_target(href)
+                .or_else(|| rewriter.absolute_target(href))
+        },
+    );
+
+    let Some(link) = link else {
+        return format!("image:{target}[{alt}]");
+    };
+    let link = link.replace(',', "%2C");
 
     format!("image:{target}[{alt},link={link}]")
 }
@@ -2668,5 +2710,113 @@ mod tests {
             adoc.contains("https://news.livejournal.com/166512.html[x]"),
             "got: {adoc:?}"
         );
+    }
+
+    #[test]
+    fn resolves_safe_links_against_delivered_page_and_renders_unsafe_links_inertly() {
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::from([166512u64]),
+            Url::parse("https://news.livejournal.com/archive/2026/166511.html").unwrap(),
+        );
+        let adoc = html_to_adoc_with_links(
+            concat!(
+                "<p>",
+                r#"<a href="/profile">profile</a> "#,
+                r#"<a href="next.html">next</a> "#,
+                r#"<a href="//cdn.example.test/x">cdn</a> "#,
+                r#"<a href="http://outside.example.test/y">outside</a> "#,
+                r#"<a href="https://news.livejournal.com/166512.html?thread=5#c1">local</a> "#,
+                r#"<a href="javascript:alert(1)">script</a> "#,
+                r#"<a href="data:text/plain,boom">data</a> "#,
+                r#"<a href="mailto:reader@example.test">mail</a>"#,
+                "</p>",
+            ),
+            Some(&r),
+        );
+
+        assert!(
+            adoc.contains("https://news.livejournal.com/profile[profile]"),
+            "got: {adoc:?}"
+        );
+        assert!(
+            adoc.contains("https://news.livejournal.com/archive/2026/next.html[next]"),
+            "got: {adoc:?}"
+        );
+        assert!(
+            adoc.contains("https://cdn.example.test/x[cdn]"),
+            "got: {adoc:?}"
+        );
+        assert!(
+            adoc.contains("http://outside.example.test/y[outside]"),
+            "got: {adoc:?}"
+        );
+        assert!(adoc.contains("xref:166512.adoc[local]"), "got: {adoc:?}");
+        assert!(adoc.contains("script data mail"), "got: {adoc:?}");
+        for unsafe_target in ["javascript:", "data:", "mailto:"] {
+            assert!(!adoc.contains(unsafe_target), "got: {adoc:?}");
+        }
+    }
+
+    #[test]
+    fn rewrites_comment_links_with_the_post_link_context() {
+        let mut comment = test_comment(0, false);
+        comment.body_html = concat!(
+            r#"<p><a href="next.html">next</a> "#,
+            r#"<a href="https://news.livejournal.com/166512.html">local</a> "#,
+            r#"<a href="javascript:alert(1)">unsafe</a></p>"#,
+        )
+        .to_string();
+        let mut post = test_post_with_comments(vec![comment]);
+        post.url = Url::parse("https://news.livejournal.com/archive/2026/166511.html").unwrap();
+        let r = LinkRewriter::new("news", HashSet::from([166512u64]), post.url.clone());
+
+        let rendered = render_post(&post, true, Some(&r));
+
+        assert!(
+            rendered.contains("https://news.livejournal.com/archive/2026/next.html[next]"),
+            "got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("xref:166512.adoc[local] unsafe"),
+            "got: {rendered:?}"
+        );
+        assert!(!rendered.contains("javascript:"), "got: {rendered:?}");
+        assert!(rendered.ends_with("\n"), "got: {rendered:?}");
+        assert!(!rendered.ends_with("\n\n"), "got: {rendered:?}");
+    }
+
+    #[test]
+    fn resolves_linked_image_href_and_keeps_safe_image_when_href_is_unsafe() {
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::new(),
+            Url::parse("https://news.livejournal.com/archive/2026/166511.html").unwrap(),
+        );
+        let adoc = html_to_adoc_with_links(
+            concat!(
+                "<p>",
+                r#"<a href="../gallery"><img src="https://cdn.example.test/photo.jpg" alt="photo"></a> "#,
+                r#"<a href="javascript:alert(1)"><img src="https://cdn.example.test/safe.jpg" alt="safe"></a> "#,
+                r#"<a href="https://example.test/"><img src="data:image/png,boom" alt="unsafe image"></a>"#,
+                "</p>",
+            ),
+            Some(&r),
+        );
+
+        assert!(
+            adoc.contains(concat!(
+                "image:https://cdn.example.test/photo.jpg[photo,",
+                "link=https://news.livejournal.com/archive/gallery]"
+            )),
+            "got: {adoc:?}"
+        );
+        assert!(
+            adoc.contains("image:https://cdn.example.test/safe.jpg[safe]"),
+            "got: {adoc:?}"
+        );
+        assert!(!adoc.contains("link=javascript:"), "got: {adoc:?}");
+        assert!(adoc.contains("safe] unsafe image"), "got: {adoc:?}");
+        assert!(!adoc.contains("image:data:"), "got: {adoc:?}");
     }
 }

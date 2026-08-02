@@ -1,7 +1,6 @@
 use crate::{
     Result,
     adoc::sanitize_macro_target,
-    net::is_loopback_test_server,
     target::{journals_alias, post_ref_from_url, post_url},
 };
 use std::{collections::HashSet, sync::Mutex};
@@ -51,7 +50,7 @@ impl LinkRewriter {
     /// Returns a complete AsciiDoc macro target when `href` resolves to a post
     /// of this journal that is in the export's id set; otherwise `None`.
     pub fn xref_target(&self, href: &str) -> Option<String> {
-        let url = self.base_url.join(href).ok()?;
+        let url = self.resolved_http_url(href)?;
         let (journal, id) = post_ref_from_url(&url)?;
         if !journals_alias(&journal, &self.journal) || !self.ids.contains(&id) {
             return None;
@@ -60,12 +59,6 @@ impl LinkRewriter {
         match self.mode {
             RewriteMode::Direct => Some(format!("xref:{id}.adoc")),
             RewriteMode::Pending => {
-                let canonical_url = if is_loopback_test_server(&self.base_url) {
-                    self.base_url.join(&format!("{}/{id}.html", self.journal))
-                } else {
-                    self.base_url.join(&format!("{id}.html"))
-                }
-                .ok()?;
                 let mut links = self
                     .pending_links
                     .lock()
@@ -74,11 +67,23 @@ impl LinkRewriter {
                 links.push(PendingLink {
                     token: token.clone(),
                     target_id: id,
-                    external_target: sanitize_macro_target(canonical_url.as_str()),
+                    external_target: sanitize_macro_target(url.as_str()),
                 });
                 Some(token)
             }
         }
+    }
+
+    /// Resolves `href` against this delivered page and returns a sanitized
+    /// generated macro target only for hosted HTTP(S) URLs.
+    pub fn absolute_target(&self, href: &str) -> Option<String> {
+        let url = self.resolved_http_url(href)?;
+        Some(sanitize_macro_target(url.as_str()))
+    }
+
+    fn resolved_http_url(&self, href: &str) -> Option<Url> {
+        let url = self.base_url.join(href).ok()?;
+        (matches!(url.scheme(), "http" | "https") && url.has_host()).then_some(url)
     }
 
     pub(crate) fn pending_links(&self) -> Vec<PendingLink> {
@@ -202,6 +207,42 @@ mod tests {
     }
 
     #[test]
+    fn resolves_only_hosted_http_targets_against_delivered_page() {
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::new(),
+            Url::parse("https://news.livejournal.com/archive/2026/1.html").unwrap(),
+        );
+
+        for (href, expected) in [
+            ("/profile", "https://news.livejournal.com/profile"),
+            (
+                "next.html",
+                "https://news.livejournal.com/archive/2026/next.html",
+            ),
+            ("//cdn.example.test/x", "https://cdn.example.test/x"),
+            (
+                "http://outside.example.test/y",
+                "http://outside.example.test/y",
+            ),
+        ] {
+            assert_eq!(r.absolute_target(href).as_deref(), Some(expected), "{href}");
+        }
+
+        for href in [
+            "javascript:alert(1)",
+            "data:text/plain,boom",
+            "mailto:reader@example.test",
+            "file:///tmp/secret",
+            "ftp://files.example.test/x",
+            "http://",
+            "http://[::1",
+        ] {
+            assert_eq!(r.absolute_target(href), None, "{href}");
+        }
+    }
+
+    #[test]
     fn ignores_query_and_fragment() {
         assert_eq!(
             rewriter().xref_target("https://news.livejournal.com/166512.html?thread=5#c1"),
@@ -282,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_pending_query_and_fragment_target() {
+    fn preserves_pending_query_and_fragment_target() {
         let r = LinkRewriter::pending(
             "news",
             HashSet::from([2u64]),
@@ -294,12 +335,12 @@ mod tests {
 
         assert_eq!(
             r.pending_links()[0].external_target,
-            "https://news.livejournal.com/2.html"
+            "https://news.livejournal.com/2.html?thread=5#c1"
         );
     }
 
     #[test]
-    fn canonicalizes_pending_alternate_host_targets() {
+    fn preserves_resolved_pending_alternate_host_targets() {
         let subdomain = LinkRewriter::pending(
             "news",
             HashSet::from([2u64]),
@@ -310,7 +351,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             subdomain.pending_links()[0].external_target,
-            "https://news.livejournal.com/2.html"
+            "https://users.livejournal.com/news/2.html"
         );
 
         let users = LinkRewriter::pending(
@@ -323,12 +364,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             users.pending_links()[0].external_target,
-            "https://users.livejournal.com/example_user/2.html"
+            "https://example-user.livejournal.com/2.html"
         );
     }
 
     #[test]
-    fn canonicalizes_pending_target_against_loopback_base() {
+    fn preserves_absolute_pending_target_against_loopback_base() {
         let r = LinkRewriter::pending(
             "news",
             HashSet::from([2u64]),
@@ -340,7 +381,7 @@ mod tests {
 
         assert_eq!(
             r.pending_links()[0].external_target,
-            "http://127.0.0.1:1234/news/2.html"
+            "https://news.livejournal.com/2.html?thread=5#c1"
         );
     }
 

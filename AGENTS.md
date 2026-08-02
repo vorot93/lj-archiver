@@ -23,8 +23,8 @@ The current tool is public-content only. Do not add login, private-content acces
 - `src/tls.rs` builds the shared rustls `ClientConfig` applied to every HTTP client (see HTTP And Media Safety).
 - `src/discover.rs` finds journal post IDs by walking the calendar, per-year pages, and month archive pages.
 - `src/parser.rs` parses LiveJournal HTML into post and comment models.
-- `src/links.rs` records and resolves same-journal post links after bulk-export write outcomes are known, and repairs stale local cross-references during resume runs.
-- `src/media.rs` finds inline media, downloads allowed assets, rewrites HTML references, validates redirects, and rejects unsafe media URLs based on scheme, host presence, literal `localhost` hosts, and restricted IP literals.
+- `src/links.rs` resolves references against each delivered post URL, records and resolves same-journal post links after bulk-export write outcomes are known, and repairs stale local cross-references during resume runs.
+- `src/media.rs` finds inline media, canonicalizes safe sources even when downloads are disabled, downloads allowed assets, rewrites HTML references, validates redirects, and rejects unsafe media URLs based on scheme, host presence, literal `localhost` hosts, and restricted IP literals.
 - `src/adoc/` converts supported HTML into AsciiDoc and preserves unsupported structures with passthrough output (submodules `mod`, `classify`, `source_html`, `escape`).
 - `src/archive.rs` owns archive paths, pending-post staging, atomic per-post writes, index writes, the optional single-file `book.adoc` assembly (`write_book`), and resume checks.
 - `src/storage.rs` atomically replaces archive files through same-directory temporary-file persistence, which safely clobbers existing files on Windows, and serializes AsciiDoc paths with forward slashes independently of the host filesystem.
@@ -151,7 +151,7 @@ Accepted target forms (`src/target.rs`): a bare journal name, a `*.livejournal.c
 
 Real post pages use `aentry-post*` markup — body `.aentry-post__text`, title `.aentry-post__title-text`, tags `.aentry-tags a` — with the older `.entry-*` classes kept only as fallbacks. Real post pages embed a server-rendered `Site.entry = {…}` JSON object carrying the post's `journal` (the canonical account name), `poster` (the authoring account, distinct from the journal), and `eventtime` (a Unix-epoch publication timestamp). `src/parser.rs` anchors on `Site.entry` (the page also carries many unrelated `"poster"` values in sidebar JSON), deserializes the single leading object with `serde_json`, and trusts it only when its `ditemid` equals the resolved post id. `poster` populates `:lj-poster:`; `eventtime` populates `:lj-date:` via `DateTime::from_timestamp`, falling back to the older `time.entry-date[datetime]` selector when `Site.entry` is absent. Post pages otherwise have no `datetime` attribute, meta tag, or JSON-LD date. `eventtime` is recorded as a UTC instant, but LiveJournal's event time historically reflects the poster's local wall-clock, so treat `:lj-date:` as a best-effort date (reliable to the day). The journal is sourced from `Site.entry.journal` when its `ditemid` matches (then `data-journal`, then the URL host), so `:lj-author:` is the canonical account name; the poster is a separate `:lj-poster:` attribute.
 
-On a bulk journal export, rendered bodies and their pending links are staged on disk as non-public `posts/*.pending` files while the fetch stream remains bounded by `RunOptions::concurrency`. Finalization first resolves every staged link to its canonical external URL and atomically writes an externally complete public `.adoc`; only those successful writes plus resume-skipped files form the final exported ID set. A best-effort atomic second pass upgrades links to successful targets in that set, so a failed upgrade retains the complete external fallback and public files never contain staging tokens. Resume-skipped posts have stale `xref:<id>.adoc[…]` links to missing IDs repaired back to canonical external URLs. Pending files are removed on both finalization success and failure, and failed posts stay out of `index.adoc` and `book.adoc`. Journal names are matched with `-`/`_` folded together (LiveJournal serves an underscore username `a_b` at the hyphen subdomain `a-b.livejournal.com`, so the two spellings denote one journal). Downloaded media is stored once in a single `assets/` folder at the archive root (filenames are a URL hash, so a reused image is stored once and referenced as `../assets/<hash>.<ext>`).
+On a bulk journal export, rendered bodies and their pending links are staged on disk as non-public `posts/*.pending` files while the fetch stream remains bounded by `RunOptions::concurrency`. Finalization first resolves every staged link to its resolved absolute href from that post's delivered URL and atomically writes an externally complete public `.adoc`; only those successful writes plus resume-skipped files form the final exported ID set. A best-effort atomic second pass upgrades links to successful targets in that set, so a failed upgrade retains the complete external fallback and public files never contain staging tokens. Resume-skipped posts have stale `xref:<id>.adoc[…]` links to missing IDs repaired back to canonical external URLs. Pending files are removed on both finalization success and failure, and failed posts stay out of `index.adoc` and `book.adoc`. Journal names are matched with `-`/`_` folded together (LiveJournal serves an underscore username `a_b` at the hyphen subdomain `a-b.livejournal.com`, so the two spellings denote one journal). Downloaded media is stored once in a single `assets/` folder at the archive root (filenames are a URL hash, so a reused image is stored once and referenced as `../assets/<hash>.<ext>`).
 
 Fetched posts are parsed against the delivered final response URL, which is
 preserved as `Post.url` for rendering and downstream processing. Before media
@@ -164,6 +164,14 @@ the requested ID. Identity mismatches fail only that row during journal exports
 and fail the whole run for a single-post target; no file is staged or written
 under the returned wrong ID.
 
+Every archive render constructs a per-post `LinkRewriter` only after identity
+validation and uses that post's delivered `Post.url` as the sole resolution
+base. The body, comment bodies, and linked-image hrefs share this context.
+Same-journal exported posts remain local or pending; other root-relative,
+path-relative, and protocol-relative HTTP(S) hrefs become absolute generated
+targets. Non-HTTP(S) hrefs and image sources render as neutralized visible text,
+never active macros.
+
 ## HTTP And Media Safety
 
 Keep network behavior conservative.
@@ -171,6 +179,13 @@ Keep network behavior conservative.
 Do not weaken redirect validation or address blocking in `src/media.rs`.
 
 Media fetching must continue to reject non-HTTP(S) URLs, URLs without hosts, literal `localhost` hosts, and restricted IP literal hosts. Restricted literals include loopback, private IPv4, link-local, unspecified, IPv6 unique-local/link-local, and IPv6-embedded IPv4 forms (IPv4-mapped, NAT64, 6to4, and IPv4-compatible) that decode to a restricted address. Redirects are re-validated per hop, so a redirect to a blocked address is rejected.
+
+Media source scanning runs even under `--no-media`. Every real hosted HTTP(S)
+source is resolved against the delivered post URL and rewritten to either a
+local `../assets/...` target after a successful download or that resolved
+absolute remote URL on no-media, address/redirect rejection, HTTP or transport
+failure, and body-cap failure. Invalid and non-HTTP(S) values issue no request
+and rely on the renderer's inert visible-text fallback.
 
 The current media checks do not resolve DNS names to block private networks. Do not document or rely on DNS-based private-network blocking unless that behavior is implemented and tested.
 

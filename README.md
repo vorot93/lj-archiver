@@ -157,8 +157,11 @@ archive/<journal>/
 Each post is written to `posts/<id>.adoc`. The post file contains document metadata, the post body, and comments when comment archiving is enabled.
 
 During a completed journal export, links to other exported posts become local
-cross-references. Links to posts that did not archive remain canonical external
-links. Archive paths written into AsciiDoc always use portable forward slashes.
+cross-references. Other root-relative, path-relative, and protocol-relative
+HTTP(S) references are resolved against the individual post's delivered final
+URL and written as absolute external targets. Non-HTTP(S) link and image
+schemes are kept as inert visible text rather than active AsciiDoc macros.
+Archive paths written into AsciiDoc always use portable forward slashes.
 
 Downloaded inline media is stored in a single `assets/` folder at the archive root. Each file is named by a hash of its source URL (`<hash>.<ext>`), so an image reused across posts is stored only once, and post files reference it with a relative path like `../assets/1d3802f42770.jpg`.
 
@@ -215,9 +218,15 @@ the tool still cannot reach friends-only or private content.
 
 Comments are included by default when they are present in the fetched page. Use `--no-comments` to write only the post body. Note that current LiveJournal renders comment threads dynamically (JavaScript), so they are usually not present in the archived HTML — see Current Limits.
 
-Inline media is downloaded by default. Use `--no-media` to leave media links pointing at their original remote URLs. Media files larger than 50 MiB are skipped; the post is still written with the original remote media URL.
+Inline media is downloaded by default. Use `--no-media` to keep images remote;
+their URLs are still resolved to absolute HTTP(S) targets from the delivered
+post URL. Media files larger than 50 MiB are skipped; the post is still written
+with that absolute remote media URL.
 
-If a media download cannot be used, the post can still be written with the original remote media URL.
+If a media download cannot be used because of an HTTP or transport failure, a
+redirect or address rejection, or a size limit, the post can still be written
+with the resolved absolute remote media URL. Only a successful download is
+referenced through the local `assets/` folder.
 
 For full journal archives, individual post failures do not stop the entire run. Successfully archived posts are still written, and the command exits with a nonzero status if any post failed. The same resilience applies to month-page discovery: individual page failures do not stop the full journal archive, but the command exits with a nonzero status if any month page failed, matching the per-post behavior.
 

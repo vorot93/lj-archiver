@@ -32,25 +32,29 @@ pub async fn rewrite_inline_media(
     download: bool,
     user_agent: Option<&str>,
 ) -> Result<RewrittenHtml> {
-    if !download {
-        return Ok(RewrittenHtml {
-            html: html.to_string(),
-            assets: Vec::new(),
-        });
-    }
-
     let client = media_client(user_agent)?;
-    rewrite_inline_media_with_client(html, base_url, assets_dir, &client).await
+    rewrite_inline_media_configured(html, base_url, assets_dir, &client, download).await
 }
 
+#[cfg(test)]
 async fn rewrite_inline_media_with_client(
     html: &str,
     base_url: &Url,
     assets_dir: &Path,
     client: &reqwest::Client,
 ) -> Result<RewrittenHtml> {
+    rewrite_inline_media_configured(html, base_url, assets_dir, client, true).await
+}
+
+async fn rewrite_inline_media_configured(
+    html: &str,
+    base_url: &Url,
+    assets_dir: &Path,
+    client: &reqwest::Client,
+    download: bool,
+) -> Result<RewrittenHtml> {
     let targets = image_targets(html);
-    let mut downloads: HashMap<Url, Option<PathBuf>> = HashMap::new();
+    let mut downloads: HashMap<Url, String> = HashMap::new();
     let mut assets = Vec::new();
     let mut replacements = Vec::with_capacity(targets.len());
     let allow_local_media = crate::net::is_loopback_test_server(base_url);
@@ -58,21 +62,26 @@ async fn rewrite_inline_media_with_client(
     for target in &targets {
         let source = decode_html_character_references(&target.source);
         let url = match base_url.join(source.as_ref()) {
-            Ok(url) => url,
+            Ok(url) if is_hosted_http_url(&url) => url,
             Err(_) => {
+                replacements.push(None);
+                continue;
+            }
+            Ok(_) => {
                 replacements.push(None);
                 continue;
             }
         };
 
-        if let Some(relative_path) = downloads.get(&url) {
-            replacements.push(relative_path.clone());
+        if let Some(replacement) = downloads.get(&url) {
+            replacements.push(Some(replacement.clone()));
             continue;
         }
 
-        if !allow_local_media && is_restricted_media_url(&url) {
-            downloads.insert(url, None);
-            replacements.push(None);
+        let absolute_target = url.to_string();
+        if !download || (!allow_local_media && is_restricted_media_url(&url)) {
+            downloads.insert(url, absolute_target.clone());
+            replacements.push(Some(absolute_target));
             continue;
         }
 
@@ -80,15 +89,16 @@ async fn rewrite_inline_media_with_client(
         let relative_path = relative_asset_path(&filename);
 
         if download_asset(client, &url, assets_dir, &filename, allow_local_media).await? {
-            downloads.insert(url.clone(), Some(relative_path.clone()));
-            replacements.push(Some(relative_path.clone()));
+            let local_target = storage::adoc_path(&relative_path);
+            downloads.insert(url.clone(), local_target.clone());
+            replacements.push(Some(local_target));
             assets.push(MediaAsset {
                 original_url: url,
                 relative_path,
             });
         } else {
-            downloads.insert(url, None);
-            replacements.push(None);
+            downloads.insert(url, absolute_target.clone());
+            replacements.push(Some(absolute_target));
         }
     }
 
@@ -96,6 +106,10 @@ async fn rewrite_inline_media_with_client(
         html: rewrite_img_sources(html, &targets, &replacements),
         assets,
     })
+}
+
+fn is_hosted_http_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https") && url.has_host()
 }
 
 fn media_client(user_agent: Option<&str>) -> Result<reqwest::Client> {
@@ -404,7 +418,7 @@ fn relative_asset_path(filename: &str) -> PathBuf {
 fn rewrite_img_sources(
     html: &str,
     targets: &[ImageTarget],
-    replacements: &[Option<PathBuf>],
+    replacements: &[Option<String>],
 ) -> String {
     debug_assert_eq!(targets.len(), replacements.len());
 
@@ -413,8 +427,8 @@ fn rewrite_img_sources(
 
     for (target, replacement) in targets.iter().zip(replacements) {
         output.push_str(&html[cursor..target.value_start]);
-        if let Some(path) = replacement {
-            output.push_str(&storage::adoc_path(path));
+        if let Some(target) = replacement {
+            output.push_str(target);
         } else {
             output.push_str(&html[target.value_start..target.value_end]);
         }
@@ -543,6 +557,7 @@ fn is_attribute_name_byte(byte: u8) -> bool {
 mod tests {
     use super::*;
     use std::{
+        collections::HashSet,
         net::SocketAddr,
         path::{Path, PathBuf},
     };
@@ -669,7 +684,9 @@ mod tests {
     fn serializes_rewritten_image_paths_with_forward_slashes() {
         let html = r#"<img src="remote.png">"#;
         let targets = image_targets(html);
-        let replacements = [Some(PathBuf::from(r"..\assets\image.png"))];
+        let replacements = [Some(storage::adoc_path(&PathBuf::from(
+            r"..\assets\image.png",
+        )))];
 
         assert_eq!(
             rewrite_img_sources(html, &targets, &replacements),
@@ -776,7 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaves_ipv4_mapped_loopback_media_src_unchanged_for_production_base_url() {
+    async fn canonicalizes_blocked_ipv4_mapped_loopback_media_without_requesting_it() {
         let dir = tempdir().unwrap();
         let assets_dir = dir.path().join("assets");
         let html = r#"<p><img src="http://[::ffff:127.0.0.1]/private.jpg" alt="Private"></p>"#;
@@ -790,7 +807,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(rewritten.html, html);
+        assert_eq!(
+            rewritten.html,
+            r#"<p><img src="http://[::ffff:7f00:1]/private.jpg" alt="Private"></p>"#
+        );
         assert!(rewritten.assets.is_empty());
         assert!(!assets_dir.exists());
     }
@@ -1160,6 +1180,116 @@ mod tests {
         .unwrap();
         assert_eq!(rewritten.html, html);
         assert!(rewritten.assets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonicalizes_relative_sources_without_downloading() {
+        let server = MockServer::start().await;
+        let html = concat!(
+            r#"<img src="/root.jpg" alt="root">"#,
+            r#"<img src="next.jpg" alt="next">"#,
+            r#"<img src="//cdn.example.test/protocol.jpg" alt="protocol">"#,
+        );
+        let base = Url::parse(&format!("{}/delivered/nested/1.html", server.uri())).unwrap();
+        let rewritten = rewrite_inline_media(html, &base, Path::new("unused"), false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rewritten.html,
+            format!(
+                concat!(
+                    r#"<img src="{}/root.jpg" alt="root">"#,
+                    r#"<img src="{}/delivered/nested/next.jpg" alt="next">"#,
+                    r#"<img src="http://cdn.example.test/protocol.jpg" alt="protocol">"#,
+                ),
+                server.uri(),
+                server.uri(),
+            )
+        );
+        assert!(rewritten.assets.is_empty());
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "--no-media must issue no media request"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_safe_download_failures_absolute_and_only_success_local() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/missing.jpg"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/error.jpg"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/ok.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let assets_dir = dir.path().join("assets");
+        let base = Url::parse(&format!("{}/delivered/1.html", server.uri())).unwrap();
+        let html = concat!(
+            r#"<img src="missing.jpg" alt="missing">"#,
+            r#"<img src="error.jpg" alt="error">"#,
+            r#"<img src="ok.jpg" alt="ok">"#,
+        );
+
+        let rewritten = rewrite_inline_media(html, &base, &assets_dir, true, None)
+            .await
+            .unwrap();
+
+        assert!(
+            rewritten
+                .html
+                .contains(&format!(r#"src="{}/delivered/missing.jpg""#, server.uri())),
+            "got: {}",
+            rewritten.html
+        );
+        assert!(
+            rewritten
+                .html
+                .contains(&format!(r#"src="{}/delivered/error.jpg""#, server.uri())),
+            "got: {}",
+            rewritten.html
+        );
+        assert!(
+            rewritten.html.contains(r#"src="../assets/"#),
+            "got: {}",
+            rewritten.html
+        );
+        assert_eq!(rewritten.assets.len(), 1);
+        assert_eq!(rewritten.assets[0].original_url.path(), "/delivered/ok.jpg");
+    }
+
+    #[tokio::test]
+    async fn unsafe_image_schemes_are_not_requested_or_rendered_as_active_macros() {
+        let server = MockServer::start().await;
+        let base = Url::parse(&format!("{}/delivered/1.html", server.uri())).unwrap();
+        let html = concat!(
+            "<p>",
+            r#"<img src="javascript:alert(1)" alt="script"> "#,
+            r#"<img src="data:image/png,boom" alt="data"> "#,
+            r#"<img src="file:///secret.jpg" alt="file"> "#,
+            r#"<img src="mailto:reader@example.test">"#,
+            "</p>",
+        );
+        let rewritten = rewrite_inline_media(html, &base, Path::new("unused"), false, None)
+            .await
+            .unwrap();
+        let rewriter = crate::links::LinkRewriter::new("news", HashSet::new(), base);
+
+        let adoc = crate::adoc::html_to_adoc_with_links(&rewritten.html, Some(&rewriter));
+
+        assert_eq!(adoc, "script data file mailto:reader@example.test\n\n");
+        assert!(!adoc.contains("image:"), "got: {adoc:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

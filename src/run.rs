@@ -11,7 +11,7 @@ use crate::{
     models::{ArchiveTarget, ArchivedPost, Post, PostFailure, RunOptions},
     parser::parse_post_page,
     progress::Progress,
-    target::{journal_base_url, journals_alias, parse_target, post_ref_from_url, post_url},
+    target::{journals_alias, parse_target, post_ref_from_url, post_url},
 };
 use futures::{StreamExt, stream};
 use std::{collections::HashSet, path::PathBuf};
@@ -74,7 +74,7 @@ async fn archive_post(
     let client = LjClient::new(options.user_agent.as_deref())?;
     let root = output_dir(options, &journal);
     let archive = Archive::new(root.clone(), &journal);
-    let post = fetch_and_write_post(&client, options, &archive, &journal, id, &url, None).await?;
+    let post = fetch_and_write_post(&client, options, &archive, &journal, id, &url).await?;
     progress.single_done(post.id, &post.path);
     let posts = [post];
     archive.write_index(&posts)?;
@@ -132,7 +132,6 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     let journal_context = JournalPostContext {
         journal: journal.clone(),
         id_set: ids.iter().copied().collect(),
-        link_base_url: journal_base_url(&journal)?,
     };
 
     let outcomes: Vec<_> = stream::iter(ids)
@@ -324,7 +323,7 @@ async fn archive_journal_post(
                 let rewriter = LinkRewriter::pending(
                     journal_context.journal,
                     journal_context.id_set,
-                    journal_context.link_base_url,
+                    post.url.clone(),
                 );
                 let rendered = render_post(&post, options.include_comments, Some(&rewriter));
                 let pending_path = archive.write_pending_post(id, &rendered)?;
@@ -385,12 +384,16 @@ async fn fetch_and_write_post(
     requested_journal: &str,
     requested_id: u64,
     requested_url: &Url,
-    link_rewriter: Option<&LinkRewriter>,
 ) -> Result<ArchivedPost> {
     let mut post =
         fetch_requested_post(client, requested_journal, requested_id, requested_url).await?;
     rewrite_post_media(&mut post, options, archive).await?;
-    let rendered = render_post(&post, options.include_comments, link_rewriter);
+    let rewriter = LinkRewriter::new(
+        requested_journal,
+        HashSet::from([requested_id]),
+        post.url.clone(),
+    );
+    let rendered = render_post(&post, options.include_comments, Some(&rewriter));
     let path = archive.write_post(requested_id, &rendered)?;
 
     Ok(ArchivedPost {
@@ -556,7 +559,6 @@ struct PreparedPost {
 struct JournalPostContext {
     journal: String,
     id_set: HashSet<u64>,
-    link_base_url: Url,
 }
 
 enum JournalPostOutcome {
@@ -901,6 +903,118 @@ mod tests {
         assert!(
             !post.contains(&format!(":lj-url: {requested_url}")),
             "{post}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_post_resolves_links_and_no_media_images_from_delivered_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "/delivered/nested/1.html"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/nested/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                concat!(
+                    r#"<p><a href="next.html">next</a> "#,
+                    r#"<a href="/profile">profile</a> "#,
+                    r#"<a href="javascript:alert(1)">unsafe</a> "#,
+                    r#"<img src="picture.jpg" alt="picture"></p>"#,
+                ),
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let options = test_cli(&server, dir.path(), "1", false, true).options();
+
+        run_archive(
+            &format!("{}/news/1.html", server.uri()),
+            &options,
+            &Progress::hidden(),
+        )
+        .await
+        .unwrap();
+
+        let post = std::fs::read_to_string(dir.path().join("out/posts/1.adoc")).unwrap();
+        assert!(
+            post.contains(&format!(
+                "{}/delivered/nested/next.html[next]",
+                server.uri()
+            )),
+            "got: {post}"
+        );
+        assert!(
+            post.contains(&format!("{}/profile[profile]", server.uri())),
+            "got: {post}"
+        );
+        assert!(!post.contains("javascript:"), "got: {post}");
+        assert!(
+            post.contains(&format!(
+                "image::{}/delivered/nested/picture.jpg[picture]",
+                server.uri()
+            )),
+            "got: {post}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn journal_post_resolves_links_from_each_delivered_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">One</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "/delivered/nested/1.html"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/delivered/nested/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                r#"<p><a href="next.html">next</a></p>"#,
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let options = journal_cli(&server, dir.path(), false).options();
+
+        run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        let post = std::fs::read_to_string(dir.path().join("out/posts/1.adoc")).unwrap();
+        assert!(
+            post.contains(&format!(
+                "{}/delivered/nested/next.html[next]",
+                server.uri()
+            )),
+            "got: {post}"
+        );
+        assert!(
+            !post.contains("https://news.livejournal.com/next.html"),
+            "got: {post}"
         );
     }
 
