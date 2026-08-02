@@ -6,6 +6,7 @@ use crate::{
     client::LjClient,
     error::{LjError, Result},
     progress::Progress,
+    target::journals_alias,
 };
 
 static ANCHOR_HREF: LazyLock<Selector> =
@@ -39,7 +40,13 @@ fn collect_archive_links(
         .select(&ANCHOR_HREF)
         .filter_map(|element| element.value().attr("href"))
         .filter_map(|href| base_url.join(href).ok())
-        .filter(|url| same_origin(url, base_url))
+        .filter(|url| {
+            if crate::net::is_loopback_test_server(base_url) {
+                same_origin(url, base_url)
+            } else {
+                is_journal_archive_url(url, journal)
+            }
+        })
         .filter(|url| is_expected(url.path(), base_url, journal))
         .collect();
 
@@ -92,18 +99,22 @@ pub async fn discover_post_ids(
     progress: &Progress,
 ) -> Result<(Vec<u64>, usize)> {
     let calendar_url = journal_calendar_url(journal, base_url)?;
-    let calendar_html = client.fetch_text(&calendar_url).await?;
+    let calendar_page = client.fetch_page(&calendar_url).await?;
 
-    let mut month_urls = parse_month_links(&calendar_html, &calendar_url, journal);
-    let year_urls = parse_year_links(&calendar_html, &calendar_url, journal);
+    let mut month_urls = parse_month_links(&calendar_page.text, &calendar_page.final_url, journal);
+    let year_urls = parse_year_links(&calendar_page.text, &calendar_page.final_url, journal);
 
     let mut ids = Vec::new();
     let mut year_failed = 0usize;
     for year_url in year_urls {
-        match client.fetch_text(&year_url).await {
-            Ok(year_html) => {
-                month_urls.extend(parse_month_links(&year_html, &year_url, journal));
-                progress.discovery_tick(year_url.path(), month_urls.len());
+        match client.fetch_page(&year_url).await {
+            Ok(year_page) => {
+                month_urls.extend(parse_month_links(
+                    &year_page.text,
+                    &year_page.final_url,
+                    journal,
+                ));
+                progress.discovery_tick(year_page.final_url.path(), month_urls.len());
             }
             Err(error) => {
                 year_failed += 1;
@@ -129,10 +140,14 @@ pub async fn discover_post_ids(
     let mut month_failed = 0usize;
     for month_url in month_urls {
         attempted += 1;
-        match client.fetch_text(&month_url).await {
-            Ok(month_html) => {
-                ids.extend(parse_post_ids(&month_html, &month_url, journal));
-                progress.discovery_tick(month_url.path(), ids.len());
+        match client.fetch_page(&month_url).await {
+            Ok(month_page) => {
+                ids.extend(parse_post_ids(
+                    &month_page.text,
+                    &month_page.final_url,
+                    journal,
+                ));
+                progress.discovery_tick(month_page.final_url.path(), ids.len());
             }
             Err(error) => {
                 month_failed += 1;
@@ -186,8 +201,7 @@ fn is_expected_month_path(path: &str, base_url: &Url, journal: &str) -> bool {
     // both the calendar and the per-year pages. The journal is known by the caller
     // (like parse_post_ids), so strip it directly rather than requiring a /calendar base.
     if is_users_livejournal_url(base_url) {
-        let prefix = format!("/{journal}");
-        return path.strip_prefix(&prefix).is_some_and(is_month_path);
+        return strip_users_journal_prefix(path, journal).is_some_and(is_month_path);
     }
     false
 }
@@ -206,20 +220,18 @@ fn is_expected_year_path(path: &str, base_url: &Url, journal: &str) -> bool {
         return true;
     }
     if is_users_livejournal_url(base_url) {
-        let prefix = format!("/{journal}");
-        return path.strip_prefix(&prefix).is_some_and(is_year_path);
+        return strip_users_journal_prefix(path, journal).is_some_and(is_year_path);
     }
     false
 }
 
 fn post_id_from_url(url: &Url, base_url: &Url, journal: &str) -> Option<u64> {
-    let host = url.host_str()?;
-    let journal_host = format!("{journal}.livejournal.com");
-
-    if host.eq_ignore_ascii_case(&journal_host) {
-        id_from_root_post_path(url.path())
-    } else if host.eq_ignore_ascii_case("users.livejournal.com") {
-        id_from_users_post_path(url.path(), journal)
+    if is_journal_archive_url(url, journal) {
+        if is_users_livejournal_url(url) {
+            strip_users_journal_prefix(url.path(), journal).and_then(id_from_root_post_path)
+        } else {
+            id_from_root_post_path(url.path())
+        }
     } else if crate::net::is_loopback_test_server(base_url) && same_origin(url, base_url) {
         id_from_test_server_post_path(url.path(), journal)
     } else {
@@ -245,15 +257,41 @@ fn is_users_livejournal_url(url: &Url) -> bool {
         .is_some_and(|host| host.eq_ignore_ascii_case("users.livejournal.com"))
 }
 
+fn journal_from_subdomain(url: &Url) -> Option<&str> {
+    let host = url.host_str()?;
+    let journal = host.strip_suffix(".livejournal.com")?;
+    (!journal.is_empty() && !journal.contains('.')).then_some(journal)
+}
+
+fn is_journal_archive_url(url: &Url, journal: &str) -> bool {
+    if url.scheme() != "https" || url.port_or_known_default() != Some(443) {
+        return false;
+    }
+
+    if is_users_livejournal_url(url) {
+        return strip_users_journal_prefix(url.path(), journal).is_some();
+    }
+
+    journal_from_subdomain(url).is_some_and(|subdomain| {
+        !subdomain.eq_ignore_ascii_case("www") && journals_alias(subdomain, journal)
+    })
+}
+
+fn strip_users_journal_prefix<'a>(path: &'a str, journal: &str) -> Option<&'a str> {
+    let path_without_leading_slash = path.strip_prefix('/')?;
+    let segment_end = path_without_leading_slash.find('/')?;
+    let path_journal = &path_without_leading_slash[..segment_end];
+
+    journals_alias(path_journal, journal).then_some(&path_without_leading_slash[segment_end..])
+}
+
 fn id_from_root_post_path(path: &str) -> Option<u64> {
     let id = path.strip_prefix('/')?.strip_suffix(".html")?;
     parse_positive_id(id)
 }
 
 fn id_from_users_post_path(path: &str, journal: &str) -> Option<u64> {
-    let prefix = format!("/{journal}/");
-    let id = path.strip_prefix(&prefix)?.strip_suffix(".html")?;
-    parse_positive_id(id)
+    strip_users_journal_prefix(path, journal).and_then(id_from_root_post_path)
 }
 
 fn id_from_test_server_post_path(path: &str, journal: &str) -> Option<u64> {
@@ -593,6 +631,97 @@ mod tests {
                 Url::parse("https://example.livejournal.com/2013/07/").unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn parses_redirected_underscore_journal_links() {
+        let calendar = Url::parse("https://evo-lutio.livejournal.com/calendar/").unwrap();
+        let calendar_html = r#"
+            <a href="https://evo-lutio.livejournal.com/2024/">2024</a>
+            <a href="https://evo-lutio.livejournal.com/2025/01/">January 2025</a>
+            <a href="https://other-journal.livejournal.com/2023/">other journal</a>
+            <a href="https://other-journal.livejournal.com/2023/12/">other month</a>
+        "#;
+
+        assert_eq!(
+            parse_year_links(calendar_html, &calendar, "evo_lutio"),
+            vec![Url::parse("https://evo-lutio.livejournal.com/2024/").unwrap()]
+        );
+        assert_eq!(
+            parse_month_links(calendar_html, &calendar, "evo_lutio"),
+            vec![Url::parse("https://evo-lutio.livejournal.com/2025/01/").unwrap()]
+        );
+
+        let month = Url::parse("https://evo-lutio.livejournal.com/2025/01/").unwrap();
+        let month_html = r#"
+            <a href="https://evo-lutio.livejournal.com/240331.html">post</a>
+            <a href="https://other-journal.livejournal.com/999999.html">other journal</a>
+        "#;
+        assert_eq!(
+            parse_post_ids(month_html, &month, "evo_lutio"),
+            vec![240331]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovers_from_final_redirect_urls() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let configured_server = MockServer::start().await;
+        let final_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/evo_lutio/calendar"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/calendar/", final_server.uri())),
+            )
+            .mount(&configured_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<a href="{0}/2024/">2024</a><a href="{0}/2025/01/">January 2025</a>"#,
+                final_server.uri()
+            )))
+            .mount(&final_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<a href="{}/2024/12/">December 2024</a>"#,
+                final_server.uri()
+            )))
+            .mount(&final_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/evo_lutio/240330.html">older</a>"#),
+            )
+            .mount(&final_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2025/01/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/evo_lutio/240331.html">newer</a>"#),
+            )
+            .mount(&final_server)
+            .await;
+
+        let client = LjClient::new(None).unwrap();
+        let configured_base = Url::parse(&configured_server.uri()).unwrap();
+        let (ids, failed) =
+            discover_post_ids(&client, "evo_lutio", &configured_base, &Progress::hidden())
+                .await
+                .unwrap();
+
+        assert_eq!(ids, vec![240330, 240331]);
+        assert_eq!(failed, 0);
     }
 
     #[tokio::test]
