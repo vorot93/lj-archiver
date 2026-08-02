@@ -26,7 +26,8 @@ The current tool is public-content only. Do not add login, private-content acces
 - `src/links.rs` records and resolves same-journal post links after bulk-export write outcomes are known, and repairs stale local cross-references during resume runs.
 - `src/media.rs` finds inline media, downloads allowed assets, rewrites HTML references, validates redirects, and rejects unsafe media URLs based on scheme, host presence, literal `localhost` hosts, and restricted IP literals.
 - `src/adoc/` converts supported HTML into AsciiDoc and preserves unsupported structures with passthrough output (submodules `mod`, `classify`, `source_html`, `escape`).
-- `src/archive.rs` owns archive paths, non-public pending-post staging, atomic per-post writes, index writes, the optional single-file `book.adoc` assembly (`write_book`), and resume checks.
+- `src/archive.rs` owns archive paths, pending-post staging, atomic per-post writes, index writes, the optional single-file `book.adoc` assembly (`write_book`), and resume checks.
+- `src/storage.rs` atomically replaces archive files through same-directory temporary-file persistence, which safely clobbers existing files on Windows, and serializes AsciiDoc paths with forward slashes independently of the host filesystem.
 - `src/run.rs` orchestrates target parsing, discovery, fetching, parsing, media rewriting, rendering, bounded staging, and archive finalization.
 - `src/progress.rs` owns user-facing progress output: a `Progress` handle with Interactive (indicatif bar/spinner via `tracing-indicatif`), Plain (stderr lines), and Quiet modes, plus `init_logging`. Progress is stderr-only UI, independent of the log level; `--verbose` keeps the bar and prints logs above it, `--quiet` suppresses progress.
 - `tests/fixtures/post_basic.html` covers a basic post fixture.
@@ -62,6 +63,11 @@ Task::perform(run_archive(...), Message::Finished)])`. The iced view is
 manual-verify only (no headless harness) — smoke-test with
 `cargo run -p lj-archiver-gui` against a small real post.
 
+The GUI accepts a selected folder only when it is empty or a matching existing
+archive. It derives an existing archive's identity from the controlled
+`index.adoc` title and compares journal names with the shared hyphen/underscore
+alias rules before enabling auto-resume.
+
 Packaging uses cargo-packager (`[package.metadata.packager]` in `gui/Cargo.toml`).
 `.github/workflows/release.yml` builds installers on `v*` tags: macOS `.dmg`
 (Apple-Silicon-only — `macos-latest` is arm64, native build, no `--target`),
@@ -86,6 +92,9 @@ Use focused commands while iterating, then run the full set before final review.
 The workspace root is itself the `lj-archiver` package, so bare `cargo test` and `cargo clippy` (as above) cover **only** that crate — the `gui` member (`lj-archiver-gui`) is silently skipped, so a green run does not mean the GUI compiles or its tests pass. Add `--workspace` (or run `-p lj-archiver-gui` separately) to include it; this mirrors CI's split into the `ci` (`-p lj-archiver`) and `gui` jobs. `cargo fmt --all` already covers both crates.
 
 CI enforces the exact `fmt` invocation above. There is no `rustfmt.toml`, so the `--config=imports_granularity=Crate` flag is required; plain `cargo fmt` reformats imports differently and will fail the check.
+
+The Windows CI job owns coverage for same-directory atomic replacement and the
+concurrent media replacement path.
 
 `Cargo.lock` is gitignored — commit `Cargo.toml` only for dependency changes. CI additionally runs `cargo audit` and executes clippy and tests across feature combinations (`cargo hack ... --each-feature`).
 
@@ -130,6 +139,7 @@ The optional `book.adoc` (opt-in via `--book` or the GUI checkbox, both setting 
 Discovery walks LiveJournal's own archive navigation, all served as static (no-JS) pages:
 
 - The journal `/calendar/` page links one page per year (`/YYYY/`), plus month pages (`/YYYY/MM/`) for the current year only. Each year page links that year's month pages, and each month page links individual post URLs. `src/discover.rs` walks `calendar → year → month → posts`, reading year links from the calendar only (every archive page repeats the year navigation, so recursing would re-crawl). Matching only `/YYYY/MM/` links off the calendar silently limits a journal to its current year — the year hop is required.
+- Discovery parses archive links against reqwest's final response URL. This matters because underscore-journal calendar URLs redirect to hyphen subdomains.
 - Posts are archived oldest-first (discovered IDs are sorted ascending), so the smallest archived post ID reflects how far back a walk reached — useful when confirming a full walk. A full multi-year pull makes many sequential requests before the first post is written, and there is no request throttling.
 
 Two journal URL schemes exist; handle and test both wherever discovery, target parsing, or URL building touch a journal:
@@ -141,7 +151,7 @@ Accepted target forms (`src/target.rs`): a bare journal name, a `*.livejournal.c
 
 Real post pages use `aentry-post*` markup — body `.aentry-post__text`, title `.aentry-post__title-text`, tags `.aentry-tags a` — with the older `.entry-*` classes kept only as fallbacks. Real post pages embed a server-rendered `Site.entry = {…}` JSON object carrying the post's `journal` (the canonical account name), `poster` (the authoring account, distinct from the journal), and `eventtime` (a Unix-epoch publication timestamp). `src/parser.rs` anchors on `Site.entry` (the page also carries many unrelated `"poster"` values in sidebar JSON), deserializes the single leading object with `serde_json`, and trusts it only when its `ditemid` equals the resolved post id. `poster` populates `:lj-poster:`; `eventtime` populates `:lj-date:` via `DateTime::from_timestamp`, falling back to the older `time.entry-date[datetime]` selector when `Site.entry` is absent. Post pages otherwise have no `datetime` attribute, meta tag, or JSON-LD date. `eventtime` is recorded as a UTC instant, but LiveJournal's event time historically reflects the poster's local wall-clock, so treat `:lj-date:` as a best-effort date (reliable to the day). The journal is sourced from `Site.entry.journal` when its `ditemid` matches (then `data-journal`, then the URL host), so `:lj-author:` is the canonical account name; the poster is a separate `:lj-poster:` attribute.
 
-On a bulk journal export, rendered bodies are staged on disk as non-public `posts/*.pending` files while the fetch stream remains bounded by `RunOptions::concurrency`. Finalization first resolves every staged link to its canonical external URL and atomically writes the public `.adoc`; only those successful writes plus resume-skipped files form the final exported ID set. A best-effort atomic second pass localizes links to IDs in that set, so a failed upgrade retains the complete external fallback and public files never contain staging tokens. Resume-skipped posts have stale `xref:<id>.adoc[…]` links to missing IDs repaired back to canonical external URLs. Pending files are removed on both finalization success and failure, and failed posts stay out of `index.adoc` and `book.adoc`. Journal names are matched with `-`/`_` folded together (LiveJournal serves an underscore username `a_b` at the hyphen subdomain `a-b.livejournal.com`, so the two spellings denote one journal). Downloaded media is stored once in a single `assets/` folder at the archive root (filenames are a URL hash, so a reused image is stored once and referenced as `../assets/<hash>.<ext>`).
+On a bulk journal export, rendered bodies and their pending links are staged on disk as non-public `posts/*.pending` files while the fetch stream remains bounded by `RunOptions::concurrency`. Finalization first resolves every staged link to its canonical external URL and atomically writes an externally complete public `.adoc`; only those successful writes plus resume-skipped files form the final exported ID set. A best-effort atomic second pass upgrades links to successful targets in that set, so a failed upgrade retains the complete external fallback and public files never contain staging tokens. Resume-skipped posts have stale `xref:<id>.adoc[…]` links to missing IDs repaired back to canonical external URLs. Pending files are removed on both finalization success and failure, and failed posts stay out of `index.adoc` and `book.adoc`. Journal names are matched with `-`/`_` folded together (LiveJournal serves an underscore username `a_b` at the hyphen subdomain `a-b.livejournal.com`, so the two spellings denote one journal). Downloaded media is stored once in a single `assets/` folder at the archive root (filenames are a URL hash, so a reused image is stored once and referenced as `../assets/<hash>.<ext>`).
 
 ## HTTP And Media Safety
 
@@ -153,7 +163,7 @@ Media fetching must continue to reject non-HTTP(S) URLs, URLs without hosts, lit
 
 The current media checks do not resolve DNS names to block private networks. Do not document or rely on DNS-based private-network blocking unless that behavior is implemented and tested.
 
-Downloads are size-capped and enforced while streaming — 64 MiB per page fetch, 50 MiB per media asset — and a response exceeding its cap is abandoned mid-stream, never truncated into the archive. The page-fetch client retries transient 5xx responses and transport errors a couple of times before surfacing a failure.
+Downloads are size-capped and enforced while streaming — 64 MiB per page fetch, 50 MiB per media asset — and a response exceeding its cap is abandoned mid-stream, never truncated into the archive. The page-fetch client retries transient 5xx responses, transport errors, and interrupted response bodies a couple of times before surfacing a failure; interrupted-body attempts discard their partial bytes before retrying.
 
 When changing HTTP or media behavior, cover redirects and blocked-address cases with local test servers.
 

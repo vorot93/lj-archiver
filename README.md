@@ -91,8 +91,10 @@ lj-archiver --user-agent "my-archiver/1.0" news
 A desktop GUI is available alongside the command-line tool. It lets you enter a
 target (a journal name, `journal/id`, or a post URL), choose an output folder,
 toggle comments and media, optionally generate a single-file `book.adoc`, watch
-archiving progress, and open the finished
-archive folder. Any posts that fail to archive are listed with clickable links.
+archiving progress, and open the finished archive folder. It warns when archive
+pages fail and lists them with clickable links. Choose either an empty folder or
+an existing archive for the same journal; the GUI automatically resumes a
+matching archive.
 
 Download an installer for your platform from the project's GitHub Releases:
 
@@ -116,6 +118,9 @@ To run the GUI from source: `cargo run -p lj-archiver-gui`.
 | `news/166511` | Archive one post from a journal |
 | `@166511` with `--journal news` | Archive one post when the journal is provided separately |
 | `https://news.livejournal.com/166511.html` | Archive one post by URL |
+
+Journal names that differ only by underscores and hyphens refer to the same
+public journal.
 
 ## Options
 
@@ -150,6 +155,10 @@ archive/<journal>/
 `index.adoc` is a table of contents that links to archived posts.
 
 Each post is written to `posts/<id>.adoc`. The post file contains document metadata, the post body, and comments when comment archiving is enabled.
+
+During a completed journal export, links to other exported posts become local
+cross-references. Links to posts that did not archive remain canonical external
+links. Archive paths written into AsciiDoc always use portable forward slashes.
 
 Downloaded inline media is stored in a single `assets/` folder at the archive root. Each file is named by a hash of its source URL (`<hash>.<ext>`), so an image reused across posts is stored only once, and post files reference it with a relative path like `../assets/1d3802f42770.jpg`.
 
