@@ -133,7 +133,8 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let mut request = [0; 1024];
-                        stream.read(&mut request).unwrap();
+                        let bytes_read = stream.read(&mut request).unwrap();
+                        assert!(request[..bytes_read].starts_with(b"GET "));
                         requests += 1;
                         let response = if requests == 1 {
                             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nab"
