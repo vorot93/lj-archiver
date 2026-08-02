@@ -17,6 +17,7 @@ use futures::{StreamExt, stream};
 use std::{
     collections::{BTreeMap, HashSet},
     path::PathBuf,
+    sync::Arc,
 };
 use url::Url;
 
@@ -142,6 +143,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     let generate_book =
         options.generate_book || existing.as_ref().is_some_and(|existing| existing.has_book);
     let mut posts = posts_by_id(existing.as_ref());
+    let trusted_posts = Arc::new(posts.clone());
     let client = LjClient::new(options.user_agent.as_deref())?;
 
     progress.discovery_started();
@@ -154,6 +156,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     let journal_context = JournalPostContext {
         journal: journal.clone(),
         id_set: candidate_ids,
+        trusted_posts,
     };
 
     let outcomes: Vec<_> = stream::iter(ids)
@@ -307,14 +310,11 @@ async fn archive_journal_post(
     journal_context: JournalPostContext,
     progress: &Progress,
 ) -> JournalPostOutcome {
-    if options.resume && archive.post_exists(id) {
-        let title = archived_post_title(&archive, id).unwrap_or_else(|| format!("Post {id}"));
+    if options.resume
+        && let Some(post) = journal_context.trusted_posts.get(&id).cloned()
+    {
         progress.post_skipped(id);
-        return JournalPostOutcome::Skipped(ArchivedPost {
-            id,
-            title,
-            path: archive.post_path(id),
-        });
+        return JournalPostOutcome::Skipped(post);
     }
 
     let url = match journal_post_url(&journal_context.journal, id, &options.base_url) {
@@ -383,12 +383,6 @@ fn cleanup_pending_post(archive: &Archive, id: u64, path: &std::path::Path) {
             "could not remove finalized pending post"
         );
     }
-}
-
-fn archived_post_title(archive: &Archive, id: u64) -> Option<String> {
-    let contents = std::fs::read_to_string(archive.post_path(id)).ok()?;
-    let title = contents.lines().next()?.strip_prefix("= ")?.trim();
-    (!title.is_empty()).then(|| title.to_string())
 }
 
 fn posts_by_id(existing: Option<&ExistingArchive>) -> BTreeMap<u64, ArchivedPost> {
@@ -591,6 +585,7 @@ struct PreparedPost {
 struct JournalPostContext {
     journal: String,
     id_set: HashSet<u64>,
+    trusted_posts: Arc<BTreeMap<u64, ArchivedPost>>,
 }
 
 enum JournalPostOutcome {
@@ -662,20 +657,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reads_archived_title_from_post_file() {
-        let dir = tempdir().unwrap();
-        let archive = Archive::new(dir.path().join("archive"), "news");
-        archive
-            .write_post(166511, "= Real Title\n\n:lj-id: 166511\n")
-            .unwrap();
-        assert_eq!(
-            archived_post_title(&archive, 166511).as_deref(),
-            Some("Real Title")
-        );
-        assert_eq!(archived_post_title(&archive, 999999), None);
-    }
-
     #[tokio::test]
     async fn archives_single_post_from_local_server() {
         let server = MockServer::start().await;
@@ -708,6 +689,79 @@ mod tests {
         let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
         assert!(post.contains("= Post Title"));
         assert!(post.contains("Hello *world*."));
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_skip_a_post_absent_from_the_inspected_snapshot() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Fetched after inspection.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("out"), "news");
+        let journal_context = JournalPostContext {
+            journal: "news".to_string(),
+            id_set: HashSet::from([1]),
+            trusted_posts: Arc::new(BTreeMap::new()),
+        };
+
+        archive
+            .write_post(1, "= Late Unverified File\n\nMust not trigger a skip.\n")
+            .unwrap();
+        let options = journal_cli(&server, dir.path(), true).options();
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let progress = Progress::channel(tx);
+
+        let outcome = archive_journal_post(
+            LjClient::new(None).unwrap(),
+            options,
+            archive.clone(),
+            1,
+            journal_context,
+            &progress,
+        )
+        .await;
+
+        let pending_path = match outcome {
+            JournalPostOutcome::Prepared(post) => {
+                assert_eq!(post.archived.id, 1);
+                assert_eq!(post.archived.title, "Post Title");
+                post.pending_path
+            }
+            JournalPostOutcome::Skipped(post) => {
+                panic!("late unverified post {} was incorrectly skipped", post.id)
+            }
+            JournalPostOutcome::Failed(failure) => {
+                panic!(
+                    "post {} unexpectedly failed: {}",
+                    failure.id, failure.message
+                )
+            }
+        };
+        drop(progress);
+        let events: Vec<_> = rx.collect().await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.url.path())
+                .collect::<Vec<_>>(),
+            vec!["/news/1.html"]
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProgressEvent::PostSkipped { id: 1 })),
+            "{events:?}"
+        );
+        archive.remove_pending_post(&pending_path).unwrap();
     }
 
     #[tokio::test]
