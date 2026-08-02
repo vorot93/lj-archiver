@@ -19,7 +19,7 @@ The current tool is public-content only. Do not add login, private-content acces
 - `src/models.rs` defines core archive, post, comment, media, and run option data types. `RunOptions::generate_book` is the opt-in single-file `book.adoc` toggle, set by the `--book` flag (and the GUI checkbox).
 - `src/target.rs` parses target strings (bare journal names, `*.livejournal.com` hostnames, journal home URLs, and post URLs) and builds LiveJournal post and calendar URLs.
 - `src/client.rs` owns HTTP fetching behavior.
-- `src/net.rs` provides shared network helpers — loopback/local test-server detection and restricted IP-literal checks (used by media safety and target/discovery), plus `affirmation_cookie_jar()`, the age-affirmation cookie jar (scoped to `livejournal.com`) installed on every production client, and `configured_client_builder(user_agent)`, which applies that jar, the shared TLS config, and an optional `User-Agent` (both `LjClient` and the media client build on it).
+- `src/net.rs` provides shared network helpers — normalized DNS hosts, loopback/local test-server detection, `affirmation_cookie_jar()` (the age-affirmation cookie jar scoped to `livejournal.com` and installed on every production client), and `configured_client_builder(user_agent)`, which applies that jar, the shared TLS config, and an optional `User-Agent` (both `LjClient` and the media client build on it). Restricted IP-literal validation belongs to `src/media.rs`.
 - `src/tls.rs` builds the shared rustls `ClientConfig` applied to every HTTP client (see HTTP And Media Safety).
 - `src/discover.rs` finds journal post IDs by walking the calendar, per-year pages, and month archive pages.
 - `src/parser.rs` parses LiveJournal HTML into post and comment models.
@@ -60,7 +60,7 @@ Reuse seam (in the core, additive, CLI behavior unchanged):
 
 GUI structure: `gui/src/state.rs` is a pure reducer (`App::update_state`) with
 full unit tests; `gui/src/app.rs` is the iced glue (`boot`/`update`/`view`).
-Progress is driven by a capacity-128 channel in
+Progress is driven by one capacity-128 channel in
 `Task::batch([Task::run(rx, Message::Progress),
 Task::perform(run_archive(...), Message::Finished)])`. Both callbacks carry
 the active run generation. Progress may be dropped, so the separately delivered
@@ -68,10 +68,11 @@ generation-tagged `Finished` result is authoritative for terminal state and
 exact counters. The iced view is manual-verify only (no headless harness) — smoke-test with
 `cargo run -p lj-archiver-gui` against a small real post.
 
-The GUI accepts a selected folder only when it is empty or a matching existing
-archive. It derives an existing archive's identity from the controlled
-`index.adoc` title and compares journal names with the shared hyphen/underscore
-alias rules before enabling auto-resume.
+The GUI reuses core `Archive::inspect_existing` and accepts a selected folder
+only when it is truly empty or a valid matching existing archive. It derives an
+existing archive's identity from the controlled `index.adoc` title and compares
+journal names with the shared hyphen/underscore alias rules before enabling
+auto-resume.
 
 Packaging uses cargo-packager (`[package.metadata.packager]` in `gui/Cargo.toml`).
 `.github/workflows/release.yml` builds installers on `v*` tags: macOS `.dmg`
@@ -101,15 +102,17 @@ CI enforces the exact `fmt` invocation above. There is no `rustfmt.toml`, so the
 The Windows CI job owns coverage for same-directory atomic replacement and the
 concurrent media replacement path.
 
-`Cargo.lock` is gitignored — commit `Cargo.toml` only for dependency changes. CI additionally runs `cargo audit` and executes clippy and tests across feature combinations (`cargo hack ... --each-feature`).
+`Cargo.lock` is gitignored — commit `Cargo.toml` only for dependency changes. CI additionally runs `cargo audit`, validates `CITATION.cff` with `cffconvert`, and executes Clippy/tests across feature combinations. The core each-feature Clippy gate is `cargo hack clippy -p lj-archiver --each-feature --all-targets -- -D warnings`, so every core target is linted under `-D warnings`.
 
-With cargo-hack 0.6.45, `cargo hack test` rejects `--no-dev-deps` before
-invoking Cargo. Use `--no-dev-deps` for Clippy feature powersets, but retain dev
+With cargo-hack 0.6.45, Clippy rejects combining `--no-dev-deps` with
+`--all-targets`, and `cargo hack test` rejects `--no-dev-deps` before invoking
+Cargo. Run the two meaningful Clippy halves separately and retain dev
 dependencies for test powersets:
 
 ```sh
-cargo hack clippy --workspace --feature-powerset --depth 1 --no-dev-deps -- -D warnings
-cargo hack test --workspace --feature-powerset --depth 1
+cargo hack clippy --workspace --feature-powerset --depth 1 --exclude-features default --no-dev-deps -- -D warnings
+cargo hack clippy --workspace --feature-powerset --depth 1 --exclude-features default --all-targets -- -D warnings
+cargo hack test --workspace --feature-powerset --depth 1 --exclude-features default
 ```
 
 ## Testing Rules
@@ -140,9 +143,9 @@ Treat comments and media as part of the archive record. Do not silently drop con
 
 For journal archives, preserve the current resilient behavior: continue past individual post failures, write successful posts, and return a nonzero status when any post failed.
 
-The AsciiDoc renderer (`src/adoc/`) produces byte-exact output guarded by a large black-box test suite; change it with care and assert exact output. Preserve two invariants: passthrough source recovery is a single-pass byte-span scan (keep it linear, and let self-closing non-void tags fall through to the tag stack so trailing content is not lost); and render recursion is depth-capped (`MAX_RENDER_DEPTH`) at every recursive entry point (`render_element`, `plain_text_inline_content_at`, `raw_text_at`) — missing one lets deeply nested input overflow the stack (an uncatchable abort).
+The AsciiDoc renderer (`src/adoc/`) produces byte-exact output guarded by a large black-box test suite; change it with care and assert exact output. Passthrough source recovery precomputes range-backed original-byte mappings with one tokenizer-compatible source scan plus one DOM traversal; both must remain linear. Quotes enter quoted attribute-value state only after `=`, and a self-closing non-void tag stays on the tag stack so normalized fallback retains its trailing children. Raw-text collection is iterative, while recursive rendering and plain-inline collection are capped at `MAX_RENDER_DEPTH`; missing a recursive cap lets deeply nested input overflow the stack (an uncatchable abort).
 
-The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
+The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list, delimiter, and related AsciiDoc syntax stays inert. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
 A same-journal target in a linked image's `link=` attribute is a contextual
 `{lj-archiver-post-link-prefix}<id>.adoc` URI, not a complete
@@ -176,6 +179,7 @@ Discovery walks LiveJournal's own archive navigation, all served as static (no-J
 
 - The journal `/calendar/` page links one page per year (`/YYYY/`), plus month pages (`/YYYY/MM/`) for the current year only. Each year page links that year's month pages, and each month page links individual post URLs. `src/discover.rs` walks `calendar → year → month → posts`, reading year links from the calendar only (every archive page repeats the year navigation, so recursing would re-crawl). Matching only `/YYYY/MM/` links off the calendar silently limits a journal to its current year — the year hop is required.
 - Discovery parses archive links against reqwest's final response URL. This matters because underscore-journal calendar URLs redirect to hyphen subdomains.
+- `DiscoveryTick.found` always means unique post IDs found so far. Year-page ticks keep the current post count unchanged; a successful month inserts its parsed IDs before emitting the next monotonic count. Never substitute month/page totals for this field.
 - Posts are archived oldest-first (discovered IDs are sorted ascending), so the smallest archived post ID reflects how far back a walk reached — useful when confirming a full walk. A full multi-year pull makes many sequential requests before the first post is written, and there is no request throttling.
 
 Two journal URL schemes exist; handle and test both wherever discovery, target parsing, or URL building touch a journal:
@@ -205,7 +209,7 @@ image targets retain the actual inspected filename (for example `01.adoc` for
 ID 1). New IDs alone use canonical `<id>.adoc`; never migrate, delete, or create
 a canonical duplicate for a validated alias.
 
-On a bulk journal export, rendered bodies and their pending links are staged on disk as non-public `posts/*.pending` files while the fetch stream remains bounded by `RunOptions::concurrency`. Finalization first resolves every staged link to its resolved absolute href from that post's delivered URL and atomically writes an externally complete public `.adoc` at the selected actual path. A best-effort atomic second pass upgrades links to IDs in the additive final set, so a failed upgrade retains the complete external fallback and public files never contain staging tokens. Every non-finalized retained entry, including resume skips, receives best-effort stale-`xref:<numeric spelling>.adoc[…]` repair by parsed ID; repair failure leaves its existing public bytes intact. Pending files are removed on both finalization success and failure. A failed new post stays out of `index.adoc` and `book.adoc`, while a failed existing post retains its validated baseline entry. Journal names are matched with `-`/`_` folded together (LiveJournal serves an underscore username `a_b` at the hyphen subdomain `a-b.livejournal.com`, so the two spellings denote one journal). Downloaded media is stored once in a single `assets/` folder at the archive root (filenames are a URL hash, so a reused image is stored once and referenced as `../assets/<hash>.<ext>`).
+On a bulk journal export, rendered bodies and their pending links are staged on disk as non-public `posts/*.pending` files while the fetch stream remains bounded by `RunOptions::concurrency`. As each preparation completes, first-stage finalization resolves every staged link to its absolute href from that post's delivered URL and atomically publishes an externally complete `.adoc` at the selected actual path; successful posts therefore become public incrementally rather than waiting for every peer. A best-effort atomic second pass upgrades links to IDs in the additive final set, so a failed upgrade retains the complete external fallback and public files never contain staging tokens. Every non-finalized retained entry, including resume skips, receives best-effort stale-`xref:<numeric spelling>.adoc[…]` repair by parsed ID; repair failure leaves its existing public bytes intact. Pending cleanup is also best effort: it is attempted after first-stage failure and after the upgrade pass, but an unlink failure may leave a non-public pending file without invalidating the externally complete public fallback. Pending-link substitution scans input tokens with one monotonic cursor and must remain linear. A failed new post stays out of `index.adoc` and `book.adoc`, while a failed existing post retains its validated baseline entry. Journal names are matched with `-`/`_` folded together (LiveJournal serves an underscore username `a_b` at the hyphen subdomain `a-b.livejournal.com`, so the two spellings denote one journal). Downloaded media is stored once in a single `assets/` folder at the archive root (filenames are a URL hash, so a reused image is stored once and referenced as `../assets/<hash>.<ext>`).
 
 Fetched posts are parsed against the delivered final response URL, which is
 preserved as `Post.url` for rendering and downstream processing. Before media
