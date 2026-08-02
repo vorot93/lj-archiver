@@ -43,6 +43,10 @@ static ENTRY_TAGS: LazyLock<Selector> = LazyLock::new(|| {
     Selector::parse(".aentry-tags a, .entry-tags a, a[rel=tag]")
         .expect("static selector must parse")
 });
+static SCRIPT: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("script").expect("static selector must parse"));
+static FORM_WITH_ACTION: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("form[action]").expect("static selector must parse"));
 
 #[derive(serde::Deserialize)]
 struct SiteEntry {
@@ -56,37 +60,78 @@ struct SiteEntry {
     eventtime: Option<i64>,
 }
 
-/// Extracts the server-rendered `Site.entry = {…}` JSON object from a post page.
-///
-/// Anchors on `Site.entry` specifically — the page carries many unrelated
-/// `"poster"` values in sidebar JSON — then deserializes the single leading
-/// JSON object and stops, so trailing script content is never read. Returns
-/// `None` when the object is absent or not valid JSON.
-fn site_entry(html: &str) -> Option<SiteEntry> {
-    let anchor = html.find("Site.entry")?;
-    let object = &html[anchor..];
-    let brace = object.find('{')?;
-    serde_json::Deserializer::from_str(&object[brace..])
-        .into_iter::<SiteEntry>()
-        .next()?
-        .ok()
+fn site_entry(document: &Html, expected_id: u64) -> Option<SiteEntry> {
+    const ANCHOR: &str = "Site.entry";
+
+    for script in document.select(&SCRIPT) {
+        let text = script.text().collect::<String>();
+        let bytes = text.as_bytes();
+        let mut search_start = 0;
+
+        while let Some(relative_anchor) = text[search_start..].find(ANCHOR) {
+            let anchor = search_start + relative_anchor;
+            let after_anchor = anchor + ANCHOR.len();
+            search_start = after_anchor;
+
+            if anchor
+                .checked_sub(1)
+                .and_then(|index| bytes.get(index))
+                .is_some_and(|byte| is_js_identifier_byte(*byte))
+                || bytes
+                    .get(after_anchor)
+                    .is_some_and(|byte| is_js_identifier_byte(*byte))
+            {
+                continue;
+            }
+
+            let mut cursor = after_anchor;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'=') {
+                continue;
+            }
+
+            cursor += 1;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'{') {
+                continue;
+            }
+
+            let entry = serde_json::Deserializer::from_str(&text[cursor..])
+                .into_iter::<SiteEntry>()
+                .next()
+                .and_then(std::result::Result::ok);
+            if entry.as_ref().and_then(|entry| entry.ditemid) == Some(expected_id) {
+                return entry;
+            }
+        }
+    }
+
+    None
 }
 
-/// True when `html` is LiveJournal's adult-content interstitial rather than a
-/// real post. The interstitial's confirmation form posts to
-/// `misc/adult_explicit.bml`; that string does not appear on an actual post
-/// page, so it is a specific, reliable marker.
-fn is_age_gate(html: &str) -> bool {
-    html.contains("misc/adult_explicit.bml")
+fn is_js_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn is_age_gate(document: &Html, page_url: &Url) -> bool {
+    document.select(&FORM_WITH_ACTION).any(|form| {
+        form.attr("action")
+            .and_then(|action| page_url.join(action).ok())
+            .is_some_and(|action| action.path().ends_with("/misc/adult_explicit.bml"))
+    })
 }
 
 pub fn parse_post_page(html: &str, url: &Url) -> Result<Post> {
-    if is_age_gate(html) {
+    let document = Html::parse_document(html);
+    if is_age_gate(&document, url) {
         return Err(LjError::AgeGated {
             url: url.to_string(),
         });
     }
-    let document = Html::parse_document(html);
     let article = source_article(&document);
 
     let id = article
@@ -97,7 +142,7 @@ pub fn parse_post_page(html: &str, url: &Url) -> Result<Post> {
         .or_else(|| id_from_url(url))
         .ok_or_else(|| parse_error(url, "missing post id"))?;
 
-    let entry = site_entry(html).filter(|entry| entry.ditemid == Some(id));
+    let entry = site_entry(&document, id);
 
     let journal = entry
         .as_ref()
@@ -297,6 +342,13 @@ fn non_empty_attr(element: ElementRef<'_>, name: &str) -> Option<String> {
 
 fn journal_from_url(url: &Url) -> Option<String> {
     let host = url.host_str()?;
+    if host == "users.livejournal.com" {
+        return url
+            .path_segments()?
+            .find(|segment| !segment.is_empty())
+            .map(ToOwned::to_owned);
+    }
+
     host.strip_suffix(".livejournal.com")
         .filter(|journal| !journal.is_empty() && *journal != "www")
         .map(ToOwned::to_owned)
@@ -586,6 +638,53 @@ mod tests {
     }
 
     #[test]
+    fn body_site_entry_prose_does_not_shadow_real_script_assignment() {
+        let html = r#"
+            <html><body>
+                <article data-journal="news" data-itemid="123">
+                    <div class="entry-content">
+                        <p>Site.entry {"ditemid":999,"poster":"fake"}</p>
+                    </div>
+                </article>
+                <script>
+                Site.entry = {"ditemid":123,"journal":"news","poster":"real_poster","eventtime":1700000000};
+                </script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "news");
+        assert_eq!(post.author, "news");
+        assert_eq!(post.poster.as_deref(), Some("real_poster"));
+        assert_eq!(post.published_at, DateTime::from_timestamp(1700000000, 0));
+    }
+
+    #[test]
+    fn site_entry_scans_past_malformed_and_unrelated_assignments() {
+        let html = r#"
+            <html><body>
+                <article data-journal="fallback" data-itemid="123">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>
+                NotSite.entry = {"ditemid":1,"journal":"wrong","poster":"wrong"};
+                Site.entryExtra = {"ditemid":2,"journal":"wrong","poster":"wrong"};
+                Site.entry = {"ditemid":
+                Site.entry = {"ditemid":123,"journal":"news","poster":"winner","eventtime":1700000000};
+                </script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "news");
+        assert_eq!(post.author, "news");
+        assert_eq!(post.poster.as_deref(), Some("winner"));
+        assert_eq!(post.published_at, DateTime::from_timestamp(1700000000, 0));
+    }
+
+    #[test]
     fn canonical_journal_is_not_overridden_by_legacy_author() {
         let html = r#"
             <html><body>
@@ -712,9 +811,25 @@ mod tests {
     }
 
     #[test]
+    fn users_host_fallback_uses_first_path_segment() {
+        let html = r#"
+            <html><body>
+                <article data-itemid="123">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://users.livejournal.com/evo_lutio/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "evo_lutio");
+        assert_eq!(post.author, "evo_lutio");
+    }
+
+    #[test]
     fn resolves_journal_from_site_entry_for_users_scheme() {
-        // users.livejournal.com/<journal>/<id>.html carries no data-journal, so the
-        // URL host strips to the literal "users"; Site.entry.journal is canonical.
+        // Site.entry.journal remains canonical when the article carries no
+        // data-journal on the users.livejournal.com URL scheme.
         let html = r#"
             <html><body>
                 <script>Site.entry = {"ditemid":123,"journal":"some_journal","poster":"some_journal"};</script>
@@ -760,10 +875,43 @@ mod tests {
     }
 
     #[test]
-    fn returns_age_gated_for_adult_interstitial() {
+    fn age_gate_marker_in_prose_or_link_does_not_reject_post() {
+        let html = r#"
+            <html><body>
+                <article data-journal="news" data-itemid="123">
+                    <div class="entry-content">
+                        <p>The path /misc/adult_explicit.bml is discussed here.</p>
+                        <a href="/misc/adult_explicit.bml">ordinary link</a>
+                    </div>
+                </article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.id, 123);
+        assert!(!post.body_html.trim().is_empty());
+    }
+
+    #[test]
+    fn structural_age_gate_form_is_rejected() {
         let html = include_str!("../tests/fixtures/post_age_gated.html");
         let url = Url::parse("https://evo-lutio.livejournal.com/47545.html").unwrap();
         let err = parse_post_page(html, &url).unwrap_err();
-        assert!(matches!(err, LjError::AgeGated { .. }), "got {err:?}");
+        match err {
+            LjError::AgeGated { url } => {
+                assert_eq!(url, "https://evo-lutio.livejournal.com/47545.html");
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        let relative_form = r#"<form action="/misc/adult_explicit.bml"></form>"#;
+        let err = parse_post_page(relative_form, &url).unwrap_err();
+        match err {
+            LjError::AgeGated { url } => {
+                assert_eq!(url, "https://evo-lutio.livejournal.com/47545.html");
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 }
