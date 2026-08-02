@@ -42,8 +42,13 @@ impl App {
     }
 
     fn start_archive(&mut self) -> Task<Message> {
-        let Some((target, options)) = self.run_request() else {
-            return Task::none();
+        let (target, options) = match self.run_request() {
+            Ok(Some(request)) => request,
+            Ok(None) => return Task::none(),
+            Err(message) => {
+                self.state = State::Error { message };
+                return Task::none();
+            }
         };
         self.update_state(&Message::Start);
 

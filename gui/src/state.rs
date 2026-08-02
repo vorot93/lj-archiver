@@ -6,9 +6,10 @@
 use std::path::{Path, PathBuf};
 
 use lj_archiver::{
-    models::{PostFailure, RunOptions},
+    models::{ArchiveTarget, PostFailure, RunOptions},
     progress::ProgressEvent,
     run::RunOutcome,
+    target::{is_valid_journal_name, journals_alias, parse_target},
 };
 use url::Url;
 
@@ -154,13 +155,31 @@ impl App {
     }
 
     /// The target string and `RunOptions` for a launch, or `None` if not
-    /// startable. Auto-detects resume from the chosen folder.
-    pub fn run_request(&self) -> Option<(String, RunOptions)> {
+    /// startable. Auto-detects resume from the chosen folder and rejects an
+    /// existing archive whose journal identity cannot be verified or matched.
+    pub fn run_request(&self) -> Result<Option<(String, RunOptions)>, String> {
         if !self.can_start() {
-            return None;
+            return Ok(None);
         }
-        let folder = self.config.folder.clone()?;
-        let resume = folder_has_existing_posts(&folder);
+        let folder = self
+            .config
+            .folder
+            .clone()
+            .expect("can_start requires a chosen folder");
+        let target = self.config.target.trim();
+        let requested_journal =
+            match parse_target(target, None).map_err(|error| error.to_string())? {
+                ArchiveTarget::Journal { journal } | ArchiveTarget::Post { journal, .. } => journal,
+            };
+        let existing_journal = archive_journal(&folder)?;
+        if let Some(existing_journal) = &existing_journal
+            && !journals_alias(existing_journal, &requested_journal)
+        {
+            return Err(format!(
+                "selected folder contains archive for {existing_journal}, not requested journal {requested_journal}"
+            ));
+        }
+        let resume = existing_journal.is_some() && folder_has_existing_posts(&folder);
         let options = RunOptions {
             output_dir: Some(folder),
             include_comments: self.config.include_comments,
@@ -172,8 +191,34 @@ impl App {
             user_agent: None,
             base_url: Url::parse("https://livejournal.com").expect("static url is valid"),
         };
-        Some((self.config.target.trim().to_string(), options))
+        Ok(Some((target.to_string(), options)))
     }
+}
+
+fn archive_journal(folder: &Path) -> Result<Option<String>, String> {
+    let index = folder.join("index.adoc");
+    let has_posts = folder_has_existing_posts(folder);
+    if !index.exists() && !has_posts {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&index).map_err(|error| {
+        format!("archive identity cannot be verified: could not read index.adoc: {error}")
+    })?;
+    let first_line = contents.lines().next().unwrap_or_default();
+    let Some(journal) = first_line
+        .strip_prefix("= ")
+        .and_then(|line| line.strip_suffix(" Archive"))
+        .map(str::trim)
+        .filter(|journal| is_valid_journal_name(journal))
+    else {
+        return Err(
+            "archive identity cannot be verified: index.adoc has an invalid archive title"
+                .to_string(),
+        );
+    };
+
+    Ok(Some(journal.to_string()))
 }
 
 /// True when `folder/posts/` already contains at least one `.adoc` file.
@@ -370,6 +415,7 @@ mod tests {
         let posts = dir.path().join("posts");
         std::fs::create_dir_all(&posts).unwrap();
         std::fs::write(posts.join("1.adoc"), "= T\n").unwrap();
+        std::fs::write(dir.path().join("index.adoc"), "= news Archive\n").unwrap();
 
         let mut app = App::default();
         app.update_state(&Message::TargetChanged("news".to_string()));
@@ -377,7 +423,7 @@ mod tests {
         app.update_state(&Message::ToggleMedia(false));
         app.update_state(&Message::ToggleBook(true));
 
-        let (target, options) = app.run_request().unwrap();
+        let (target, options) = app.run_request().unwrap().unwrap();
         assert_eq!(target, "news");
         assert_eq!(options.output_dir.as_deref(), Some(dir.path()));
         assert!(options.resume); // posts/ already has a .adoc
@@ -385,5 +431,66 @@ mod tests {
         assert!(options.generate_book);
         assert!(options.include_comments);
         assert_eq!(options.concurrency, 4);
+    }
+
+    #[test]
+    fn matching_archive_alias_can_resume() {
+        let dir = tempdir().unwrap();
+        let posts = dir.path().join("posts");
+        std::fs::create_dir_all(&posts).unwrap();
+        std::fs::write(posts.join("1.adoc"), "= T\n").unwrap();
+        std::fs::write(dir.path().join("index.adoc"), "= evo-lutio Archive\n").unwrap();
+
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("evo_lutio".to_string()));
+        app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
+
+        let (target, options) = app.run_request().unwrap().unwrap();
+        assert_eq!(target, "evo_lutio");
+        assert!(options.resume);
+    }
+
+    #[test]
+    fn mismatched_archive_is_rejected() {
+        let dir = tempdir().unwrap();
+        let posts = dir.path().join("posts");
+        std::fs::create_dir_all(&posts).unwrap();
+        std::fs::write(posts.join("1.adoc"), "= T\n").unwrap();
+        std::fs::write(dir.path().join("index.adoc"), "= news Archive\n").unwrap();
+
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("other".to_string()));
+        app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
+
+        let error = app.run_request().unwrap_err();
+        assert!(error.contains("news"));
+        assert!(error.contains("other"));
+    }
+
+    #[test]
+    fn unverifiable_nonempty_archive_is_rejected() {
+        let dir = tempdir().unwrap();
+        let posts = dir.path().join("posts");
+        std::fs::create_dir_all(&posts).unwrap();
+        std::fs::write(posts.join("1.adoc"), "= T\n").unwrap();
+
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("news".to_string()));
+        app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
+
+        let error = app.run_request().unwrap_err();
+        assert!(error.contains("archive identity cannot be verified"));
+    }
+
+    #[test]
+    fn empty_folder_starts_without_resume() {
+        let dir = tempdir().unwrap();
+
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("news".to_string()));
+        app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
+
+        let (_, options) = app.run_request().unwrap().unwrap();
+        assert!(!options.resume);
     }
 }

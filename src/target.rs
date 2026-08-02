@@ -242,7 +242,7 @@ fn parse_post_id(input: &str, id_text: &str) -> Result<u64> {
     }
 }
 
-pub(crate) fn is_valid_journal_name(name: &str) -> bool {
+pub fn is_valid_journal_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) => {
