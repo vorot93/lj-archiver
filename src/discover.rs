@@ -1,13 +1,12 @@
-use scraper::{Html, Selector};
-use std::sync::LazyLock;
-use url::Url;
-
 use crate::{
     client::LjClient,
     error::{LjError, Result},
     progress::Progress,
     target::journals_alias,
 };
+use scraper::{Html, Selector};
+use std::{collections::HashSet, sync::LazyLock};
+use url::Url;
 
 static ANCHOR_HREF: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("a[href]").expect("static selector must parse"));
@@ -104,7 +103,7 @@ pub async fn discover_post_ids(
     let mut month_urls = parse_month_links(&calendar_page.text, &calendar_page.final_url, journal);
     let year_urls = parse_year_links(&calendar_page.text, &calendar_page.final_url, journal);
 
-    let mut ids = Vec::new();
+    let mut ids = HashSet::new();
     let mut year_failed = 0usize;
     for year_url in year_urls {
         match client.fetch_page(&year_url).await {
@@ -114,7 +113,7 @@ pub async fn discover_post_ids(
                     &year_page.final_url,
                     journal,
                 ));
-                progress.discovery_tick(year_page.final_url.path(), month_urls.len());
+                progress.discovery_tick(year_page.final_url.path(), ids.len());
             }
             Err(error) => {
                 year_failed += 1;
@@ -159,8 +158,8 @@ pub async fn discover_post_ids(
         return Err(discovery_error(journal, "all month pages failed to fetch"));
     }
 
+    let mut ids: Vec<_> = ids.into_iter().collect();
     ids.sort_unstable();
-    ids.dedup();
     Ok((ids, year_failed + month_failed))
 }
 
@@ -485,6 +484,133 @@ mod tests {
 
         assert_eq!(ids, vec![166511, 166512]);
         assert_eq!(failed_months, 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_tick_counts_unique_posts_monotonically_across_pages() {
+        use crate::{client::LjClient, progress::ProgressEvent};
+        use futures::StreamExt;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                    <a href="/2023/">2023</a>
+                    <a href="/2024/">2024</a>
+                    <a href="/2024/03/">March</a>
+                    <a href="/2024/03/">March duplicate</a>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2023/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                    <a href="/2023/01/">January</a>
+                    <a href="/2023/02/">February</a>
+                    <a href="/2023/02/">February duplicate</a>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                    <a href="/2024/03/">March repeated from calendar</a>
+                    <a href="/2024/04/">April</a>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2023/01/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                    <a href="/news/30.html">thirty</a>
+                    <a href="/news/10.html">ten</a>
+                    <a href="/news/10.html">ten duplicate</a>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2023/02/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                    <a href="/news/30.html">thirty repeated</a>
+                    <a href="/news/20.html">twenty</a>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/03/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                    <a href="/news/20.html">twenty repeated</a>
+                    <a href="/news/40.html">forty</a>
+                    <a href="/news/40.html">forty duplicate</a>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/04/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = LjClient::new(None).unwrap();
+        let base = Url::parse(&server.uri()).unwrap();
+        let (tx, rx) = futures::channel::mpsc::channel(8);
+        let progress = Progress::channel(tx);
+        let (ids, failed) = discover_post_ids(&client, "news", &base, &progress)
+            .await
+            .unwrap();
+        drop(progress);
+        let events: Vec<_> = rx.collect().await;
+
+        let expected_ticks = vec![
+            ProgressEvent::DiscoveryTick {
+                label: "/2023/".to_string(),
+                found: 0,
+            },
+            ProgressEvent::DiscoveryTick {
+                label: "/2024/".to_string(),
+                found: 0,
+            },
+            ProgressEvent::DiscoveryTick {
+                label: "/2023/01/".to_string(),
+                found: 2,
+            },
+            ProgressEvent::DiscoveryTick {
+                label: "/2023/02/".to_string(),
+                found: 3,
+            },
+            ProgressEvent::DiscoveryTick {
+                label: "/2024/03/".to_string(),
+                found: 4,
+            },
+        ];
+        assert_eq!(events, expected_ticks);
+        let found: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProgressEvent::DiscoveryTick { found, .. } => Some(*found),
+                _ => None,
+            })
+            .collect();
+        assert!(found.windows(2).all(|counts| counts[0] <= counts[1]));
+        assert_eq!(found.last().copied(), Some(ids.len()));
+        assert_eq!(ids, vec![10, 20, 30, 40]);
+        assert_eq!(failed, 1);
     }
 
     #[tokio::test]
