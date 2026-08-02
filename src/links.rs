@@ -81,7 +81,6 @@ impl LinkRewriter {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn pending_links(&self) -> Vec<PendingLink> {
         self.pending_links
             .lock()
@@ -90,7 +89,6 @@ impl LinkRewriter {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn resolve_pending_links(
     text: &str,
     links: &[PendingLink],
@@ -110,7 +108,6 @@ pub(crate) fn resolve_pending_links(
     resolved
 }
 
-#[allow(dead_code)]
 pub(crate) fn restore_missing_xrefs(
     text: &str,
     journal: &str,

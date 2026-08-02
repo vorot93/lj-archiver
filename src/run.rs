@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf};
 
 use futures::{StreamExt, stream};
 use url::Url;
@@ -11,7 +11,7 @@ use crate::{
     client::LjClient,
     discover::discover_post_ids,
     error::LjError,
-    links::LinkRewriter,
+    links::{LinkRewriter, PendingLink, resolve_pending_links, restore_missing_xrefs},
     media::rewrite_inline_media,
     models::{ArchiveTarget, ArchivedPost, Post, PostFailure, RunOptions},
     parser::parse_post_page,
@@ -110,55 +110,136 @@ async fn archive_journal(
         discover_post_ids(&client, &journal, &options.base_url, progress).await?;
     progress.archiving_started(ids.len());
 
-    let id_set: HashSet<u64> = ids.iter().copied().collect();
-    let rewriter = Arc::new(LinkRewriter::new(
-        journal.clone(),
-        id_set,
-        journal_base_url(&journal)?,
-    ));
+    let journal_context = JournalPostContext {
+        journal: journal.clone(),
+        id_set: ids.iter().copied().collect(),
+        link_base_url: journal_base_url(&journal)?,
+    };
 
     let outcomes: Vec<_> = stream::iter(ids)
         .map(|id| {
             let archive = archive.clone();
             let client = client.clone();
-            let journal = journal.clone();
             let options = options.clone();
-            let rewriter = Arc::clone(&rewriter);
+            let journal_context = journal_context.clone();
             let progress = progress.clone();
 
             async move {
-                archive_journal_post(
-                    client,
-                    options,
-                    archive,
-                    journal,
-                    id,
-                    Some(rewriter),
-                    &progress,
-                )
-                .await
+                archive_journal_post(client, options, archive, id, journal_context, &progress).await
             }
         })
         .buffer_unordered(options.concurrency)
         .collect()
         .await;
 
-    progress.archiving_finished();
-
-    let mut posts = Vec::new();
+    let mut prepared = Vec::new();
+    let mut skipped_posts = Vec::new();
     let mut failures = Vec::new();
     let mut skipped = 0usize;
     for outcome in outcomes {
         match outcome {
-            JournalPostOutcome::Archived(post) => posts.push(post),
+            JournalPostOutcome::Prepared(post) => prepared.push(post),
             JournalPostOutcome::Skipped(post) => {
                 skipped += 1;
-                posts.push(post);
+                skipped_posts.push(post);
             }
             JournalPostOutcome::Failed(failure) => failures.push(failure),
         }
     }
 
+    let mut finalized = Vec::new();
+    let no_local_ids = HashSet::new();
+    for mut post in prepared {
+        let first_stage = archive
+            .read_pending_post(&post.pending_path)
+            .and_then(|pending| {
+                let external = resolve_pending_links(&pending, &post.links, &no_local_ids);
+                archive.write_post(post.archived.id, &external)
+            });
+
+        match first_stage {
+            Ok(path) => {
+                post.archived.path = path;
+                progress.post_done(post.archived.id, &post.archived.title);
+                finalized.push(post);
+            }
+            Err(error) => {
+                progress.post_failed(post.archived.id);
+                failures.push(PostFailure {
+                    id: post.archived.id,
+                    url: journal_post_url(&journal, post.archived.id, &options.base_url)
+                        .unwrap_or_else(|_| options.base_url.clone()),
+                    message: error.to_string(),
+                });
+                cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
+            }
+        }
+    }
+
+    let final_ids: HashSet<u64> = finalized
+        .iter()
+        .map(|post| post.archived.id)
+        .chain(skipped_posts.iter().map(|post| post.id))
+        .collect();
+
+    for post in &finalized {
+        match archive.read_pending_post(&post.pending_path) {
+            Ok(pending) => {
+                let local = resolve_pending_links(&pending, &post.links, &final_ids);
+                if let Err(error) = archive.write_post(post.archived.id, &local) {
+                    tracing::warn!(
+                        post_id = post.archived.id,
+                        error = %error,
+                        "could not upgrade finalized post links; retaining external links"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    post_id = post.archived.id,
+                    error = %error,
+                    "could not reread pending post for local link upgrade; retaining external links"
+                );
+            }
+        }
+        cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
+    }
+
+    for post in &skipped_posts {
+        match std::fs::read_to_string(&post.path) {
+            Ok(existing) => match restore_missing_xrefs(&existing, &journal, &final_ids) {
+                Ok(repaired) if repaired != existing => {
+                    if let Err(error) = archive.write_post(post.id, &repaired) {
+                        tracing::warn!(
+                            post_id = post.id,
+                            error = %error,
+                            "could not repair skipped post links; retaining existing post"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        post_id = post.id,
+                        error = %error,
+                        "could not resolve skipped post links; retaining existing post"
+                    );
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    post_id = post.id,
+                    error = %error,
+                    "could not read skipped post for link repair; retaining existing post"
+                );
+            }
+        }
+    }
+
+    progress.archiving_finished();
+
+    let mut posts = skipped_posts;
+    posts.extend(finalized.into_iter().map(|post| post.archived));
     posts.sort_by_key(|post| post.id);
     failures.sort_by_key(|failure| failure.id);
     archive.write_index(&posts)?;
@@ -191,9 +272,8 @@ async fn archive_journal_post(
     client: LjClient,
     options: RunOptions,
     archive: Archive,
-    journal: String,
     id: u64,
-    rewriter: Option<Arc<LinkRewriter>>,
+    journal_context: JournalPostContext,
     progress: &Progress,
 ) -> JournalPostOutcome {
     if options.resume && archive.post_exists(id) {
@@ -206,7 +286,7 @@ async fn archive_journal_post(
         });
     }
 
-    let url = match journal_post_url(&journal, id, &options.base_url) {
+    let url = match journal_post_url(&journal_context.journal, id, &options.base_url) {
         Ok(url) => url,
         Err(error) => {
             progress.post_failed(id);
@@ -218,19 +298,32 @@ async fn archive_journal_post(
         }
     };
 
-    match fetch_and_write_post(
-        &client,
-        &options,
-        &archive,
-        url.clone(),
-        rewriter.as_deref(),
-    )
-    .await
-    {
-        Ok(post) => {
-            progress.post_done(post.id, &post.title);
-            JournalPostOutcome::Archived(post)
-        }
+    let prepared = async {
+        let html = client.fetch_text(&url).await?;
+        let mut post = parse_post_page(&html, &url)?;
+        rewrite_post_media(&mut post, &options, &archive).await?;
+        let rewriter = LinkRewriter::pending(
+            journal_context.journal,
+            journal_context.id_set,
+            journal_context.link_base_url,
+        );
+        let rendered = render_post(&post, options.include_comments, Some(&rewriter));
+        let pending_path = archive.write_pending_post(post.id, &rendered)?;
+
+        Result::Ok(PreparedPost {
+            archived: ArchivedPost {
+                id: post.id,
+                title: post.title,
+                path: archive.post_path(post.id),
+            },
+            pending_path,
+            links: rewriter.pending_links(),
+        })
+    }
+    .await;
+
+    match prepared {
+        Ok(post) => JournalPostOutcome::Prepared(post),
         Err(error) => {
             progress.post_failed(id);
             JournalPostOutcome::Failed(PostFailure {
@@ -239,6 +332,16 @@ async fn archive_journal_post(
                 message: error.to_string(),
             })
         }
+    }
+}
+
+fn cleanup_pending_post(archive: &Archive, id: u64, path: &std::path::Path) {
+    if let Err(error) = archive.remove_pending_post(path) {
+        tracing::warn!(
+            post_id = id,
+            error = %error,
+            "could not remove finalized pending post"
+        );
     }
 }
 
@@ -315,8 +418,21 @@ fn failure_reason(failed_pages: usize, failures: &[PostFailure]) -> String {
     reasons.join("; ")
 }
 
+struct PreparedPost {
+    archived: ArchivedPost,
+    pending_path: PathBuf,
+    links: Vec<PendingLink>,
+}
+
+#[derive(Clone)]
+struct JournalPostContext {
+    journal: String,
+    id_set: HashSet<u64>,
+    link_base_url: Url,
+}
+
 enum JournalPostOutcome {
-    Archived(ArchivedPost),
+    Prepared(PreparedPost),
     Skipped(ArchivedPost),
     Failed(PostFailure),
 }
@@ -809,6 +925,125 @@ mod tests {
             !post.contains("news.livejournal.com/166512.html"),
             "got: {post}"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_bulk_link_target_stays_external() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/news/1.html">One</a><a href="/news/2.html">Two</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                r#"<p><a href="https://news.livejournal.com/2.html">Post two</a></p>"#,
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let options = journal_cli(&server, dir.path(), false).options();
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.failed, 1);
+        let post_path = dir.path().join("out/posts/1.adoc");
+        assert!(post_path.exists());
+        assert!(!dir.path().join("out/posts/2.adoc").exists());
+        let post = std::fs::read_to_string(post_path).unwrap();
+        assert!(
+            post.contains("https://news.livejournal.com/2.html[Post two]"),
+            "got: {post}"
+        );
+        assert!(!post.contains("xref:2.adoc"), "got: {post}");
+        assert!(!post.contains("lj-archiver-link"), "got: {post:?}");
+
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert!(index.contains("xref:posts/1.adoc"), "got: {index}");
+        assert!(!index.contains("xref:posts/2.adoc"), "got: {index}");
+        let pending_files: Vec<_> = std::fs::read_dir(dir.path().join("out/posts"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.extension().and_then(|extension| extension.to_str()) == Some("pending"))
+                    .then_some(path)
+            })
+            .collect();
+        assert!(pending_files.is_empty(), "got: {pending_files:?}");
+    }
+
+    #[tokio::test]
+    async fn resume_repairs_xrefs_to_missing_failed_posts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/news/1.html">One</a><a href="/news/2.html">Two</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let existing = dir.path().join("out/posts/1.adoc");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, "= Existing\n\nxref:2.adoc[Post two]\n").unwrap();
+        let options = journal_cli(&server, dir.path(), true).options();
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.failed, 1);
+        let repaired = std::fs::read_to_string(existing).unwrap();
+        assert_eq!(
+            repaired,
+            "= Existing\n\nhttps://news.livejournal.com/2.html[Post two]\n"
+        );
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert!(
+            index.contains("xref:posts/1.adoc[Existing]"),
+            "got: {index}"
+        );
+        assert!(!index.contains("xref:posts/2.adoc"), "got: {index}");
     }
 
     fn test_cli(

@@ -47,6 +47,32 @@ impl Archive {
         Ok(path)
     }
 
+    pub fn write_pending_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
+        let path = self.root.join("posts").join(format!("{id}.pending"));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| LjError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        storage::write_atomic(&path, contents.as_bytes())?;
+        Ok(path)
+    }
+
+    pub fn read_pending_post(&self, path: &Path) -> Result<String> {
+        fs::read_to_string(path).map_err(|source| LjError::Read {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    pub fn remove_pending_post(&self, path: &Path) -> Result<()> {
+        fs::remove_file(path).map_err(|source| LjError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
     pub fn write_index(&self, posts: &[ArchivedPost]) -> Result<PathBuf> {
         self.ensure_root()?;
         let mut contents = format!("= {} Archive\n\n", self.journal);
@@ -279,5 +305,39 @@ mod tests {
             std::fs::read_to_string(path).unwrap(),
             "= news Archive\n:doctype: book\n:toc:\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166512.adoc[leveloffset=+1]\n"
         );
+    }
+
+    #[test]
+    fn pending_posts_round_trip_and_cleanup() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+
+        let path = archive.write_pending_post(1, "first pending body").unwrap();
+
+        assert_eq!(
+            path.parent(),
+            Some(dir.path().join("archive/posts").as_path())
+        );
+        assert_ne!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("adoc")
+        );
+        assert_eq!(
+            archive.read_pending_post(&path).unwrap(),
+            "first pending body"
+        );
+        assert!(!archive.post_path(1).exists());
+
+        let replacement = archive
+            .write_pending_post(1, "second pending body")
+            .unwrap();
+        assert_eq!(replacement, path);
+        assert_eq!(
+            archive.read_pending_post(&path).unwrap(),
+            "second pending body"
+        );
+
+        archive.remove_pending_post(&path).unwrap();
+        assert!(!path.exists());
     }
 }
