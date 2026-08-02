@@ -179,7 +179,7 @@ impl App {
                 "selected folder contains archive for {existing_journal}, not requested journal {requested_journal}"
             ));
         }
-        let resume = existing_journal.is_some() && folder_has_existing_posts(&folder);
+        let resume = existing_journal.is_some() && folder_has_existing_posts(&folder)?;
         let options = RunOptions {
             output_dir: Some(folder),
             include_comments: self.config.include_comments,
@@ -197,8 +197,17 @@ impl App {
 
 fn archive_journal(folder: &Path) -> Result<Option<String>, String> {
     let index = folder.join("index.adoc");
-    let has_posts = folder_has_existing_posts(folder);
-    if !index.exists() && !has_posts {
+    let has_posts = folder_has_existing_posts(folder)?;
+    let has_index = match std::fs::metadata(&index) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "archive identity cannot be verified: could not inspect index.adoc: {error}"
+            ));
+        }
+    };
+    if !has_index && !has_posts {
         return Ok(None);
     }
 
@@ -221,14 +230,32 @@ fn archive_journal(folder: &Path) -> Result<Option<String>, String> {
     Ok(Some(journal.to_string()))
 }
 
-/// True when `folder/posts/` already contains at least one `.adoc` file.
-pub fn folder_has_existing_posts(folder: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(folder.join("posts")) else {
-        return false;
+/// Whether `folder/posts/` already contains at least one `.adoc` file.
+pub fn folder_has_existing_posts(folder: &Path) -> Result<bool, String> {
+    let entries = match std::fs::read_dir(folder.join("posts")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "archive identity cannot be verified: could not inspect posts folder: {error}"
+            ));
+        }
     };
-    entries
-        .flatten()
-        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "adoc"))
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "archive identity cannot be verified: could not inspect posts folder entry: {error}"
+            )
+        })?;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "adoc")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -402,11 +429,11 @@ mod tests {
     #[test]
     fn detects_existing_posts_for_resume() {
         let dir = tempdir().unwrap();
-        assert!(!folder_has_existing_posts(dir.path()));
+        assert!(!folder_has_existing_posts(dir.path()).unwrap());
         let posts = dir.path().join("posts");
         std::fs::create_dir_all(&posts).unwrap();
         std::fs::write(posts.join("166511.adoc"), "= T\n").unwrap();
-        assert!(folder_has_existing_posts(dir.path()));
+        assert!(folder_has_existing_posts(dir.path()).unwrap());
     }
 
     #[test]
@@ -492,5 +519,32 @@ mod tests {
 
         let (_, options) = app.run_request().unwrap().unwrap();
         assert!(!options.resume);
+    }
+
+    #[test]
+    fn selected_output_file_is_rejected_when_inspection_fails() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("output");
+        std::fs::write(&output, "not a directory\n").unwrap();
+
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("news".to_string()));
+        app.update_state(&Message::FolderChosen(Some(output)));
+
+        let error = app.run_request().unwrap_err();
+        assert!(error.contains("archive identity cannot be verified"));
+    }
+
+    #[test]
+    fn posts_file_is_rejected_when_inspection_fails() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("posts"), "not a directory\n").unwrap();
+
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("news".to_string()));
+        app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
+
+        let error = app.run_request().unwrap_err();
+        assert!(error.contains("archive identity cannot be verified"));
     }
 }
