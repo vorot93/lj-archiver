@@ -7,6 +7,12 @@ use crate::error::{LjError, Result};
 
 const MAX_PAGE_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone)]
+pub struct FetchedPage {
+    pub final_url: Url,
+    pub text: String,
+}
+
 #[derive(Clone)]
 pub struct LjClient {
     client: reqwest::Client,
@@ -27,16 +33,22 @@ impl LjClient {
     }
 
     pub async fn fetch_text(&self, url: &Url) -> Result<String> {
-        self.fetch_text_capped(url, MAX_PAGE_BYTES).await
+        Ok(self.fetch_page(url).await?.text)
     }
 
-    async fn fetch_text_capped(&self, url: &Url, max_bytes: usize) -> Result<String> {
+    pub async fn fetch_page(&self, url: &Url) -> Result<FetchedPage> {
+        self.fetch_page_capped(url, MAX_PAGE_BYTES).await
+    }
+
+    async fn fetch_page_capped(&self, url: &Url, max_bytes: usize) -> Result<FetchedPage> {
         let mut last_error = None;
         for attempt in 0..=self.retries {
             match self.client.get(url.clone()).send().await {
                 Ok(response) if response.status().is_success() => {
                     let mut response = response;
+                    let final_url = response.url().clone();
                     let mut bytes = Vec::new();
+                    let mut body_error = None;
                     loop {
                         match response.chunk().await {
                             Ok(Some(chunk)) => {
@@ -50,14 +62,22 @@ impl LjClient {
                             }
                             Ok(None) => break,
                             Err(source) => {
-                                return Err(LjError::Http {
-                                    url: url.to_string(),
-                                    source,
-                                });
+                                body_error = Some(source);
+                                break;
                             }
                         }
                     }
-                    return Ok(String::from_utf8_lossy(&bytes).into_owned());
+                    if let Some(source) = body_error {
+                        last_error = Some(source);
+                        if attempt < self.retries {
+                            sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
+                        }
+                        continue;
+                    }
+                    return Ok(FetchedPage {
+                        final_url,
+                        text: String::from_utf8_lossy(&bytes).into_owned(),
+                    });
                 }
                 Ok(response) if response.status().is_server_error() && attempt < self.retries => {
                     sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
@@ -86,10 +106,89 @@ impl LjClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+        time::Instant,
+    };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    fn interrupted_body_server() -> (Url, thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/interrupted.html",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut requests = 0;
+
+            while requests < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0; 1024];
+                        stream.read(&mut request).unwrap();
+                        requests += 1;
+                        let response = if requests == 1 {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nab"
+                                .as_slice()
+                        } else {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                                .as_slice()
+                        };
+                        stream.write_all(response).unwrap();
+                        stream.flush().unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+
+            requests
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn fetch_page_reports_final_redirect_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/final"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/final"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let client = LjClient::new(None).unwrap();
+        let start = Url::parse(&format!("{}/start", server.uri())).unwrap();
+        let page = client.fetch_page(&start).await.unwrap();
+
+        assert_eq!(page.final_url.path(), "/final");
+        assert_eq!(page.text, "ok");
+    }
+
+    #[tokio::test]
+    async fn retries_interrupted_body_from_empty_buffer() {
+        let (url, server) = interrupted_body_server();
+        let client = LjClient::new(None).unwrap();
+
+        let text = client.fetch_text(&url).await.unwrap();
+
+        assert_eq!(text, "hello");
+        assert_eq!(server.join().unwrap(), 2);
+    }
 
     #[tokio::test]
     async fn sends_no_user_agent_and_no_cookie_to_non_livejournal_host() {
@@ -210,7 +309,7 @@ mod tests {
             .await;
         let client = LjClient::new(None).unwrap();
         let err = client
-            .fetch_text_capped(
+            .fetch_page_capped(
                 &Url::parse(&format!("{}/big.html", server.uri())).unwrap(),
                 10,
             )
