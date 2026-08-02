@@ -142,7 +142,8 @@ pub(crate) fn sanitize_xref_label(value: &str) -> String {
 }
 
 fn escape_attribute_value(value: &str) -> String {
-    value.replace(['\r', '\n'], " ")
+    let normalized = value.replace(['\r', '\n'], " ");
+    neutralize_plain_adoc_fragment_at_line_start(&normalized, false)
 }
 
 pub fn html_to_adoc(html: &str) -> String {
@@ -762,6 +763,8 @@ mod tests {
     use crate::links::LinkRewriter;
     use std::collections::HashSet;
     use url::Url;
+
+    const USER_FRAGMENT: &str = "image:evil.png[] xref:1.adoc[x] {secret}";
 
     #[test]
     fn converts_basic_inline_html() {
@@ -1415,6 +1418,16 @@ mod tests {
     }
 
     #[test]
+    fn neutralizes_inline_macros_and_attribute_references_in_link_labels() {
+        let html = format!(r#"<p><a href="https://example.test/path">{USER_FRAGMENT}</a></p>"#);
+
+        assert_eq!(
+            html_to_adoc(&html),
+            "https://example.test/path[\\image:evil.png \\xref:1.adoc x \\{secret}]\n\n"
+        );
+    }
+
+    #[test]
     fn sanitizes_link_macro_targets() {
         let html = r#"<p><a href="https://example.com/?tags[]=x">tagged</a></p>"#;
         assert_eq!(
@@ -1483,6 +1496,16 @@ mod tests {
     }
 
     #[test]
+    fn neutralizes_attribute_references_in_image_labels_without_escaping_normalized_non_macros() {
+        let html = format!(r#"<p><img src="safe.png" alt="{USER_FRAGMENT}"></p>"#);
+
+        assert_eq!(
+            html_to_adoc(&html),
+            "image::safe.png[image:evil.png xref:1.adoc x \\{secret}]\n\n"
+        );
+    }
+
+    #[test]
     fn sanitizes_image_macro_targets() {
         let html = r#"<p><img src="../assets/foo[1].jpg" alt="x"></p>"#;
         assert_eq!(html_to_adoc(html), "image::../assets/foo%5B1%5D.jpg[x]\n\n");
@@ -1525,6 +1548,46 @@ mod tests {
 
         assert!(!adoc.lines().any(|line| line == "include::secret[]"));
         assert!(adoc.contains(r"\include::secret[]"));
+    }
+
+    #[test]
+    fn neutralizes_inline_macros_and_attribute_references_in_plain_text() {
+        assert_eq!(
+            html_to_adoc("<p>image:evil.png[] xref:1.adoc[x] {secret}</p>"),
+            "\\image:evil.png[] \\xref:1.adoc[x] \\{secret}\n\n"
+        );
+    }
+
+    #[test]
+    fn does_not_double_escape_inline_macros_or_attribute_references() {
+        assert_eq!(
+            html_to_adoc(r"<p>\image:evil.png[] \xref:1.adoc[x] \{secret}</p>"),
+            "\\image:evil.png[] \\xref:1.adoc[x] \\{secret}\n\n"
+        );
+    }
+
+    #[test]
+    fn keeps_malformed_inline_macro_and_attribute_reference_shapes_unchanged() {
+        assert_eq!(
+            html_to_adoc("<p>image:evil.png {secret {bad space}</p>"),
+            "image:evil.png {secret {bad space}\n\n"
+        );
+    }
+
+    #[test]
+    fn neutralizes_arbitrary_valid_inline_macro_names_at_token_boundaries() {
+        assert_eq!(
+            html_to_adoc("<p>extension.name:target[]</p>"),
+            "\\extension.name:target[]\n\n"
+        );
+    }
+
+    #[test]
+    fn keeps_inline_macro_names_embedded_after_name_bytes_unchanged() {
+        assert_eq!(
+            html_to_adoc("<p>9image:evil.png[]</p>"),
+            "9image:evil.png[]\n\n"
+        );
     }
 
     #[test]
@@ -1852,10 +1915,10 @@ mod tests {
     }
 
     #[test]
-    fn keeps_pass_like_text_inside_larger_words() {
-        let adoc = html_to_adoc("<p>before compass:q[x] after</p>");
+    fn keeps_pass_substrings_inside_larger_words_without_a_macro_shape() {
+        let adoc = html_to_adoc("<p>before compass:q after</p>");
 
-        assert!(adoc.contains("before compass:q[x] after"));
+        assert!(adoc.contains("before compass:q after"));
     }
 
     #[test]
@@ -2381,6 +2444,40 @@ mod tests {
         );
         assert!(!rendered.contains("=== pass:[author]"));
         assert!(!rendered.contains("Subject pass:[subject]"));
+    }
+
+    #[test]
+    fn neutralizes_inline_macros_and_attribute_references_in_post_titles() {
+        let mut post = test_post_with_comments(vec![]);
+        post.title = USER_FRAGMENT.to_string();
+
+        let rendered = render_post(&post, false, None);
+
+        assert!(rendered.starts_with("= \\image:evil.png[] \\xref:1.adoc[x] \\{secret}\n\n"));
+    }
+
+    #[test]
+    fn neutralizes_inline_macros_and_attribute_references_in_post_attributes() {
+        let mut post = test_post_with_comments(vec![]);
+        post.author = USER_FRAGMENT.to_string();
+
+        let rendered = render_post(&post, false, None);
+
+        assert!(rendered.contains(":lj-author: \\image:evil.png[] \\xref:1.adoc[x] \\{secret}\n"));
+    }
+
+    #[test]
+    fn neutralizes_inline_macros_and_attribute_references_in_comment_headings() {
+        let mut comment = test_comment(0, false);
+        comment.author = USER_FRAGMENT.to_string();
+        comment.subject = Some(USER_FRAGMENT.to_string());
+        let post = test_post_with_comments(vec![comment]);
+
+        let rendered = render_post(&post, true, None);
+
+        assert!(rendered.contains(
+            "=== \\image:evil.png[] \\xref:1.adoc[x] \\{secret}, 2024-12-17T17:02:00Z - \\image:evil.png[] \\xref:1.adoc[x] \\{secret}\n"
+        ));
     }
 
     #[test]

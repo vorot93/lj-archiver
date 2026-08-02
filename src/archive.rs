@@ -204,6 +204,26 @@ mod tests {
     }
 
     #[test]
+    fn keeps_generated_index_xref_active_while_neutralizing_user_title_syntax() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        archive
+            .write_index(&[ArchivedPost {
+                id: 1,
+                title: "image:evil.png[] xref:1.adoc[x] {secret}".to_string(),
+                path: PathBuf::from("posts/1.adoc"),
+            }])
+            .unwrap();
+
+        let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
+        let row = index.lines().find(|line| line.starts_with("|1 ")).unwrap();
+        assert_eq!(
+            row,
+            "|1 |xref:posts/1.adoc[image:evil.png xref:1.adoc x \\{secret}]"
+        );
+    }
+
+    #[test]
     fn writes_index_paths_relative_to_archive_root() {
         let dir = tempdir().unwrap();
         let archive = Archive::new(dir.path().join("archive"), "news");

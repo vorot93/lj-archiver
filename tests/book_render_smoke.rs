@@ -80,3 +80,72 @@ fn book_media_resolves_to_archive_root_asset() {
         emitted_asset_path.display()
     );
 }
+
+#[test]
+#[ignore = "requires asciidoctor; exercised explicitly by CI"]
+fn plain_text_cannot_create_asciidoc_macros_or_expand_attributes() {
+    let dir = tempdir().unwrap();
+    let adoc = format!(
+        ":secret: EXPANDED\n\n{}",
+        lj_archiver::adoc::html_to_adoc("<p>image:evil.png[] xref:1.adoc[x] {secret}</p>")
+    );
+    fs::write(dir.path().join("plain-text.adoc"), adoc).unwrap();
+
+    let output = Command::new("asciidoctor")
+        .arg("--embedded")
+        .arg("plain-text.adoc")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "asciidoctor failed:\nstdout excerpt: {}\nstderr excerpt: {}",
+        bounded_diagnostic(&output.stdout),
+        bounded_diagnostic(&output.stderr)
+    );
+
+    let html = fs::read_to_string(dir.path().join("plain-text.html")).unwrap();
+    assert!(
+        html.contains("image:evil.png[]"),
+        "literal image macro was not visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        html.contains("xref:1.adoc[x]"),
+        "literal xref macro was not visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        html.contains("{secret}"),
+        "literal attribute reference was not visible; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.match_indices("<img").any(|(start, _)| html[start..]
+            .split_once('>')
+            .is_some_and(|(tag, _)| tag.contains("evil.png"))),
+        "plain text created an evil.png image; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html
+            .match_indices("<a")
+            .any(
+                |(start, _)| html[start..].split_once('>').is_some_and(|(tag, _)| {
+                    tag.contains("href=\"1.adoc") || tag.contains("href=\"1.html")
+                })
+            ),
+        "plain text created a link to 1.adoc; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains(">x</a>"),
+        "plain text created an xref label; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+    assert!(
+        !html.contains("EXPANDED"),
+        "plain text expanded an AsciiDoc attribute; HTML excerpt:\n{}",
+        bounded_diagnostic(html.as_bytes())
+    );
+}

@@ -44,7 +44,124 @@ pub(crate) fn neutralize_active_adoc_lines(text: &str) -> String {
 }
 
 fn neutralize_inline_adoc_syntax(text: &str) -> String {
-    neutralize_inline_passthrough_delimiters(&neutralize_inline_passthrough_macros(text))
+    let text = neutralize_inline_attribute_references(text);
+    let text = neutralize_inline_passthrough_macros(&text);
+    let text = neutralize_inline_macros(&text);
+    neutralize_inline_passthrough_delimiters(&text)
+}
+
+fn neutralize_inline_attribute_references(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::new();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'{'
+            && !is_immediately_escaped(bytes, cursor)
+            && is_attribute_reference_at(bytes, cursor)
+        {
+            output.push('\\');
+        }
+
+        let character = text[cursor..]
+            .chars()
+            .next()
+            .expect("cursor should remain on a character boundary");
+        output.push(character);
+        cursor += character.len_utf8();
+    }
+
+    output
+}
+
+fn is_attribute_reference_at(bytes: &[u8], start: usize) -> bool {
+    let Some(first) = bytes.get(start + 1) else {
+        return false;
+    };
+    if !is_attribute_name_start(*first) {
+        return false;
+    }
+
+    let mut cursor = start + 2;
+    while let Some(byte) = bytes.get(cursor) {
+        if *byte == b'}' {
+            return true;
+        }
+        if !is_attribute_name_byte(*byte) {
+            return false;
+        }
+        cursor += 1;
+    }
+
+    false
+}
+
+fn is_attribute_name_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_attribute_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+}
+
+fn neutralize_inline_macros(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::new();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor].is_ascii_alphabetic()
+            && is_inline_macro_token_boundary(bytes, cursor)
+            && is_inline_macro_at(bytes, cursor)
+            && !is_immediately_escaped(bytes, cursor)
+        {
+            output.push('\\');
+        }
+
+        let character = text[cursor..]
+            .chars()
+            .next()
+            .expect("cursor should remain on a character boundary");
+        output.push(character);
+        cursor += character.len_utf8();
+    }
+
+    output
+}
+
+fn is_inline_macro_token_boundary(bytes: &[u8], start: usize) -> bool {
+    start == 0
+        || !bytes[start - 1].is_ascii_alphanumeric()
+            && !matches!(bytes[start - 1], b'_' | b'.' | b'-')
+}
+
+fn is_inline_macro_at(bytes: &[u8], start: usize) -> bool {
+    let mut cursor = start + 1;
+    while matches!(bytes.get(cursor), Some(byte) if is_adoc_macro_name_byte(*byte)) {
+        cursor += 1;
+    }
+
+    if bytes.get(cursor) != Some(&b':') {
+        return false;
+    }
+
+    let target_start = cursor + 1;
+    cursor = target_start;
+    while let Some(byte) = bytes.get(cursor) {
+        if *byte == b'[' {
+            return cursor > target_start;
+        }
+        if byte.is_ascii_whitespace() {
+            return false;
+        }
+        cursor += 1;
+    }
+
+    false
+}
+
+fn is_immediately_escaped(bytes: &[u8], start: usize) -> bool {
+    start > 0 && bytes[start - 1] == b'\\'
 }
 
 fn neutralize_inline_passthrough_macros(text: &str) -> String {
@@ -252,9 +369,10 @@ pub(crate) fn should_preserve_unwrapped_inline_output(text: &str) -> bool {
 }
 
 pub(crate) fn sanitize_macro_label(text: &str) -> String {
-    normalize_inline_text(&text.replace(['[', ']', '\n', '\r'], " "))
+    let normalized = normalize_inline_text(&text.replace(['[', ']', '\n', '\r'], " "))
         .trim()
-        .to_string()
+        .to_string();
+    neutralize_plain_adoc_fragment_at_line_start(&normalized, false)
 }
 
 pub(crate) fn sanitize_macro_target(text: &str) -> String {
