@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::path::Path;
 use tempfile::tempdir;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -304,4 +305,163 @@ async fn cli_without_book_flag_writes_no_book_adoc() {
         .success();
 
     assert!(!dir.path().join("out/book.adoc").exists());
+}
+
+#[tokio::test]
+async fn cli_archive_updates_preserve_the_full_manifest_without_a_book() {
+    assert_cross_run_archive_updates(false).await;
+}
+
+#[tokio::test]
+async fn cli_archive_updates_regenerate_a_preexisting_book() {
+    assert_cross_run_archive_updates(true).await;
+}
+
+async fn assert_cross_run_archive_updates(initial_book: bool) {
+    let initial_server = MockServer::start().await;
+    mount_journal(&initial_server, &[(1, "One Original"), (2, "Two Original")]).await;
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("out");
+
+    let mut initial = archive_command(&initial_server, &output);
+    if initial_book {
+        initial.arg("--book");
+    }
+    initial.arg("news").assert().success();
+
+    let post_one = std::fs::read_to_string(output.join("posts/1.adoc")).unwrap();
+    let original_post_two = std::fs::read_to_string(output.join("posts/2.adoc")).unwrap();
+
+    let update_server = MockServer::start().await;
+    mount_post(&update_server, 2, "Two Updated").await;
+    archive_command(&update_server, &output)
+        .arg(format!("{}/news/2.html", update_server.uri()))
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(output.join("posts/1.adoc")).unwrap(),
+        post_one
+    );
+    let updated_post_two = std::fs::read_to_string(output.join("posts/2.adoc")).unwrap();
+    assert_ne!(updated_post_two, original_post_two);
+    assert!(
+        updated_post_two.contains("= Two Updated"),
+        "{updated_post_two}"
+    );
+
+    let addition_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/3.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(post_html_with_body(
+                3,
+                "Three Added",
+                r#"<p><a href="https://news.livejournal.com/1.html">Post one</a></p>"#,
+            )),
+        )
+        .mount(&addition_server)
+        .await;
+    archive_command(&addition_server, &output)
+        .arg(format!("{}/news/3.html", addition_server.uri()))
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(output.join("posts/1.adoc")).unwrap(),
+        post_one
+    );
+    assert_eq!(
+        std::fs::read_to_string(output.join("posts/2.adoc")).unwrap(),
+        updated_post_two
+    );
+    let post_three = std::fs::read_to_string(output.join("posts/3.adoc")).unwrap();
+    assert!(post_three.contains("= Three Added"), "{post_three}");
+    assert!(post_three.contains("xref:1.adoc[Post one]"), "{post_three}");
+
+    assert_eq!(
+        std::fs::read_to_string(output.join("index.adoc")).unwrap(),
+        concat!(
+            "= news Archive\n\n",
+            "|===\n|Post ID |Title\n\n",
+            "|1 |xref:posts/1.adoc[One Original]\n",
+            "|2 |xref:posts/2.adoc[Two Updated]\n",
+            "|3 |xref:posts/3.adoc[Three Added]\n",
+            "|===\n",
+        )
+    );
+
+    let book_path = output.join("book.adoc");
+    if initial_book {
+        assert_eq!(
+            std::fs::read_to_string(book_path).unwrap(),
+            concat!(
+                "= news Archive\n",
+                ":doctype: book\n",
+                ":toc:\n",
+                ":imagesdir: posts\n",
+                ":lj-archiver-post-link-prefix: posts/\n\n",
+                "include::index.adoc[leveloffset=+1]\n",
+                "\ninclude::posts/1.adoc[leveloffset=+1]\n",
+                "\ninclude::posts/2.adoc[leveloffset=+1]\n",
+                "\ninclude::posts/3.adoc[leveloffset=+1]\n",
+            )
+        );
+    } else {
+        assert!(!book_path.exists());
+    }
+}
+
+fn archive_command(server: &MockServer, output: &Path) -> Command {
+    let mut command = Command::cargo_bin("lj-archiver").unwrap();
+    command
+        .arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(output)
+        .arg("--no-media");
+    command
+}
+
+async fn mount_journal(server: &MockServer, posts: &[(u64, &str)]) {
+    Mock::given(method("GET"))
+        .and(path("/news/calendar"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#))
+        .mount(server)
+        .await;
+    let links = posts
+        .iter()
+        .map(|(id, title)| format!(r#"<a href="/news/{id}.html">{title}</a>"#))
+        .collect::<String>();
+    Mock::given(method("GET"))
+        .and(path("/2024/12/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(links))
+        .mount(server)
+        .await;
+    for &(id, title) in posts {
+        mount_post(server, id, title).await;
+    }
+}
+
+async fn mount_post(server: &MockServer, id: u64, title: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/news/{id}.html")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(post_html(id, title)))
+        .mount(server)
+        .await;
+}
+
+fn post_html(id: u64, title: &str) -> String {
+    post_html_with_body(id, title, &format!("<p>Body for {title}.</p>"))
+}
+
+fn post_html_with_body(id: u64, title: &str, body: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<article class="lj-post" data-journal="news" data-itemid="{id}">
+  <h1 class="entry-title">{title}</h1>
+  <a class="entry-author" href="https://news.livejournal.com/">news</a>
+  <div class="entry-content">{body}</div>
+</article>"#
+    )
 }

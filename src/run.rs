@@ -1,7 +1,7 @@
 use crate::{
     Result,
     adoc::render_post,
-    archive::Archive,
+    archive::{Archive, ExistingArchive},
     cli::Cli,
     client::LjClient,
     discover::discover_post_ids,
@@ -14,7 +14,10 @@ use crate::{
     target::{journals_alias, parse_target, post_ref_from_url, post_url},
 };
 use futures::{StreamExt, stream};
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 use url::Url;
 
 /// The result of a completed archive run. `Ok(RunOutcome)` means the run wrote
@@ -70,17 +73,30 @@ async fn archive_post(
     id: u64,
     url: Url,
 ) -> Result<RunOutcome> {
-    progress.single_started(id);
-    let client = LjClient::new(options.user_agent.as_deref())?;
     let root = output_dir(options, &journal);
     let archive = Archive::new(root.clone(), &journal);
-    let post = fetch_and_write_post(&client, options, &archive, &journal, id, &url).await?;
+    let existing = archive.inspect_existing()?;
+    let generate_book =
+        options.generate_book || existing.as_ref().is_some_and(|existing| existing.has_book);
+    let mut posts = posts_by_id(existing.as_ref());
+    let mut candidate_ids = posts.keys().copied().collect::<HashSet<_>>();
+    candidate_ids.insert(id);
+
+    progress.single_started(id);
+    let client = LjClient::new(options.user_agent.as_deref())?;
+    let post = fetch_and_write_post(
+        &client,
+        options,
+        &archive,
+        &journal,
+        id,
+        &url,
+        candidate_ids,
+    )
+    .await?;
     progress.single_done(post.id, &post.path);
-    let posts = [post];
-    archive.write_index(&posts)?;
-    if options.generate_book {
-        archive.write_book(&posts)?;
-    }
+    posts.insert(post.id, post);
+    write_manifests(&archive, &posts, generate_book)?;
 
     Ok(RunOutcome {
         root,
@@ -120,18 +136,24 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     writer: &W,
 ) -> Result<RunOutcome> {
     let start = std::time::Instant::now();
-    let client = LjClient::new(options.user_agent.as_deref())?;
     let root = output_dir(options, &journal);
     let archive = Archive::new(root.clone(), journal.clone());
+    let existing = archive.inspect_existing()?;
+    let generate_book =
+        options.generate_book || existing.as_ref().is_some_and(|existing| existing.has_book);
+    let mut posts = posts_by_id(existing.as_ref());
+    let client = LjClient::new(options.user_agent.as_deref())?;
 
     progress.discovery_started();
     let (ids, failed_pages) =
         discover_post_ids(&client, &journal, &options.base_url, progress).await?;
     progress.archiving_started(ids.len());
 
+    let mut candidate_ids = posts.keys().copied().collect::<HashSet<_>>();
+    candidate_ids.extend(ids.iter().copied());
     let journal_context = JournalPostContext {
         journal: journal.clone(),
-        id_set: ids.iter().copied().collect(),
+        id_set: candidate_ids,
     };
 
     let outcomes: Vec<_> = stream::iter(ids)
@@ -166,6 +188,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     }
 
     let mut finalized = Vec::new();
+    let mut archived = 0usize;
     let no_local_ids = HashSet::new();
     for mut post in prepared {
         let first_stage = archive
@@ -179,6 +202,8 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
             Ok(path) => {
                 post.archived.path = path;
                 progress.post_done(post.archived.id, &post.archived.title);
+                posts.insert(post.archived.id, post.archived.clone());
+                archived += 1;
                 finalized.push(post);
             }
             Err(error) => {
@@ -193,11 +218,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         }
     }
 
-    let final_ids: HashSet<u64> = finalized
-        .iter()
-        .map(|post| post.archived.id)
-        .chain(skipped_posts.iter().map(|post| post.id))
-        .collect();
+    let final_ids = posts.keys().copied().collect::<HashSet<_>>();
 
     for post in &finalized {
         match archive.read_pending_post(&post.pending_path) {
@@ -255,14 +276,8 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
 
     progress.archiving_finished();
 
-    let mut posts = skipped_posts;
-    posts.extend(finalized.into_iter().map(|post| post.archived));
-    posts.sort_by_key(|post| post.id);
     failures.sort_by_key(|failure| failure.id);
-    archive.write_index(&posts)?;
-    if options.generate_book {
-        archive.write_book(&posts)?;
-    }
+    write_manifests(&archive, &posts, generate_book)?;
 
     for failure in &failures {
         eprintln!(
@@ -271,7 +286,6 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         );
     }
 
-    let archived = posts.len() - skipped;
     progress.summary(archived, skipped, failures.len(), start.elapsed());
 
     Ok(RunOutcome {
@@ -377,6 +391,27 @@ fn archived_post_title(archive: &Archive, id: u64) -> Option<String> {
     (!title.is_empty()).then(|| title.to_string())
 }
 
+fn posts_by_id(existing: Option<&ExistingArchive>) -> BTreeMap<u64, ArchivedPost> {
+    existing
+        .into_iter()
+        .flat_map(|existing| existing.posts.iter().cloned())
+        .map(|post| (post.id, post))
+        .collect()
+}
+
+fn write_manifests(
+    archive: &Archive,
+    posts: &BTreeMap<u64, ArchivedPost>,
+    generate_book: bool,
+) -> Result<()> {
+    let posts = posts.values().cloned().collect::<Vec<_>>();
+    archive.write_index(&posts)?;
+    if generate_book {
+        archive.write_book(&posts)?;
+    }
+    Ok(())
+}
+
 async fn fetch_and_write_post(
     client: &LjClient,
     options: &RunOptions,
@@ -384,15 +419,12 @@ async fn fetch_and_write_post(
     requested_journal: &str,
     requested_id: u64,
     requested_url: &Url,
+    candidate_ids: HashSet<u64>,
 ) -> Result<ArchivedPost> {
     let mut post =
         fetch_requested_post(client, requested_journal, requested_id, requested_url).await?;
     rewrite_post_media(&mut post, options, archive).await?;
-    let rewriter = LinkRewriter::new(
-        requested_journal,
-        HashSet::from([requested_id]),
-        post.url.clone(),
-    );
+    let rewriter = LinkRewriter::new(requested_journal, candidate_ids, post.url.clone());
     let rendered = render_post(&post, options.include_comments, Some(&rewriter));
     let path = archive.write_post(requested_id, &rendered)?;
 
@@ -1241,9 +1273,12 @@ mod tests {
             .await;
 
         let dir = tempdir().unwrap();
+        seed_existing_archive(
+            dir.path(),
+            &[(166511, "Existing", "= Existing\n\nBody\n")],
+            false,
+        );
         let existing_post = dir.path().join("out/posts/166511.adoc");
-        std::fs::create_dir_all(existing_post.parent().unwrap()).unwrap();
-        std::fs::write(&existing_post, "= Existing\n\nBody\n").unwrap();
         let cli = journal_cli(&server, dir.path(), true);
 
         run(cli).await.unwrap();
@@ -1409,6 +1444,160 @@ mod tests {
         assert!(outcome.failures.iter().any(|f| f.id == 166512));
         assert_eq!(outcome.journal.as_deref(), Some("news"));
         assert!(dir.path().join("out/posts/166511.adoc").exists());
+    }
+
+    #[tokio::test]
+    async fn partial_rediscovery_retains_baseline_manifests_counts_and_local_links() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/2024/12/">Old</a><a href="/2025/01/">Current</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2025/01/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/2.html">Two</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                r#"<p><a href="https://news.livejournal.com/1.html">Post one</a></p>"#,
+                "",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let baseline = "= Existing One\n\n:lj-id: 1\n\nOriginal body.\n";
+        seed_existing_archive(dir.path(), &[(1, "Existing One", baseline)], true);
+        let options = journal_cli(&server, dir.path(), false).options();
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let progress = Progress::channel(tx);
+
+        let outcome = run_archive("news", &options, &progress).await.unwrap();
+        drop(progress);
+        let events: Vec<_> = rx.collect().await;
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.failed_pages, 1);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/posts/1.adoc")).unwrap(),
+            baseline
+        );
+        let post_two = std::fs::read_to_string(dir.path().join("out/posts/2.adoc")).unwrap();
+        assert!(post_two.contains("xref:1.adoc[Post one]"), "{post_two}");
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert_eq!(index.matches("|1 |xref:posts/1.adoc").count(), 1, "{index}");
+        assert_eq!(index.matches("|2 |xref:posts/2.adoc").count(), 1, "{index}");
+        assert!(index.find("|1 |").unwrap() < index.find("|2 |").unwrap());
+        let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+        assert_eq!(book.matches("include::posts/1.adoc").count(), 1, "{book}");
+        assert_eq!(book.matches("include::posts/2.adoc").count(), 1, "{book}");
+        assert!(
+            book.find("include::posts/1.adoc").unwrap()
+                < book.find("include::posts/2.adoc").unwrap()
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::Summary {
+                    archived: 1,
+                    skipped: 0,
+                    failed: 0,
+                    ..
+                }
+            )
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProgressEvent::PostDone { id: 2, .. }))
+                .count(),
+            1
+        );
+        assert!(pending_post_paths(dir.path().join("out/posts")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn single_post_rejects_unverified_output_before_requests_or_writes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Should not be fetched.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("out");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("unverified.txt"), "unchanged").unwrap();
+        let options = test_cli(&server, dir.path(), "1", false, true).options();
+
+        let error = run_archive(
+            &format!("{}/news/1.html", server.uri()),
+            &options,
+            &Progress::hidden(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, LjError::InvalidArchive { .. }), "{error:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(output.join("unverified.txt")).unwrap(),
+            "unchanged"
+        );
+        assert!(!output.join("posts").exists());
+        assert!(!output.join("index.adoc").exists());
+        assert!(!output.join("book.adoc").exists());
+    }
+
+    #[tokio::test]
+    async fn journal_rejects_mismatched_output_before_requests_or_writes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("unused"))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("out");
+        std::fs::create_dir(&output).unwrap();
+        let mismatched_index = "= other Archive\n\n|===\n|Post ID |Title\n\n|===\n";
+        std::fs::write(output.join("index.adoc"), mismatched_index).unwrap();
+        let options = journal_cli(&server, dir.path(), false).options();
+
+        let error = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, LjError::InvalidArchive { .. }), "{error:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(output.join("index.adoc")).unwrap(),
+            mismatched_index
+        );
+        assert!(!output.join("posts").exists());
+        assert!(!output.join("book.adoc").exists());
     }
 
     #[test]
@@ -1722,6 +1911,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_refetch_retains_the_validated_baseline_entry_and_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<a href="/news/1.html">One</a><a href="/news/2.html">Two</a>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Replacement that must not become public.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/2.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "2",
+                r#"<p><a href="https://news.livejournal.com/1.html">Post one</a></p>"#,
+                "",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let baseline = "= Baseline One\n\n:lj-id: 1\n\nKeep me.\n";
+        seed_existing_archive(dir.path(), &[(1, "Baseline One", baseline)], true);
+        let options = journal_cli(&server, dir.path(), false).options();
+        let writer = InjectedFinalPostWriter::failing_on([(1, 1)]);
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let progress = Progress::channel(tx);
+
+        let outcome = archive_journal_with_writer(&options, &progress, "news".to_string(), &writer)
+            .await
+            .unwrap();
+        drop(progress);
+        let events: Vec<_> = rx.collect().await;
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].id, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/posts/1.adoc")).unwrap(),
+            baseline
+        );
+        let post_two = std::fs::read_to_string(dir.path().join("out/posts/2.adoc")).unwrap();
+        assert!(post_two.contains("xref:1.adoc[Post one]"), "{post_two}");
+        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
+        assert_eq!(index.matches("|1 |xref:posts/1.adoc").count(), 1, "{index}");
+        assert_eq!(index.matches("|2 |xref:posts/2.adoc").count(), 1, "{index}");
+        let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+        assert_eq!(book.matches("include::posts/1.adoc").count(), 1, "{book}");
+        assert_eq!(book.matches("include::posts/2.adoc").count(), 1, "{book}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProgressEvent::PostFailed { id: 1 }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::Summary {
+                    archived: 1,
+                    skipped: 0,
+                    failed: 1,
+                    ..
+                }
+            )
+        }));
+        assert!(pending_post_paths(dir.path().join("out/posts")).is_empty());
+    }
+
+    #[tokio::test]
     async fn upgrade_write_failure_retains_external_fallback_and_cleans_up() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1810,9 +2089,12 @@ mod tests {
             .await;
 
         let dir = tempdir().unwrap();
+        seed_existing_archive(
+            dir.path(),
+            &[(1, "Existing", "= Existing\n\nxref:2.adoc[Post two]\n")],
+            false,
+        );
         let existing = dir.path().join("out/posts/1.adoc");
-        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
-        std::fs::write(&existing, "= Existing\n\nxref:2.adoc[Post two]\n").unwrap();
         let options = journal_cli(&server, dir.path(), true).options();
 
         let outcome = run_archive("news", &options, &Progress::hidden())
@@ -1905,6 +2187,27 @@ mod tests {
             body_html: "<p>Body.</p>".to_string(),
             comments: Vec::new(),
         }
+    }
+
+    fn seed_existing_archive(
+        temp_dir: &std::path::Path,
+        posts: &[(u64, &str, &str)],
+        generate_book: bool,
+    ) -> Archive {
+        let archive = Archive::new(temp_dir.join("out"), "news");
+        let archived = posts
+            .iter()
+            .map(|&(id, title, contents)| ArchivedPost {
+                id,
+                title: title.to_string(),
+                path: archive.write_post(id, contents).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        archive.write_index(&archived).unwrap();
+        if generate_book {
+            archive.write_book(&archived).unwrap();
+        }
+        archive
     }
 
     fn asset_dir_entries(path: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
