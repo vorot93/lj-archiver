@@ -810,6 +810,43 @@ mod tests {
     }
 
     #[test]
+    fn raw_text_end_tag_prefix_requires_appropriate_boundary() {
+        let html = concat!(
+            "<script>const x = \"</scripture><table>fake</table>\";</script>",
+            "<table data-kind='real'><tr><td>real</td></tr></table>"
+        );
+        assert_eq!(
+            html_to_adoc(html),
+            concat!(
+                "----\n",
+                "const x = \"</scripture><table>fake</table>\";\n",
+                "----\n\n",
+                "++++\n",
+                "<table data-kind='real'><tr><td>real</td></tr></table>\n",
+                "++++\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn abrupt_comment_end_preserves_following_source_span() {
+        let html = "<!--><div data-kind='abrupt'>real</div>";
+        assert_eq!(
+            html_to_adoc(html),
+            "++++\n<div data-kind='abrupt'>real</div>\n++++\n\n"
+        );
+    }
+
+    #[test]
+    fn bang_comment_end_preserves_following_source_span() {
+        let html = "<!-- comment --!><div data-kind='bang'>real</div>";
+        assert_eq!(
+            html_to_adoc(html),
+            "++++\n<div data-kind='bang'>real</div>\n++++\n\n"
+        );
+    }
+
+    #[test]
     fn uses_safe_passthrough_delimiter_when_html_contains_default_delimiter() {
         let html = "<table><tr><td>before\n++++\nafter</td></tr></table>";
         let adoc = html_to_adoc(html);

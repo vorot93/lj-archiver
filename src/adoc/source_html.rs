@@ -161,9 +161,7 @@ fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<String>> {
         let start = search_start + relative_start;
 
         if source_html[start..].starts_with("<!--") {
-            search_start = source_html[start + 4..]
-                .find("-->")
-                .map_or(source_html.len(), |end| start + 4 + end + 3);
+            search_start = find_source_comment_end(source_html.as_bytes(), start + 4);
             continue;
         }
 
@@ -196,7 +194,7 @@ fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<String>> {
                 search_start = source_html.len();
             } else {
                 let closing_prefix = format!("</{raw_text_name}");
-                search_start = find_ascii_case_insensitive(
+                search_start = find_ascii_case_insensitive_tag_prefix(
                     source_html.as_bytes(),
                     tag.end,
                     closing_prefix.as_bytes(),
@@ -222,11 +220,48 @@ fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<String>> {
         .collect()
 }
 
-fn find_ascii_case_insensitive(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+/// Return the first byte after an HTML-tokenizer-recognized comment end. `>` and
+/// `->` are abrupt endings only in the two states immediately after `<!--`;
+/// `-->` and the parse-error form `--!>` end a comment from its body.
+fn find_source_comment_end(haystack: &[u8], content_start: usize) -> usize {
+    if haystack.get(content_start) == Some(&b'>') {
+        return content_start + 1;
+    }
+    if haystack.get(content_start..content_start + 2) == Some(b"->") {
+        return content_start + 2;
+    }
+
+    let mut cursor = content_start;
+
+    while cursor < haystack.len() {
+        if haystack.get(cursor..cursor + 3) == Some(b"-->") {
+            return cursor + 3;
+        }
+        if haystack.get(cursor..cursor + 4) == Some(b"--!>") {
+            return cursor + 4;
+        }
+        cursor += 1;
+    }
+
+    haystack.len()
+}
+
+fn find_ascii_case_insensitive_tag_prefix(
+    haystack: &[u8],
+    start: usize,
+    needle: &[u8],
+) -> Option<usize> {
     let mut cursor = start;
 
     while cursor + needle.len() <= haystack.len() {
-        if haystack[cursor..cursor + needle.len()].eq_ignore_ascii_case(needle) {
+        let candidate_end = cursor + needle.len();
+        let has_appropriate_boundary = matches!(
+            haystack.get(candidate_end),
+            Some(byte) if byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
+        );
+
+        if has_appropriate_boundary && haystack[cursor..candidate_end].eq_ignore_ascii_case(needle)
+        {
             return Some(cursor);
         }
         cursor += 1;
