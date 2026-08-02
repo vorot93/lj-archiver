@@ -1,3 +1,10 @@
+use crate::{
+    error::{LjError, Result},
+    models::MediaAsset,
+    storage,
+};
+use reqwest::header::LOCATION;
+use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -6,23 +13,12 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-
-use reqwest::header::LOCATION;
-use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 use url::{Host, Url};
-
-use crate::{
-    error::{LjError, Result},
-    models::MediaAsset,
-};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const MEDIA_DOWNLOAD_RETRIES: usize = 2;
 const MEDIA_REDIRECT_LIMIT: usize = 10;
 const MAX_MEDIA_BYTES: usize = 50 * 1024 * 1024;
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct RewrittenHtml {
     pub html: String,
@@ -311,16 +307,7 @@ async fn download_asset(
         source,
     })?;
 
-    let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = assets_dir.join(format!("{filename}.{unique}.tmp"));
-    fs::write(&tmp, bytes).map_err(|source| LjError::Write {
-        path: tmp.clone(),
-        source,
-    })?;
-    fs::rename(&tmp, &path).map_err(|source| LjError::Write {
-        path: path.clone(),
-        source,
-    })?;
+    storage::write_atomic(&path, &bytes)?;
 
     Ok(true)
 }
@@ -427,7 +414,7 @@ fn rewrite_img_sources(
     for (target, replacement) in targets.iter().zip(replacements) {
         output.push_str(&html[cursor..target.value_start]);
         if let Some(path) = replacement {
-            output.push_str(&path.to_string_lossy());
+            output.push_str(&storage::adoc_path(path));
         } else {
             output.push_str(&html[target.value_start..target.value_end]);
         }
@@ -555,7 +542,10 @@ fn is_attribute_name_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::SocketAddr, path::Path};
+    use std::{
+        net::SocketAddr,
+        path::{Path, PathBuf},
+    };
     use tempfile::tempdir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -630,6 +620,61 @@ mod tests {
         assert_eq!(names.len(), 1, "one deduped asset, no temp: {names:?}");
         assert!(!names[0].ends_with(".tmp"), "{names:?}");
         // .expect(1) verifies the single download when the server drops.
+    }
+
+    #[tokio::test]
+    async fn concurrent_rewrites_share_one_final_asset_without_temporary_files() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pic.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let assets = dir.path().join("assets");
+        let base = Url::parse(&server.uri()).unwrap();
+        let html = format!(r#"<img src="{}/pic.jpg">"#, server.uri());
+
+        let (first, second) = tokio::join!(
+            rewrite_inline_media(&html, &base, &assets, true, None),
+            rewrite_inline_media(&html, &base, &assets, true, None)
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.html, second.html);
+        assert!(first.html.starts_with(r#"<img src="../assets/"#));
+        assert!(first.html.ends_with(r#"">"#));
+        assert_eq!(first.assets.len(), 1);
+        assert_eq!(second.assets.len(), 1);
+        assert_eq!(
+            first.assets[0].relative_path,
+            second.assets[0].relative_path
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(&assets)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(entries.len(), 1, "one final asset and no temporary files");
+        assert!(entries[0].file_type().unwrap().is_file());
+        assert_eq!(
+            entries[0].file_name(),
+            first.assets[0].relative_path.file_name().unwrap()
+        );
+    }
+
+    #[test]
+    fn serializes_rewritten_image_paths_with_forward_slashes() {
+        let html = r#"<img src="remote.png">"#;
+        let targets = image_targets(html);
+        let replacements = [Some(PathBuf::from(r"..\assets\image.png"))];
+
+        assert_eq!(
+            rewrite_img_sources(html, &targets, &replacements),
+            r#"<img src="../assets/image.png">"#
+        );
     }
 
     #[tokio::test]

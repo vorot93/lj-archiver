@@ -1,12 +1,12 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
 use crate::{
     adoc,
     error::{LjError, Result},
     models::ArchivedPost,
+    storage,
+};
+use std::{
+    fs,
+    path::{Path, PathBuf},
 };
 
 #[derive(Debug, Clone)]
@@ -43,7 +43,7 @@ impl Archive {
                 source,
             })?;
         }
-        write_atomic(&path, contents)?;
+        storage::write_atomic(&path, contents.as_bytes())?;
         Ok(path)
     }
 
@@ -57,13 +57,13 @@ impl Archive {
             contents.push_str(&format!(
                 "|{} |xref:{}[{}]\n",
                 post.id,
-                path.to_string_lossy(),
+                storage::adoc_path(&path),
                 title
             ));
         }
         contents.push_str("|===\n");
         let path = self.root.join("index.adoc");
-        write_atomic(&path, &contents)?;
+        storage::write_atomic(&path, contents.as_bytes())?;
         Ok(path)
     }
 
@@ -75,11 +75,11 @@ impl Archive {
             let path = self.index_path(&post.path);
             contents.push_str(&format!(
                 "\ninclude::{}[leveloffset=+1]\n",
-                path.to_string_lossy()
+                storage::adoc_path(&path)
             ));
         }
         let path = self.root.join("book.adoc");
-        write_atomic(&path, &contents)?;
+        storage::write_atomic(&path, contents.as_bytes())?;
         Ok(path)
     }
 
@@ -93,18 +93,6 @@ impl Archive {
     fn index_path(&self, path: &Path) -> PathBuf {
         path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
     }
-}
-
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, contents).map_err(|source| LjError::Write {
-        path: tmp.clone(),
-        source,
-    })?;
-    fs::rename(&tmp, path).map_err(|source| LjError::Write {
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 #[cfg(test)]
@@ -240,6 +228,56 @@ mod tests {
         assert_eq!(
             book,
             "= news Archive\n:doctype: book\n:toc:\n\ninclude::index.adoc[leveloffset=+1]\n"
+        );
+    }
+
+    #[test]
+    fn replaces_existing_index_with_exact_second_contents() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        archive
+            .write_index(&[ArchivedPost {
+                id: 166511,
+                title: "First".to_string(),
+                path: PathBuf::from("posts/166511.adoc"),
+            }])
+            .unwrap();
+        let path = archive
+            .write_index(&[ArchivedPost {
+                id: 166512,
+                title: "Second".to_string(),
+                path: PathBuf::from(r"posts\166512.adoc"),
+            }])
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "= news Archive\n\n|===\n|Post ID |Title\n\n|166512 |xref:posts/166512.adoc[Second]\n|===\n"
+        );
+    }
+
+    #[test]
+    fn replaces_existing_book_with_exact_second_contents() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        archive
+            .write_book(&[ArchivedPost {
+                id: 166511,
+                title: "First".to_string(),
+                path: PathBuf::from("posts/166511.adoc"),
+            }])
+            .unwrap();
+        let path = archive
+            .write_book(&[ArchivedPost {
+                id: 166512,
+                title: "Second".to_string(),
+                path: PathBuf::from(r"posts\166512.adoc"),
+            }])
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "= news Archive\n:doctype: book\n:toc:\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166512.adoc[leveloffset=+1]\n"
         );
     }
 }

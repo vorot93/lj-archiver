@@ -11,6 +11,7 @@ mod net;
 pub mod parser;
 pub mod progress;
 pub mod run;
+mod storage;
 pub mod target;
 mod tls;
 

@@ -36,3 +36,11 @@ jobs:
           components: clippy
       - run: cargo clippy -p lj-archiver-gui --all-targets -- -D warnings
       - run: cargo build -p lj-archiver-gui
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p lj-archiver storage::tests
+      - run: cargo test -p lj-archiver archive::tests
