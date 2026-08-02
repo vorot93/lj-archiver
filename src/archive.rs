@@ -95,7 +95,10 @@ impl Archive {
 
     pub fn write_book(&self, posts: &[ArchivedPost]) -> Result<PathBuf> {
         self.ensure_root()?;
-        let mut contents = format!("= {} Archive\n:doctype: book\n:toc:\n\n", self.journal);
+        let mut contents = format!(
+            "= {} Archive\n:doctype: book\n:toc:\n:imagesdir: posts\n\n",
+            self.journal
+        );
         contents.push_str("include::index.adoc[leveloffset=+1]\n");
         for post in posts {
             let path = self.index_path(&post.path);
@@ -241,7 +244,7 @@ mod tests {
         let book = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             book,
-            "= news Archive\n:doctype: book\n:toc:\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166511.adoc[leveloffset=+1]\n\ninclude::posts/166512.adoc[leveloffset=+1]\n"
+            "= news Archive\n:doctype: book\n:toc:\n:imagesdir: posts\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166511.adoc[leveloffset=+1]\n\ninclude::posts/166512.adoc[leveloffset=+1]\n"
         );
     }
 
@@ -253,7 +256,7 @@ mod tests {
         let book = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             book,
-            "= news Archive\n:doctype: book\n:toc:\n\ninclude::index.adoc[leveloffset=+1]\n"
+            "= news Archive\n:doctype: book\n:toc:\n:imagesdir: posts\n\ninclude::index.adoc[leveloffset=+1]\n"
         );
     }
 
@@ -303,7 +306,7 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
-            "= news Archive\n:doctype: book\n:toc:\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166512.adoc[leveloffset=+1]\n"
+            "= news Archive\n:doctype: book\n:toc:\n:imagesdir: posts\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166512.adoc[leveloffset=+1]\n"
         );
     }
 
