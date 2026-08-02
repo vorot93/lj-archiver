@@ -3,9 +3,7 @@ use crate::{
     models::{Comment, Post},
 };
 use chrono::SecondsFormat;
-use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
-use std::collections::HashMap;
 
 mod classify;
 mod escape;
@@ -223,7 +221,7 @@ const MAX_RENDER_DEPTH: usize = 256;
 #[derive(Clone, Copy)]
 struct RenderCtx<'a> {
     source_html: &'a str,
-    source_map: &'a HashMap<NodeId, String>,
+    source_map: &'a SourceMap,
     depth: usize,
     list_depth: usize,
     link_rewriter: Option<&'a LinkRewriter>,
@@ -873,6 +871,22 @@ mod tests {
         assert_eq!(
             html_to_adoc(html),
             "intro\n\n++++\n<div>real</div>\n++++\n\n"
+        );
+    }
+
+    #[test]
+    fn malformed_space_after_tag_open_does_not_shift_real_div_source() {
+        assert_eq!(
+            html_to_adoc("< div>fake</div><div data-real='yes'>real</div>"),
+            "< div>fake\n\n++++\n<div data-real='yes'>real</div>\n++++\n\n"
+        );
+    }
+
+    #[test]
+    fn tokenizer_valid_punctuation_in_tag_name_does_not_shift_real_div_source() {
+        assert_eq!(
+            html_to_adoc("<div!>fake</div!><div data-real='yes'>real</div>"),
+            "fake\n\n++++\n<div data-real='yes'>real</div>\n++++\n\n"
         );
     }
 
@@ -2130,7 +2144,8 @@ mod tests {
         // recover each element's original source by rescanning the matching close
         // and re-parsing/serializing each candidate — both O(subtree) per element,
         // so O(n^2) overall (~94s at 2000 levels). Source recovery is now a single
-        // linear scan, so this must complete quickly.
+        // linear scan backed by fixed-size byte ranges, so this must complete
+        // quickly without allocating overlapping source substrings.
         use std::time::Instant;
         let depth = 2000;
         let html = format!("{}x{}", "<div>".repeat(depth), "</div>".repeat(depth));
@@ -2150,8 +2165,8 @@ mod tests {
         // overflow the stack (uncatchable SIGABRT). Past MAX_RENDER_DEPTH it now
         // returns `None`, so the caller falls through to the already-capped
         // `render_element` path and this RETURNS with content preserved instead of
-        // aborting. Depth is kept just past the 256 cap (not thousands) because
-        // `build_source_map` is separately O(n^2) in nesting depth.
+        // aborting. Depth is kept just past the 256 cap because this regression
+        // exercises render recursion rather than source-index storage.
         let depth = 300;
         let html = format!("{}text{}", "<span>".repeat(depth), "</span>".repeat(depth));
         let out = html_to_adoc(&html);

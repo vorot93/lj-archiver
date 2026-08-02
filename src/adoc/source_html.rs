@@ -1,8 +1,10 @@
 use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap, ops::Range};
 
 use super::{MAX_RENDER_DEPTH, RenderCtx, classify::is_stripped_chrome};
+
+pub(crate) type SourceMap = HashMap<NodeId, Range<usize>>;
 
 pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     if is_stripped_chrome(element) {
@@ -11,11 +13,11 @@ pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) ->
 
     let html = source_preserving_html(element, ctx);
 
-    if contains_script_or_style_tag(&html) {
-        return render_source_listing(&html);
+    if contains_script_or_style_tag(html.as_ref()) {
+        return render_source_listing(html.as_ref());
     }
 
-    let delimiter = safe_block_delimiter(&html, '+');
+    let delimiter = safe_block_delimiter(html.as_ref(), '+');
 
     format!("{delimiter}\n{html}\n{delimiter}\n\n")
 }
@@ -56,30 +58,28 @@ pub(crate) fn safe_block_delimiter(content: &str, character: char) -> String {
     delimiter
 }
 
-fn source_preserving_html(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
-    let html = element.html();
-    let name = element.value().name();
-
-    if let Some(source) = ctx.source_map.get(&element.id()) {
-        return source.clone();
+fn source_preserving_html<'a>(element: ElementRef<'_>, ctx: RenderCtx<'a>) -> Cow<'a, str> {
+    if let Some(range) = ctx.source_map.get(&element.id()) {
+        return Cow::Borrowed(&ctx.source_html[range.clone()]);
     }
 
-    if name == "table" {
+    let html = element.html();
+    if element.value().name() == "table" {
         let without_inserted_tbody = html.replace("<tbody>", "").replace("</tbody>", "");
         if ctx.source_html.contains(&without_inserted_tbody) {
-            return without_inserted_tbody;
+            return Cow::Owned(without_inserted_tbody);
         }
     }
 
-    html
+    Cow::Owned(html)
 }
 
-/// Precompute the original source substring of every element in the document
+/// Precompute the original source byte range of every element in the document
 /// with one linear scan of the source plus one walk of the DOM, instead of
 /// rescanning the whole tree and source once per passthrough (which was O(n^2)
 /// for deeply nested content).
 ///
-/// Each element maps to the source substring of the k-th source element of the
+/// Each element maps to the source range of the k-th source element of the
 /// same (lowercased) tag name, where k is the element's document-order ordinal
 /// among elements of that name. Because the DOM is parsed from the source, the
 /// k-th element of a given name in DOM document order is the k-th of that name in
@@ -100,7 +100,7 @@ fn source_preserving_html(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String
 /// `source_preserving_html`'s `element.html()`, trading a raw `<div/>` for a
 /// normalized `<div>...</div>` rather than silently dropping the nested
 /// content.
-pub(crate) fn build_source_map(document: &Html, source_html: &str) -> HashMap<NodeId, String> {
+pub(crate) fn build_source_map(document: &Html, source_html: &str) -> SourceMap {
     let source_by_name = collect_source_spans(source_html);
     let mut counters: HashMap<String, usize> = HashMap::new();
     let mut source_map = HashMap::new();
@@ -126,7 +126,7 @@ pub(crate) fn build_source_map(document: &Html, source_html: &str) -> HashMap<No
     source_map
 }
 
-/// Recover, in one linear scan, the original source substring of every source
+/// Recover, in one linear scan, the original source byte range of every source
 /// element grouped by lowercased tag name in document (opening) order.
 ///
 /// A per-name stack pairs each opening tag with its matching closing tag exactly
@@ -149,7 +149,7 @@ pub(crate) fn build_source_map(document: &Html, source_html: &str) -> HashMap<No
 /// spans in opening order with one slot reserved per opening tag (empty until its
 /// close is seen), then keeping only the leading run of slots that were closed:
 /// the first never-closed opening tag, and everything after it, is dropped.
-fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<String>> {
+fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<Range<usize>>> {
     // Per name, one slot per opening tag in opening order; `None` until the
     // matching close is found (and permanently `None` if it never is).
     let mut slots: HashMap<String, Vec<Option<(usize, usize)>>> = HashMap::new();
@@ -210,12 +210,13 @@ fn collect_source_spans(source_html: &str) -> HashMap<String, Vec<String>> {
     slots
         .into_iter()
         .map(|(name, list)| {
-            let spans = list
-                .into_iter()
-                .map_while(|slot| slot)
-                .map(|(start, end)| source_html[start..end].to_string())
-                .collect();
-            (name, spans)
+            (
+                name,
+                list.into_iter()
+                    .map_while(|slot| slot)
+                    .map(|(start, end)| start..end)
+                    .collect(),
+            )
         })
         .collect()
 }
@@ -290,20 +291,16 @@ fn parse_source_tag(source_html: &str, start: usize) -> Option<SourceTag> {
         cursor += 1;
     }
 
-    while matches!(bytes.get(cursor), Some(byte) if byte.is_ascii_whitespace()) {
-        cursor += 1;
-    }
-
-    let name_start = cursor;
-    while matches!(bytes.get(cursor), Some(byte) if is_source_tag_name_byte(*byte)) {
-        cursor += 1;
-    }
-
-    if cursor == name_start {
+    let first = *bytes.get(cursor)?;
+    if !first.is_ascii_alphabetic() {
         return None;
     }
-
-    let name = source_html[name_start..cursor].to_string();
+    let name_start = cursor;
+    while matches!(bytes.get(cursor), Some(byte) if !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'>' | 0))
+    {
+        cursor += 1;
+    }
+    let name = source_html[name_start..cursor].to_ascii_lowercase();
 
     Some(SourceTag {
         name,
@@ -325,10 +322,6 @@ fn find_source_tag_end(source_html: &str, start: usize) -> Option<usize> {
     }
 
     None
-}
-
-fn is_source_tag_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'_')
 }
 
 fn is_source_void_tag(name: &str) -> bool {
@@ -394,4 +387,21 @@ fn raw_text_at(element: ElementRef<'_>, depth: usize) -> String {
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::HashMap, ops::Range};
+
+    #[test]
+    fn nested_source_index_stores_one_range_per_element() {
+        let depth = 4_000;
+        let html = format!("{}x{}", "<div>".repeat(depth), "</div>".repeat(depth));
+        let spans: HashMap<String, Vec<Range<usize>>> = collect_source_spans(&html);
+        let divs = spans.get("div").unwrap();
+        assert_eq!(divs.len(), depth);
+        assert_eq!(divs[0], 0..html.len());
+        assert!(divs.windows(2).all(|pair| pair[0].start < pair[1].start));
+    }
 }
