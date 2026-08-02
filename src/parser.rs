@@ -340,8 +340,8 @@ fn non_empty_attr(element: ElementRef<'_>, name: &str) -> Option<String> {
 }
 
 fn journal_from_url(url: &Url) -> Option<String> {
-    let host = url.host_str()?;
-    if host == "users.livejournal.com" {
+    let host = crate::net::normalized_domain_host(url)?;
+    if host.eq_ignore_ascii_case("users.livejournal.com") {
         return url
             .path_segments()?
             .find(|segment| !segment.is_empty())
@@ -820,6 +820,22 @@ mod tests {
             </body></html>
         "#;
         let url = Url::parse("https://users.livejournal.com/evo_lutio/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "evo_lutio");
+        assert_eq!(post.author, "evo_lutio");
+    }
+
+    #[test]
+    fn dns_trailing_dot_users_host_fallback_uses_first_path_segment() {
+        let html = r#"
+            <html><body>
+                <article data-itemid="123">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://users.livejournal.com./evo_lutio/123.html").unwrap();
         let post = parse_post_page(html, &url).unwrap();
 
         assert_eq!(post.journal, "evo_lutio");

@@ -2,6 +2,7 @@ use super::{RenderCtx, classify::is_stripped_chrome};
 use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
 use std::{borrow::Cow, collections::HashMap, ops::Range};
+use url::Url;
 
 pub(crate) type SourceMap = HashMap<NodeId, Range<usize>>;
 
@@ -12,13 +13,43 @@ pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) ->
 
     let html = source_preserving_html(element, ctx);
 
-    if contains_script_or_style_tag(html.as_ref()) {
+    if contains_script_or_style_tag(html.as_ref())
+        || contains_rejected_url_attribute(html.as_ref(), ctx)
+    {
         return render_source_listing(html.as_ref());
     }
 
     let delimiter = safe_block_delimiter(html.as_ref(), '+');
 
     format!("{delimiter}\n{html}\n{delimiter}\n\n")
+}
+
+fn contains_rejected_url_attribute(source_html: &str, ctx: RenderCtx<'_>) -> bool {
+    let fragment = Html::parse_fragment(source_html);
+
+    fragment
+        .tree
+        .root()
+        .descendants()
+        .filter_map(ElementRef::wrap)
+        .any(|element| {
+            ["href", "src"].iter().any(|name| {
+                element
+                    .attr(name)
+                    .is_some_and(|value| !is_safe_url_reference(value, ctx))
+            })
+        })
+}
+
+fn is_safe_url_reference(value: &str, ctx: RenderCtx<'_>) -> bool {
+    if let Some(rewriter) = ctx.link_rewriter {
+        return rewriter.absolute_target(value).is_some();
+    }
+
+    Url::parse("https://source.invalid/")
+        .expect("static URL is valid")
+        .join(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
 }
 
 fn render_source_listing(content: &str) -> String {

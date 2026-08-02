@@ -130,6 +130,20 @@ The AsciiDoc renderer (`src/adoc/`) produces byte-exact output guarded by a larg
 
 The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
+A same-journal target in a linked image's `link=` attribute is a relative
+`<id>.adoc` URI, not a complete `xref:<id>.adoc` macro. Pending link records
+retain that output context: ordinary links resolve locally to `xref:`, linked
+images resolve to a URI, and a linked-image external fallback has commas
+encoded before token substitution so it cannot split the image attribute list.
+
+Unsupported HTML remains exact source-preserved passthrough when its recovered
+source span has only safe URL attributes. Safety-parse that exact span as a
+complete fragment before inspecting `href` and `src`; inspecting only the
+original DOM subtree is insufficient because table foster-parenting can move a
+node outside the subtree while its bytes remain inside the emitted span. If a
+URL is not a hosted HTTP(S) reference, render the untouched span as a listing
+instead of raw `++++` passthrough, and never serialize the safety DOM.
+
 The composed document ends with exactly one newline **by construction**, not a post-hoc trim: each block ends with a single `\n` (`push_body`) and the blank-line separator is inserted *before* each block (`render_post`, `render_comment`). Do not switch to per-block `\n\n` plus a trailing trim.
 
 The optional `book.adoc` (opt-in via `--book` or the GUI checkbox, both setting `RunOptions::generate_book`) is assembled by `archive::Archive::write_book`, called after `write_index` in both run paths (`archive_post`, `archive_journal`) from the **same sorted `&[ArchivedPost]` slice** — so it lists exactly what `index.adoc` lists, oldest-first, and is rewritten on every enabled run (including `--resume`; failed posts are absent from the slice, resume-skipped posts are present). Its output is byte-exact and asserted like the rest of `archive.rs` (the `write_book` unit tests pin the exact bytes): a `= <journal> Archive` title carrying `:doctype: book`, `:toc:`, and `:imagesdir: posts`, then `include::index.adoc[leveloffset=+1]`, then one `include::posts/<id>.adoc[leveloffset=+1]` per post. Two load-bearing invariants: a blank line precedes **every** include (block separation — without it an included post's now-`==` chapter title is absorbed into the preceding post's trailing paragraph), and the file ends with exactly one newline. `leveloffset=+1` demotes each standalone post's level-0 `= Title` to a `==` chapter under `:doctype: book`, and `:toc:` supplies in-document navigation; the included `index.adoc`'s `xref:posts/<id>.adoc[…]` links deliberately resolve to the sibling post files, not in-book anchors (path-based `xref:` needs no existing target, so no converter warning). `:imagesdir: posts` is load-bearing for downloaded media: included post targets such as `../assets/<hash>.<ext>` then render as archive-root `assets/...` paths when converter output is written beside `book.adoc`. `write_book` shares `ensure_root()` (archive-root creation) with `write_index`; `write_post` keeps its own parent-dir creation for a different path — do not merge those. Because `write_book` only emits include directives, the renderer and per-post files are untouched. The ignored `book_render_smoke` integration test invokes Asciidoctor and is run explicitly by Ubuntu CI; normal Rust test runs remain converter-independent. Manually run the same ignored test after converter-specific changes when Asciidoctor is available locally.
@@ -164,6 +178,10 @@ the requested ID. Identity mismatches fail only that row during journal exports
 and fail the whole run for a single-post target; no file is staged or written
 under the returned wrong ID.
 
+DNS hosts may carry the equivalent trailing root dot. Domain recognition strips
+one such dot consistently for LiveJournal and `localhost`; IP literals continue
+to use their parsed `Host` variants and are not normalized as domains.
+
 Every archive render constructs a per-post `LinkRewriter` only after identity
 validation and uses that post's delivered `Post.url` as the sole resolution
 base. The body, comment bodies, and linked-image hrefs share this context.
@@ -190,10 +208,14 @@ and rely on the renderer's inert visible-text fallback.
 Inline-media discovery is a forward-only byte-span scan so untouched HTML
 stays byte-identical. It treats `script`, `style`, `textarea`, `xmp`, `iframe`,
 `noembed`, `noframes`, and `plaintext` contents as opaque (including
-tag-looking text), and follows HTML-tokenizer comment endings; keep those
-skips linear and rewrite only real `src` value spans. Download filenames keep
-a 12-hex digest stem and use only lowercase allowlisted image suffixes (`jpg`,
-`jpeg`, `png`, `gif`, `webp`, `svg`, `avif`, `bmp`, `ico`), falling back to
+tag-looking text), and follows HTML-tokenizer proper and bogus comment/
+declaration endings. A recognized DOCTYPE also keeps `>` inside quoted public
+or system identifiers opaque. Keep those skips linear and rewrite only real
+`src` value spans. Generated replacements are HTML-attribute-escaped because
+the renderer parses the rewritten fragment again: that one parse must recover
+the exact target, and bytes outside the value span remain untouched. Download
+filenames keep a 12-hex digest stem and use only lowercase allowlisted image
+suffixes (`jpg`, `jpeg`, `png`, `gif`, `webp`, `svg`, `avif`, `bmp`, `ico`), falling back to
 `bin` so each filename component remains portable and bounded.
 
 The current media checks do not resolve DNS names to block private networks. Do not document or rely on DNS-based private-network blocking unless that behavior is implemented and tested.

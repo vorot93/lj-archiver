@@ -468,7 +468,7 @@ fn final_numeric_path_id(url: &Url) -> Option<u64> {
 }
 
 fn final_livejournal_journal(url: &Url) -> Option<String> {
-    let host = url.host_str()?;
+    let host = crate::net::normalized_domain_host(url)?;
     if host.eq_ignore_ascii_case("users.livejournal.com") {
         return url
             .path_segments()?
@@ -1084,6 +1084,60 @@ mod tests {
                 );
             }
             other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dns_trailing_dot_final_livejournal_journal_mismatch_is_rejected() {
+        let post = parsed_post(
+            "https://other.livejournal.com./landing?source=redirect",
+            "canonical_metadata",
+            1,
+        );
+
+        let error = validate_requested_post_identity("news", 1, &post).unwrap_err();
+
+        match error {
+            LjError::Parse { url, reason } => {
+                assert_eq!(
+                    url,
+                    "https://other.livejournal.com./landing?source=redirect"
+                );
+                assert!(reason.contains("requested news/1"), "{reason}");
+                assert!(reason.contains("final URL identity other"), "{reason}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dns_trailing_dot_final_livejournal_post_id_mismatch_is_rejected() {
+        let post = parsed_post(
+            "https://news.livejournal.com./2.html?source=redirect",
+            "news",
+            1,
+        );
+
+        let error = validate_requested_post_identity("news", 1, &post).unwrap_err();
+
+        match error {
+            LjError::Parse { reason, .. } => {
+                assert!(reason.contains("requested news/1"), "{reason}");
+                assert!(reason.contains("final URL identity news/2"), "{reason}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dns_trailing_dot_valid_final_livejournal_alias_is_accepted() {
+        for url in [
+            "https://evo-lutio.livejournal.com./240331.html",
+            "https://users.livejournal.com./evo_lutio/240331.html",
+        ] {
+            let post = parsed_post(url, "canonical_metadata", 240331);
+
+            validate_requested_post_identity("evo_lutio", 240331, &post).unwrap();
         }
     }
 

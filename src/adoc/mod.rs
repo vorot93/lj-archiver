@@ -498,7 +498,7 @@ fn render_linked_image(image: ElementRef<'_>, href: &str, ctx: RenderCtx<'_>) ->
         || Some(sanitize_macro_target(href)),
         |rewriter| {
             rewriter
-                .xref_target(href)
+                .image_link_target(href)
                 .or_else(|| rewriter.absolute_target(href))
         },
     );
@@ -802,8 +802,10 @@ fn append_inline_block(output: &mut String, block: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::links::LinkRewriter;
-    use std::collections::HashSet;
+    use crate::links::{LinkRewriter, resolve_pending_links};
+    use scraper::{Html, Selector};
+    use std::{collections::HashSet, fs, process::Command};
+    use tempfile::tempdir;
     use url::Url;
 
     const USER_FRAGMENT: &str = "image:evil.png[] xref:1.adoc[x] {secret}";
@@ -2818,5 +2820,278 @@ mod tests {
         assert!(!adoc.contains("link=javascript:"), "got: {adoc:?}");
         assert!(adoc.contains("safe] unsafe image"), "got: {adoc:?}");
         assert!(!adoc.contains("image:data:"), "got: {adoc:?}");
+    }
+
+    #[test]
+    fn direct_local_linked_image_uses_relative_uri_not_xref_macro() {
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::from([2u64]),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+
+        let adoc = html_to_adoc_with_links(
+            r#"<a href="https://news.livejournal.com/2.html"><img src="https://cdn.example.test/photo.jpg" alt="photo"></a>"#,
+            Some(&r),
+        );
+
+        assert_eq!(
+            adoc,
+            "image:https://cdn.example.test/photo.jpg[photo,link=2.adoc]"
+        );
+    }
+
+    #[test]
+    fn pending_local_linked_image_resolves_to_relative_uri_not_xref_macro() {
+        let r = LinkRewriter::pending(
+            "news",
+            HashSet::from([2u64]),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+        let pending = html_to_adoc_with_links(
+            r#"<a href="https://news.livejournal.com/2.html"><img src="https://cdn.example.test/photo.jpg" alt="photo"></a>"#,
+            Some(&r),
+        );
+
+        let resolved = resolve_pending_links(&pending, &r.pending_links(), &HashSet::from([2u64]));
+
+        assert_eq!(
+            resolved,
+            "image:https://cdn.example.test/photo.jpg[photo,link=2.adoc]"
+        );
+    }
+
+    #[test]
+    fn failed_pending_linked_image_keeps_external_href_comma_hardened() {
+        let r = LinkRewriter::pending(
+            "news",
+            HashSet::from([2u64]),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+        let pending = html_to_adoc_with_links(
+            concat!(
+                r#"<a href="https://news.livejournal.com/2.html?view=,role=red">"#,
+                r#"<img src="https://cdn.example.test/photo.jpg" alt="photo"></a>"#,
+            ),
+            Some(&r),
+        );
+
+        let resolved = resolve_pending_links(&pending, &r.pending_links(), &HashSet::new());
+
+        assert_eq!(
+            resolved,
+            concat!(
+                "image:https://cdn.example.test/photo.jpg[photo,",
+                "link=https://news.livejournal.com/2.html?view=%2Crole=red]"
+            )
+        );
+        assert!(!resolved.contains(",role=red"), "got: {resolved:?}");
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn direct_local_linked_image_converts_to_relative_href() {
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::from([2u64]),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+        let adoc = html_to_adoc_with_links(
+            r#"<a href="https://news.livejournal.com/2.html"><img src="https://cdn.example.test/photo.jpg" alt="photo"></a>"#,
+            Some(&r),
+        );
+
+        let html = convert_with_asciidoctor(&adoc);
+
+        assert!(html.contains("href=\"2.adoc\""), "got: {html}");
+        assert!(!html.contains("href=\"xref:2.adoc\""), "got: {html}");
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn pending_linked_image_targets_convert_without_xref_or_attribute_split() {
+        let local = LinkRewriter::pending(
+            "news",
+            HashSet::from([2u64]),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+        let local_pending = html_to_adoc_with_links(
+            r#"<a href="https://news.livejournal.com/2.html"><img src="https://cdn.example.test/local.jpg" alt="local"></a>"#,
+            Some(&local),
+        );
+        let local_adoc = resolve_pending_links(
+            &local_pending,
+            &local.pending_links(),
+            &HashSet::from([2u64]),
+        );
+
+        let failed = LinkRewriter::pending(
+            "news",
+            HashSet::from([2u64]),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+        let failed_pending = html_to_adoc_with_links(
+            concat!(
+                r#"<a href="https://news.livejournal.com/2.html?view=,role=red">"#,
+                r#"<img src="https://cdn.example.test/failed.jpg" alt="failed"></a>"#,
+            ),
+            Some(&failed),
+        );
+        let failed_adoc =
+            resolve_pending_links(&failed_pending, &failed.pending_links(), &HashSet::new());
+
+        let html = convert_with_asciidoctor(&format!("{local_adoc}\n\n{failed_adoc}"));
+
+        assert!(html.contains("href=\"2.adoc\""), "got: {html}");
+        assert!(!html.contains("href=\"xref:2.adoc\""), "got: {html}");
+        assert!(
+            html.contains(concat!(
+                "href=\"https://news.livejournal.com/2.html?",
+                "view=%2Crole=red\""
+            )),
+            "got: {html}"
+        );
+        assert!(!html.contains("class=\"image red\""), "got: {html}");
+    }
+
+    #[test]
+    fn unsafe_url_attributes_degrade_passthrough_to_exact_source_listing() {
+        let source = concat!(
+            r#"<section data-kind='opaque'><a href="javascript:alert(1)">script link</a>"#,
+            r#"<a href='mailto:reader@example.test'>mail link</a>"#,
+            r#"<img src="data:image/png,boom" alt="data image">"#,
+            r#"<img src='file:///secret.jpg' alt='file image'></section>"#,
+        );
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::new(),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+
+        let adoc = html_to_adoc_with_links(source, Some(&r));
+
+        assert_eq!(adoc, format!("----\n{source}\n----\n\n"));
+        assert!(!adoc.contains("++++"), "got: {adoc:?}");
+    }
+
+    #[test]
+    fn safe_url_attributes_keep_exact_raw_passthrough_control() {
+        let source = concat!(
+            r#"<section data-kind='safe'><a href="/profile">safe link</a>"#,
+            r#"<img src='photo.jpg' alt='safe image'></section>"#,
+        );
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::new(),
+            Url::parse("https://news.livejournal.com/archive/1.html").unwrap(),
+        );
+
+        let adoc = html_to_adoc_with_links(source, Some(&r));
+
+        assert_eq!(adoc, format!("++++\n{source}\n++++\n\n"));
+    }
+
+    #[test]
+    fn foster_parented_unsafe_url_inside_emitted_source_degrades_to_listing() {
+        let table = concat!(
+            r#"<table><a href="javascript:alert(1)">fostered link</a>"#,
+            r#"<tr><td>cell</td></tr></table>"#,
+        );
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::new(),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+
+        let adoc = html_to_adoc_with_links(table, Some(&r));
+
+        assert!(
+            adoc.contains(&format!("----\n{table}\n----\n\n")),
+            "got: {adoc:?}"
+        );
+        assert!(!adoc.contains("++++"), "got: {adoc:?}");
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn passthrough_url_safety_converts_unsafe_source_inert_and_safe_control_raw() {
+        let unsafe_source = concat!(
+            r#"<section><a href="javascript:alert(1)">script label</a>"#,
+            r#"<a href="data:text/plain,boom">data label</a>"#,
+            r#"<a href="file:///secret.txt">file label</a>"#,
+            r#"<a href="mailto:reader@example.test">mail label</a>"#,
+            r#"<img src="javascript:alert(2)" alt="script image">"#,
+            r#"<img src="data:image/png,boom" alt="data image">"#,
+            r#"<img src="file:///secret.jpg" alt="file image">"#,
+            r#"<img src="mailto:image@example.test" alt="mail image"></section>"#,
+        );
+        let safe_source = concat!(
+            r#"<section><a href="https://safe.example.test/page">safe label</a>"#,
+            r#"<img src="https://safe.example.test/photo.jpg" alt="safe image"></section>"#,
+        );
+        let r = LinkRewriter::new(
+            "news",
+            HashSet::new(),
+            Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        );
+        let unsafe_adoc = html_to_adoc_with_links(unsafe_source, Some(&r));
+        let safe_adoc = html_to_adoc_with_links(safe_source, Some(&r));
+
+        let html = convert_with_asciidoctor(&format!("{unsafe_adoc}\n{safe_adoc}"));
+        let document = Html::parse_document(&html);
+        let url_attributes = Selector::parse("[href], [src]").unwrap();
+        let active_values: Vec<_> = document
+            .select(&url_attributes)
+            .flat_map(|element| [element.attr("href"), element.attr("src")])
+            .flatten()
+            .collect();
+
+        for value in &active_values {
+            assert!(
+                !["javascript:", "data:", "file:", "mailto:"]
+                    .iter()
+                    .any(|scheme| value.to_ascii_lowercase().starts_with(scheme)),
+                "active unsafe URL {value:?} in: {html}"
+            );
+        }
+        assert!(
+            active_values.contains(&"https://safe.example.test/page"),
+            "got: {html}"
+        );
+        assert!(
+            active_values.contains(&"https://safe.example.test/photo.jpg"),
+            "got: {html}"
+        );
+        let visible_text = document.root_element().text().collect::<String>();
+        for visible in [
+            "javascript:alert(1)",
+            "data:image/png,boom",
+            "file:///secret.jpg",
+            "mailto:image@example.test",
+            "script label",
+            "mail image",
+        ] {
+            assert!(
+                visible_text.contains(visible),
+                "missing {visible:?} in: {html}"
+            );
+        }
+    }
+
+    fn convert_with_asciidoctor(adoc: &str) -> String {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("input.adoc"), adoc).unwrap();
+        let output = Command::new("asciidoctor")
+            .arg("--embedded")
+            .arg("input.adoc")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "asciidoctor failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(dir.path().join("input.html")).unwrap()
     }
 }

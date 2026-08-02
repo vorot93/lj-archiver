@@ -238,6 +238,21 @@ fn image_targets_scanned(html: &str) -> (Vec<ImageTarget>, usize) {
             continue;
         }
 
+        if starts_with_at(bytes, tag_start, b"<?") {
+            cursor = find_html_bogus_comment_end(bytes, tag_start + 2, &mut scan_steps);
+            continue;
+        }
+
+        if starts_with_ascii_case_insensitive_at(bytes, tag_start, b"<!doctype") {
+            cursor = find_html_doctype_end(bytes, tag_start + 9, &mut scan_steps);
+            continue;
+        }
+
+        if starts_with_at(bytes, tag_start, b"<!") {
+            cursor = find_html_bogus_comment_end(bytes, tag_start + 2, &mut scan_steps);
+            continue;
+        }
+
         match scan_html_tag(html, tag_start, &mut scan_steps) {
             HtmlTagScan::Invalid => cursor += 1,
             HtmlTagScan::Unclosed => break,
@@ -496,7 +511,7 @@ fn rewrite_img_sources(
     for (target, replacement) in targets.iter().zip(replacements) {
         output.push_str(&html[cursor..target.value_start]);
         if let Some(target) = replacement {
-            output.push_str(target);
+            push_html_attribute_escaped(&mut output, target);
         } else {
             output.push_str(&html[target.value_start..target.value_end]);
         }
@@ -505,6 +520,19 @@ fn rewrite_img_sources(
 
     output.push_str(&html[cursor..]);
     output
+}
+
+fn push_html_attribute_escaped(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&#39;"),
+            character => output.push(character),
+        }
+    }
 }
 
 enum HtmlTagScan {
@@ -861,13 +889,184 @@ fn find_html_comment_end(bytes: &[u8], content_start: usize, scan_steps: &mut us
     bytes.len()
 }
 
+/// Consume processing-instruction-like and unknown declaration input in the
+/// HTML tokenizer's bogus-comment state. The first `>` ends it; EOF consumes
+/// the remainder.
+fn find_html_bogus_comment_end(
+    bytes: &[u8],
+    content_start: usize,
+    scan_steps: &mut usize,
+) -> usize {
+    let mut cursor = content_start;
+    while cursor < bytes.len() {
+        *scan_steps += 1;
+        if bytes[cursor] == b'>' {
+            return cursor + 1;
+        }
+        cursor += 1;
+    }
+
+    bytes.len()
+}
+
+/// Consume a DOCTYPE with the tokenizer states that determine whether `>` is
+/// data in a quoted public/system identifier or the declaration terminator.
+/// Malformed states fall through to bogus-DOCTYPE handling, where the first
+/// `>` ends the declaration. EOF always consumes the remainder.
+fn find_html_doctype_end(bytes: &[u8], content_start: usize, scan_steps: &mut usize) -> usize {
+    let mut cursor = content_start;
+
+    match bytes.get(cursor) {
+        Some(b'>') => {
+            *scan_steps += 1;
+            return cursor + 1;
+        }
+        Some(byte) if is_html_whitespace(*byte) => {}
+        Some(_) => return find_html_bogus_comment_end(bytes, cursor, scan_steps),
+        None => return bytes.len(),
+    }
+
+    skip_html_whitespace(bytes, &mut cursor, scan_steps);
+    match bytes.get(cursor) {
+        Some(b'>') => {
+            *scan_steps += 1;
+            return cursor + 1;
+        }
+        Some(_) => {}
+        None => return bytes.len(),
+    }
+
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| !is_html_whitespace(*byte) && *byte != b'>')
+    {
+        *scan_steps += 1;
+        cursor += 1;
+    }
+
+    if bytes.get(cursor) == Some(&b'>') {
+        *scan_steps += 1;
+        return cursor + 1;
+    }
+    if cursor == bytes.len() {
+        return bytes.len();
+    }
+
+    skip_html_whitespace(bytes, &mut cursor, scan_steps);
+    if bytes.get(cursor) == Some(&b'>') {
+        *scan_steps += 1;
+        return cursor + 1;
+    }
+
+    let is_public = if starts_with_ascii_case_insensitive_at(bytes, cursor, b"public") {
+        *scan_steps += b"public".len();
+        cursor += b"public".len();
+        true
+    } else if starts_with_ascii_case_insensitive_at(bytes, cursor, b"system") {
+        *scan_steps += b"system".len();
+        cursor += b"system".len();
+        false
+    } else {
+        return find_html_bogus_comment_end(bytes, cursor, scan_steps);
+    };
+
+    skip_html_whitespace(bytes, &mut cursor, scan_steps);
+    let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() else {
+        return match bytes.get(cursor) {
+            Some(b'>') => {
+                *scan_steps += 1;
+                cursor + 1
+            }
+            Some(_) => find_html_bogus_comment_end(bytes, cursor, scan_steps),
+            None => bytes.len(),
+        };
+    };
+
+    let Some(mut cursor) = find_quoted_doctype_identifier_end(bytes, cursor, quote, scan_steps)
+    else {
+        return bytes.len();
+    };
+
+    skip_html_whitespace(bytes, &mut cursor, scan_steps);
+    if !is_public || bytes.get(cursor) == Some(&b'>') {
+        return finish_html_doctype(bytes, cursor, scan_steps);
+    }
+
+    let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() else {
+        return match bytes.get(cursor) {
+            Some(_) => find_html_bogus_comment_end(bytes, cursor, scan_steps),
+            None => bytes.len(),
+        };
+    };
+
+    let Some(cursor) = find_quoted_doctype_identifier_end(bytes, cursor, quote, scan_steps) else {
+        return bytes.len();
+    };
+
+    finish_html_doctype(bytes, cursor, scan_steps)
+}
+
+fn find_quoted_doctype_identifier_end(
+    bytes: &[u8],
+    mut cursor: usize,
+    quote: u8,
+    scan_steps: &mut usize,
+) -> Option<usize> {
+    *scan_steps += 1;
+    cursor += 1;
+
+    while cursor < bytes.len() {
+        *scan_steps += 1;
+        let current = bytes[cursor];
+        cursor += 1;
+        if current == quote {
+            return Some(cursor);
+        }
+    }
+
+    None
+}
+
+fn finish_html_doctype(bytes: &[u8], mut cursor: usize, scan_steps: &mut usize) -> usize {
+    skip_html_whitespace(bytes, &mut cursor, scan_steps);
+    match bytes.get(cursor) {
+        Some(b'>') => {
+            *scan_steps += 1;
+            cursor + 1
+        }
+        Some(_) => find_html_bogus_comment_end(bytes, cursor, scan_steps),
+        None => bytes.len(),
+    }
+}
+
+fn skip_html_whitespace(bytes: &[u8], cursor: &mut usize, scan_steps: &mut usize) {
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| is_html_whitespace(*byte))
+    {
+        *scan_steps += 1;
+        *cursor += 1;
+    }
+}
+
+fn is_html_whitespace(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+}
+
 fn starts_with_at(bytes: &[u8], index: usize, needle: &[u8]) -> bool {
     index + needle.len() <= bytes.len() && &bytes[index..index + needle.len()] == needle
+}
+
+fn starts_with_ascii_case_insensitive_at(bytes: &[u8], index: usize, needle: &[u8]) -> bool {
+    bytes
+        .get(index..index + needle.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scraper::{Html, Selector};
     use std::{
         collections::HashSet,
         net::SocketAddr,
@@ -1479,6 +1678,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bogus_comments_do_not_expose_fake_images_or_hide_later_real_images() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7, 8, 9]))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let assets_dir = dir.path().join("assets");
+        let cases = [
+            (
+                r#"<?probe <img src="/fake-question.jpg">>"#,
+                "/real-question.jpg",
+            ),
+            (
+                r#"<!probe <img src="/fake-declaration.jpg">>"#,
+                "/real-declaration.jpg",
+            ),
+        ];
+
+        for (bogus, real_path) in cases {
+            let html = format!(r#"{bogus}<img src="{real_path}">"#);
+            let rewritten = rewrite_inline_media(
+                &html,
+                &Url::parse(&server.uri()).unwrap(),
+                &assets_dir,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(rewritten.html.starts_with(bogus), "got: {}", rewritten.html);
+            assert!(
+                !rewritten.html.contains(real_path),
+                "got: {}",
+                rewritten.html
+            );
+            assert_eq!(rewritten.assets.len(), 1);
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(paths, ["/real-question.jpg", "/real-declaration.jpg"]);
+    }
+
+    #[test]
+    fn bogus_comment_scanning_is_linear_and_does_not_restart_inside_content() {
+        let bogus = r#"<?probe <img src="/fake.jpg">>"#.repeat(4_096);
+        let html = format!(r#"{bogus}<img src="/real.jpg">"#);
+
+        let (targets, scan_steps) = image_targets_with_scan_steps(&html);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].source, "/real.jpg");
+        assert!(
+            scan_steps <= 4 * html.len(),
+            "scanner took {scan_steps} steps for {} input bytes",
+            html.len()
+        );
+    }
+
+    #[test]
+    fn bogus_comments_at_eof_consume_the_remainder() {
+        for html in [
+            r#"<?probe <img src="/fake-question.jpg""#,
+            r#"<!probe <img src="/fake-declaration.jpg""#,
+        ] {
+            let (targets, scan_steps) = image_targets_with_scan_steps(html);
+
+            assert!(targets.is_empty(), "got a target for {html:?}");
+            assert!(
+                scan_steps <= 2 * html.len(),
+                "scanner took {scan_steps} steps for {} input bytes",
+                html.len()
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_doctype_identifiers_do_not_expose_img_looking_bytes() {
+        let html = concat!(
+            r#"<!DOCTYPE html PUBLIC "identifier><img src='/fake.jpg'>">"#,
+            r#"<img src="/real.jpg">"#,
+        );
+
+        let (targets, scan_steps) = image_targets_with_scan_steps(html);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].source, "/real.jpg");
+        assert!(
+            scan_steps <= 2 * html.len(),
+            "scanner took {scan_steps} steps for {} input bytes",
+            html.len()
+        );
+    }
+
+    #[test]
+    fn malformed_doctype_name_quote_uses_bogus_terminator() {
+        let html = r#"<!DOCTYPE "bogus><img src="/real.jpg">"#;
+
+        let (targets, scan_steps) = image_targets_with_scan_steps(html);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].source, "/real.jpg");
+        assert!(
+            scan_steps <= 2 * html.len(),
+            "scanner took {scan_steps} steps for {} input bytes",
+            html.len()
+        );
+    }
+
+    #[tokio::test]
     async fn opaque_html_bodies_preserve_img_looking_bytes_without_requests() {
         let server = MockServer::start().await;
         let dir = tempdir().unwrap();
@@ -1849,6 +2163,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_media_fallbacks_survive_html_reparse_with_exact_targets() {
+        let html = concat!(
+            r#"<img src="double.jpg?x=1&amp;copy;=2" alt="double">"#,
+            r#"<img src='https://cdn.example.test/x&apos;onerror=alert(1)' alt='single'>"#,
+        );
+        let rewritten = rewrite_inline_media(
+            html,
+            &Url::parse("https://cdn.example.test/posts/1.html").unwrap(),
+            Path::new("unused"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let document = Html::parse_fragment(&rewritten.html);
+        let selector = Selector::parse("img").unwrap();
+        let images: Vec<_> = document.select(&selector).collect();
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            images[1].attr("src"),
+            Some("https://cdn.example.test/x'onerror=alert(1)")
+        );
+        assert_eq!(
+            images[0].attr("src"),
+            Some("https://cdn.example.test/posts/double.jpg?x=1&copy;=2")
+        );
+        assert!(images.iter().all(|image| image.attr("onerror").is_none()));
+
+        let rendered = crate::adoc::html_to_adoc(&rewritten.html);
+        assert!(
+            rendered.contains(concat!(
+                "image::https://cdn.example.test/posts/double.jpg?",
+                "x=1&copy;=2[double]"
+            )),
+            "got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(concat!(
+                "image::https://cdn.example.test/x'onerror=alert(1)",
+                "[single]"
+            )),
+            "got: {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn keeps_safe_download_failures_absolute_and_only_success_local() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1900,6 +2261,56 @@ mod tests {
         );
         assert_eq!(rewritten.assets.len(), 1);
         assert_eq!(rewritten.assets[0].original_url.path(), "/delivered/ok.jpg");
+    }
+
+    #[tokio::test]
+    async fn failed_download_fallbacks_survive_html_reparse_with_exact_targets() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let assets_dir = dir.path().join("assets");
+        let base = Url::parse(&format!("{}/delivered/1.html", server.uri())).unwrap();
+        let html = concat!(
+            r#"<img src="failed.jpg?x=1&amp;copy;=2" alt="double">"#,
+            r#"<img src='x&apos;onerror=alert(2)' alt='single'>"#,
+        );
+
+        let rewritten = rewrite_inline_media(html, &base, &assets_dir, true, None)
+            .await
+            .unwrap();
+
+        let document = Html::parse_fragment(&rewritten.html);
+        let selector = Selector::parse("img").unwrap();
+        let images: Vec<_> = document.select(&selector).collect();
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            images[0].attr("src"),
+            Some(format!("{}/delivered/failed.jpg?x=1&copy;=2", server.uri()).as_str())
+        );
+        assert_eq!(
+            images[1].attr("src"),
+            Some(format!("{}/delivered/x'onerror=alert(2)", server.uri()).as_str())
+        );
+        assert!(images.iter().all(|image| image.attr("onerror").is_none()));
+
+        let rendered = crate::adoc::html_to_adoc(&rewritten.html);
+        assert!(
+            rendered.contains(&format!(
+                "image::{}/delivered/failed.jpg?x=1&copy;=2[double]",
+                server.uri()
+            )),
+            "got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "image::{}/delivered/x'onerror=alert(2)[single]",
+                server.uri()
+            )),
+            "got: {rendered:?}"
+        );
     }
 
     #[tokio::test]

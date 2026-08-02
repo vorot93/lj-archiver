@@ -101,7 +101,7 @@ pub fn journal_base_url(journal: &str) -> Result<Url> {
 /// `users.livejournal.com/<journal>/<id>.html`). Query and fragment are ignored.
 /// Returns `None` for non-post or non-livejournal URLs.
 pub fn post_ref_from_url(url: &Url) -> Option<(String, u64)> {
-    let host = url.host_str()?;
+    let host = crate::net::normalized_domain_host(url)?;
 
     if host.eq_ignore_ascii_case("users.livejournal.com") {
         let mut segments = url.path_segments()?;
@@ -132,12 +132,15 @@ fn parse_url_target(input: &str) -> Result<ArchiveTarget> {
         input: input.to_string(),
         reason: error.to_string(),
     })?;
-    let host = url.host_str().ok_or_else(|| LjError::InvalidTarget {
-        input: input.to_string(),
-        reason: "URL has no host".to_string(),
-    })?;
+    if url.host().is_none() {
+        return Err(LjError::InvalidTarget {
+            input: input.to_string(),
+            reason: "URL has no host".to_string(),
+        });
+    }
+    let host = crate::net::normalized_domain_host(&url);
 
-    if host == "users.livejournal.com" {
+    if host.is_some_and(|host| host.eq_ignore_ascii_case("users.livejournal.com")) {
         let segments: Vec<_> = url
             .path_segments()
             .map(|segments| segments.collect())
@@ -174,7 +177,7 @@ fn parse_url_target(input: &str) -> Result<ArchiveTarget> {
         );
     }
 
-    if let Some(journal) = host.strip_suffix(".livejournal.com") {
+    if let Some(journal) = host.and_then(|host| host.strip_suffix(".livejournal.com")) {
         if journal.is_empty() || journal.eq_ignore_ascii_case("www") {
             return invalid(input, "expected a livejournal.com post URL");
         }
@@ -262,10 +265,9 @@ fn validate_journal(input: &str, journal: &str) -> Result<()> {
 }
 
 fn is_livejournal_host(input: &str) -> bool {
-    input
-        .split('/')
-        .next()
-        .unwrap_or(input)
+    let host = input.split('/').next().unwrap_or(input);
+    host.strip_suffix('.')
+        .unwrap_or(host)
         .to_ascii_lowercase()
         .ends_with(".livejournal.com")
 }
@@ -380,6 +382,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_dns_trailing_dot_livejournal_urls() {
+        let subdomain = parse_target("https://news.livejournal.com./166511.html", None).unwrap();
+        assert_post(
+            subdomain,
+            "news",
+            166511,
+            "https://news.livejournal.com./166511.html",
+        );
+
+        let users = parse_target(
+            "https://users.livejournal.com./example_user/166512.html",
+            None,
+        )
+        .unwrap();
+        assert_post(
+            users,
+            "example_user",
+            166512,
+            "https://users.livejournal.com./example_user/166512.html",
+        );
+
+        let bare = parse_target("evo-lutio.livejournal.com./1753760.html", None).unwrap();
+        assert_post(
+            bare,
+            "evo-lutio",
+            1753760,
+            "https://evo-lutio.livejournal.com./1753760.html",
+        );
+    }
+
+    #[test]
     fn parses_local_test_server_post_url() {
         let parsed = parse_target("http://127.0.0.1:37185/news/166511.html", None).unwrap();
         assert_post(
@@ -395,6 +428,14 @@ mod tests {
             "news",
             166511,
             "http://localhost:37185/news/166511.html",
+        );
+
+        let parsed = parse_target("http://localhost.:37185/news/166511.html", None).unwrap();
+        assert_post(
+            parsed,
+            "news",
+            166511,
+            "http://localhost.:37185/news/166511.html",
         );
     }
 
@@ -550,6 +591,16 @@ mod tests {
                 &Url::parse("https://users.livejournal.com/example_user/166512.html").unwrap()
             ),
             Some(("example_user".to_string(), 166512))
+        );
+        assert_eq!(
+            post_ref_from_url(&Url::parse("https://news.livejournal.com./166513.html").unwrap()),
+            Some(("news".to_string(), 166513))
+        );
+        assert_eq!(
+            post_ref_from_url(
+                &Url::parse("https://users.livejournal.com./example_user/166514.html").unwrap()
+            ),
+            Some(("example_user".to_string(), 166514))
         );
     }
 

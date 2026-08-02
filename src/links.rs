@@ -10,7 +10,14 @@ use url::Url;
 pub(crate) struct PendingLink {
     pub token: String,
     pub target_id: u64,
+    pub local_target: String,
     pub external_target: String,
+}
+
+#[derive(Clone, Copy)]
+enum LocalTargetContext {
+    XrefMacro,
+    ImageLinkAttribute,
 }
 
 enum RewriteMode {
@@ -50,14 +57,29 @@ impl LinkRewriter {
     /// Returns a complete AsciiDoc macro target when `href` resolves to a post
     /// of this journal that is in the export's id set; otherwise `None`.
     pub fn xref_target(&self, href: &str) -> Option<String> {
+        self.local_post_target(href, LocalTargetContext::XrefMacro)
+    }
+
+    /// Returns a URI/path suitable for an image macro's `link=` attribute when
+    /// `href` resolves to an exported post of this journal.
+    pub fn image_link_target(&self, href: &str) -> Option<String> {
+        self.local_post_target(href, LocalTargetContext::ImageLinkAttribute)
+    }
+
+    fn local_post_target(&self, href: &str, context: LocalTargetContext) -> Option<String> {
         let url = self.resolved_http_url(href)?;
         let (journal, id) = post_ref_from_url(&url)?;
         if !journals_alias(&journal, &self.journal) || !self.ids.contains(&id) {
             return None;
         }
 
+        let local_target = match context {
+            LocalTargetContext::XrefMacro => format!("xref:{id}.adoc"),
+            LocalTargetContext::ImageLinkAttribute => format!("{id}.adoc"),
+        };
+
         match self.mode {
-            RewriteMode::Direct => Some(format!("xref:{id}.adoc")),
+            RewriteMode::Direct => Some(local_target),
             RewriteMode::Pending => {
                 let mut links = self
                     .pending_links
@@ -67,7 +89,8 @@ impl LinkRewriter {
                 links.push(PendingLink {
                     token: token.clone(),
                     target_id: id,
-                    external_target: sanitize_macro_target(url.as_str()),
+                    local_target,
+                    external_target: pending_external_target(&url, context),
                 });
                 Some(token)
             }
@@ -94,6 +117,14 @@ impl LinkRewriter {
     }
 }
 
+fn pending_external_target(url: &Url, context: LocalTargetContext) -> String {
+    let target = sanitize_macro_target(url.as_str());
+    match context {
+        LocalTargetContext::XrefMacro => target,
+        LocalTargetContext::ImageLinkAttribute => target.replace(',', "%2C"),
+    }
+}
+
 pub(crate) fn resolve_pending_links(
     text: &str,
     links: &[PendingLink],
@@ -103,7 +134,7 @@ pub(crate) fn resolve_pending_links(
 
     for link in links {
         let target = if local_ids.contains(&link.target_id) {
-            format!("xref:{}.adoc", link.target_id)
+            link.local_target.clone()
         } else {
             link.external_target.clone()
         };

@@ -3,6 +3,15 @@ use std::sync::Arc;
 use reqwest::cookie::Jar;
 use url::{Host, Url};
 
+/// Returns a DNS host without its optional root-label dot. IP literals remain
+/// distinguishable through `Url::host()` and are deliberately not returned.
+pub(crate) fn normalized_domain_host(url: &Url) -> Option<&str> {
+    match url.host()? {
+        Host::Domain(host) => Some(host.strip_suffix('.').unwrap_or(host)),
+        Host::Ipv4(_) | Host::Ipv6(_) => None,
+    }
+}
+
 /// A loopback HTTP test server: `http` scheme, an explicit port, and a
 /// loopback host (`localhost` or any loopback IP literal). Never matches a
 /// production `https://*.livejournal.com` base URL.
@@ -16,7 +25,9 @@ pub(crate) fn is_loopback_test_server(url: &Url) -> bool {
         return false;
     }
     match url.host() {
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Domain(_)) => {
+            normalized_domain_host(url).is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+        }
         Some(Host::Ipv4(ip)) => ip.is_loopback(),
         Some(Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
@@ -85,6 +96,13 @@ mod tests {
         for u in ["http://127.4.5.6:8080/", "http://LocalHost:8080/"] {
             assert!(is_loopback_test_server(&Url::parse(u).unwrap()), "{u}");
         }
+    }
+
+    #[test]
+    fn matches_dns_trailing_dot_localhost() {
+        let url = Url::parse("http://localhost.:8080/").unwrap();
+
+        assert!(is_loopback_test_server(&url));
     }
 
     #[test]
