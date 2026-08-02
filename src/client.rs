@@ -320,14 +320,36 @@ mod tests {
 
     #[tokio::test]
     async fn transport_error_without_response_reports_requested_url() {
-        let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
-        let requested_url = Url::parse(&format!(
-            "http://{}/start",
-            unavailable.local_addr().unwrap()
-        ))
-        .unwrap();
-        drop(unavailable);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let requested_url =
+            Url::parse(&format!("http://{}/start", listener.local_addr().unwrap())).unwrap();
         let client = LjClient::new(None).unwrap();
+        let expected_attempts = client.retries + 1;
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut attempts = 0;
+
+            while attempts < expected_attempts && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let mut request_prefix = [0; b"GET /start ".len()];
+                        stream.read_exact(&mut request_prefix).unwrap();
+                        assert_eq!(request_prefix, *b"GET /start ");
+                        attempts += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+
+            attempts
+        });
 
         let error = client.fetch_page(&requested_url).await.unwrap_err();
 
@@ -335,6 +357,7 @@ mod tests {
             LjError::Http { url, .. } => assert_eq!(url, requested_url.as_str()),
             other => panic!("expected transport error, got {other:?}"),
         }
+        assert_eq!(server.join().unwrap(), expected_attempts);
     }
 
     #[tokio::test]
