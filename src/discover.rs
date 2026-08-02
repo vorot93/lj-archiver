@@ -47,7 +47,7 @@ fn collect_archive_links(
                 is_journal_archive_url(url, journal)
             }
         })
-        .filter(|url| is_expected(url.path(), base_url, journal))
+        .filter(|url| is_expected(url.path(), url, journal))
         .collect();
 
     urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -193,14 +193,14 @@ fn is_month_path(path: &str) -> bool {
         && bytes[6..8].iter().all(|byte| byte.is_ascii_digit())
 }
 
-fn is_expected_month_path(path: &str, base_url: &Url, journal: &str) -> bool {
+fn is_expected_month_path(path: &str, url: &Url, journal: &str) -> bool {
     if is_month_path(path) {
         return true;
     }
     // users.livejournal.com links month/year pages under a /<journal> prefix, on
     // both the calendar and the per-year pages. The journal is known by the caller
     // (like parse_post_ids), so strip it directly rather than requiring a /calendar base.
-    if is_users_livejournal_url(base_url) {
+    if is_users_livejournal_url(url) {
         return strip_users_journal_prefix(path, journal).is_some_and(is_month_path);
     }
     false
@@ -215,11 +215,11 @@ fn is_year_path(path: &str) -> bool {
         && bytes[1..5].iter().all(|byte| byte.is_ascii_digit())
 }
 
-fn is_expected_year_path(path: &str, base_url: &Url, journal: &str) -> bool {
+fn is_expected_year_path(path: &str, url: &Url, journal: &str) -> bool {
     if is_year_path(path) {
         return true;
     }
-    if is_users_livejournal_url(base_url) {
+    if is_users_livejournal_url(url) {
         return strip_users_journal_prefix(path, journal).is_some_and(is_year_path);
     }
     false
@@ -661,6 +661,29 @@ mod tests {
             parse_post_ids(month_html, &month, "evo_lutio"),
             vec![240331]
         );
+    }
+
+    #[test]
+    fn accepts_users_archive_link_from_subdomain_page() {
+        let page = Url::parse("https://evo-lutio.livejournal.com/calendar/").unwrap();
+        let html = r#"
+            <a href="https://users.livejournal.com/evo_lutio/2025/01/">January 2025</a>
+        "#;
+
+        assert_eq!(
+            parse_month_links(html, &page, "evo_lutio"),
+            vec![Url::parse("https://users.livejournal.com/evo_lutio/2025/01/").unwrap()]
+        );
+    }
+
+    #[test]
+    fn rejects_prefixed_subdomain_archive_link_from_users_page() {
+        let page = Url::parse("https://users.livejournal.com/evo_lutio/calendar/").unwrap();
+        let html = r#"
+            <a href="https://evo-lutio.livejournal.com/evo_lutio/2025/01/">invalid</a>
+        "#;
+
+        assert!(parse_month_links(html, &page, "evo_lutio").is_empty());
     }
 
     #[tokio::test]
