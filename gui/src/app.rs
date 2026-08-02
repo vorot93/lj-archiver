@@ -182,8 +182,11 @@ mod tests {
         let State::Error { message } = &app.state else {
             panic!("invalid output folder should enter the error state");
         };
+        assert!(message.starts_with("selected folder failed archive validation: "));
+        assert!(message.contains("could not read selected directory"));
         assert!(
-            message.contains("archive identity cannot be verified: could not inspect posts folder")
+            !message.contains("posts folder"),
+            "selected-path errors must not claim that a posts folder was inspected: {message}"
         );
     }
 }

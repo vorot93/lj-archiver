@@ -4,12 +4,13 @@
 //! that actually constructs and consumes this API lives in `app.rs`.
 
 use lj_archiver::{
+    archive::Archive,
     models::{ArchiveTarget, PostFailure, RunOptions},
     progress::ProgressEvent,
     run::RunOutcome,
-    target::{is_valid_journal_name, journals_alias, parse_target},
+    target::parse_target,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -170,15 +171,16 @@ impl App {
             match parse_target(target, None).map_err(|error| error.to_string())? {
                 ArchiveTarget::Journal { journal } | ArchiveTarget::Post { journal, .. } => journal,
             };
-        let existing_journal = archive_journal(&folder)?;
-        if let Some(existing_journal) = &existing_journal
-            && !journals_alias(existing_journal, &requested_journal)
-        {
-            return Err(format!(
-                "selected folder contains archive for {existing_journal}, not requested journal {requested_journal}"
-            ));
-        }
-        let resume = existing_journal.is_some() && folder_has_existing_posts(&folder)?;
+        std::fs::read_dir(&folder).map_err(|error| {
+            format!(
+                "selected folder failed archive validation: could not read selected directory {}: {error}",
+                folder.display()
+            )
+        })?;
+        let existing = Archive::new(&folder, requested_journal)
+            .inspect_existing()
+            .map_err(|error| format!("selected folder failed archive validation: {error}"))?;
+        let resume = existing.is_some_and(|archive| !archive.posts.is_empty());
         let options = RunOptions {
             output_dir: Some(folder),
             include_comments: self.config.include_comments,
@@ -194,76 +196,84 @@ impl App {
     }
 }
 
-fn archive_journal(folder: &Path) -> Result<Option<String>, String> {
-    let index = folder.join("index.adoc");
-    let has_posts = folder_has_existing_posts(folder)?;
-    let has_index = match std::fs::metadata(&index) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            return Err(format!(
-                "archive identity cannot be verified: could not inspect index.adoc: {error}"
-            ));
-        }
-    };
-    if !has_index && !has_posts {
-        return Ok(None);
-    }
-
-    let contents = std::fs::read_to_string(&index).map_err(|error| {
-        format!("archive identity cannot be verified: could not read index.adoc: {error}")
-    })?;
-    let first_line = contents.lines().next().unwrap_or_default();
-    let Some(journal) = first_line
-        .strip_prefix("= ")
-        .and_then(|line| line.strip_suffix(" Archive"))
-        .map(str::trim)
-        .filter(|journal| is_valid_journal_name(journal))
-    else {
-        return Err(
-            "archive identity cannot be verified: index.adoc has an invalid archive title"
-                .to_string(),
-        );
-    };
-
-    Ok(Some(journal.to_string()))
-}
-
-/// Whether `folder/posts/` already contains at least one `.adoc` file.
-pub fn folder_has_existing_posts(folder: &Path) -> Result<bool, String> {
-    let entries = match std::fs::read_dir(folder.join("posts")) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!(
-                "archive identity cannot be verified: could not inspect posts folder: {error}"
-            ));
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!(
-                "archive identity cannot be verified: could not inspect posts folder entry: {error}"
-            )
-        })?;
-        if entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "adoc")
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use lj_archiver::{models::PostFailure, progress::ProgressEvent, run::RunOutcome};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
     use url::Url;
+
+    const ARCHIVE_VALIDATION_PREFIX: &str = "selected folder failed archive validation: ";
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TreeEntry {
+        path: PathBuf,
+        is_dir: bool,
+        contents: Vec<u8>,
+    }
+
+    fn app_for_folder(target: &str, folder: &Path) -> App {
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged(target.to_string()));
+        app.update_state(&Message::FolderChosen(Some(folder.to_path_buf())));
+        app
+    }
+
+    fn write_valid_index(root: &Path, journal: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("index.adoc"), format!("= {journal} Archive\n")).unwrap();
+    }
+
+    fn write_public_post(root: &Path, filename: &str, contents: &str) {
+        let posts = root.join("posts");
+        std::fs::create_dir_all(&posts).unwrap();
+        std::fs::write(posts.join(filename), contents).unwrap();
+    }
+
+    fn snapshot_tree(root: &Path) -> Vec<TreeEntry> {
+        let Ok(root_metadata) = std::fs::symlink_metadata(root) else {
+            return Vec::new();
+        };
+        if !root_metadata.is_dir() {
+            return vec![TreeEntry {
+                path: PathBuf::from("."),
+                is_dir: false,
+                contents: std::fs::read(root).unwrap(),
+            }];
+        }
+
+        let mut snapshot = vec![TreeEntry {
+            path: PathBuf::from("."),
+            is_dir: true,
+            contents: Vec::new(),
+        }];
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = entry.metadata().unwrap();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if metadata.is_dir() {
+                    snapshot.push(TreeEntry {
+                        path: relative,
+                        is_dir: true,
+                        contents: Vec::new(),
+                    });
+                    pending.push(path);
+                } else {
+                    snapshot.push(TreeEntry {
+                        path: relative,
+                        is_dir: false,
+                        contents: std::fs::read(path).unwrap(),
+                    });
+                }
+            }
+        }
+        snapshot.sort_by(|left, right| left.path.cmp(&right.path));
+        snapshot
+    }
 
     fn outcome(root: PathBuf, failed: usize, failures: Vec<PostFailure>) -> RunOutcome {
         RunOutcome {
@@ -426,13 +436,168 @@ mod tests {
     }
 
     #[test]
-    fn detects_existing_posts_for_resume() {
+    fn unsafe_output_folder_matrix_is_rejected_without_mutation() {
         let dir = tempdir().unwrap();
-        assert!(!folder_has_existing_posts(dir.path()).unwrap());
-        let posts = dir.path().join("posts");
-        std::fs::create_dir_all(&posts).unwrap();
-        std::fs::write(posts.join("166511.adoc"), "= T\n").unwrap();
-        assert!(folder_has_existing_posts(dir.path()).unwrap());
+        let cases = [
+            "unrelated-file",
+            "lone-book",
+            "assets-only",
+            "posts-without-index",
+            "malformed-index",
+            "mismatched-index",
+            "invalid-journal-index",
+            "index-as-directory",
+            "book-as-directory",
+            "public-adoc-as-directory",
+            "posts-as-file",
+            "zero-post-id",
+            "nonnumeric-post-id",
+            "duplicate-numeric-post-id",
+            "missing-post-title",
+            "malformed-post-title",
+            "selected-path-is-file",
+            "selected-path-vanished",
+        ];
+        let mut accepted = Vec::new();
+        let mut unstable_errors = Vec::new();
+
+        for name in cases {
+            let root = dir.path().join(name);
+            match name {
+                "unrelated-file" => {
+                    std::fs::create_dir(&root).unwrap();
+                    std::fs::write(root.join("notes.txt"), "unrelated\n").unwrap();
+                }
+                "lone-book" => {
+                    std::fs::create_dir(&root).unwrap();
+                    std::fs::write(root.join("book.adoc"), "= news Archive\n").unwrap();
+                }
+                "assets-only" => {
+                    std::fs::create_dir_all(root.join("assets")).unwrap();
+                    std::fs::write(root.join("assets/image.jpg"), "asset").unwrap();
+                }
+                "posts-without-index" => write_public_post(&root, "1.adoc", "= One\n"),
+                "malformed-index" => {
+                    std::fs::create_dir(&root).unwrap();
+                    std::fs::write(root.join("index.adoc"), "news Archive\n").unwrap();
+                }
+                "mismatched-index" => write_valid_index(&root, "other"),
+                "invalid-journal-index" => write_valid_index(&root, "bad.name"),
+                "index-as-directory" => {
+                    std::fs::create_dir_all(root.join("index.adoc")).unwrap();
+                }
+                "book-as-directory" => {
+                    write_valid_index(&root, "news");
+                    std::fs::create_dir(root.join("book.adoc")).unwrap();
+                }
+                "public-adoc-as-directory" => {
+                    write_valid_index(&root, "news");
+                    std::fs::create_dir_all(root.join("posts/1.adoc")).unwrap();
+                }
+                "posts-as-file" => {
+                    write_valid_index(&root, "news");
+                    std::fs::write(root.join("posts"), "not a directory\n").unwrap();
+                }
+                "zero-post-id" => {
+                    write_valid_index(&root, "news");
+                    write_public_post(&root, "0.adoc", "= Zero\n");
+                }
+                "nonnumeric-post-id" => {
+                    write_valid_index(&root, "news");
+                    write_public_post(&root, "not-a-number.adoc", "= Text\n");
+                }
+                "duplicate-numeric-post-id" => {
+                    write_valid_index(&root, "news");
+                    write_public_post(&root, "1.adoc", "= One\n");
+                    write_public_post(&root, "01.adoc", "= Duplicate\n");
+                }
+                "missing-post-title" => {
+                    write_valid_index(&root, "news");
+                    write_public_post(&root, "1.adoc", "");
+                }
+                "malformed-post-title" => {
+                    write_valid_index(&root, "news");
+                    write_public_post(&root, "1.adoc", "== Not level zero\n");
+                }
+                "selected-path-is-file" => {
+                    std::fs::write(&root, "not a directory\n").unwrap();
+                }
+                "selected-path-vanished" => {}
+                other => panic!("unhandled unsafe-folder fixture {other}"),
+            }
+
+            let before = snapshot_tree(&root);
+            match app_for_folder("news", &root).run_request() {
+                Ok(Some(_)) => accepted.push(name),
+                Ok(None) => panic!("{name}: configured request unexpectedly was not startable"),
+                Err(error) => {
+                    if !error.starts_with(ARCHIVE_VALIDATION_PREFIX) {
+                        unstable_errors.push((name, error));
+                    }
+                }
+            }
+            assert_eq!(
+                snapshot_tree(&root),
+                before,
+                "{name}: validation mutated root"
+            );
+        }
+
+        assert!(
+            accepted.is_empty(),
+            "manual GUI checks accepted unsafe folders: {accepted:?}"
+        );
+        assert!(
+            unstable_errors.is_empty(),
+            "archive-validation errors lacked stable prefix: {unstable_errors:?}"
+        );
+    }
+
+    #[test]
+    fn safe_output_folder_matrix_preserves_core_alias_and_numeric_resume_rules() {
+        let dir = tempdir().unwrap();
+        let cases = [
+            ("truly-empty", "news", false),
+            ("exact-zero-post", "news", false),
+            ("matching-alias-zero-post", "evo_lutio", false),
+            ("canonical-public-post", "news", true),
+            ("numeric-alias-public-post", "evo_lutio", true),
+        ];
+
+        for (name, target, expected_resume) in cases {
+            let root = dir.path().join(name);
+            match name {
+                "truly-empty" => std::fs::create_dir(&root).unwrap(),
+                "exact-zero-post" => write_valid_index(&root, "news"),
+                "matching-alias-zero-post" => write_valid_index(&root, "Evo-Lutio"),
+                "canonical-public-post" => {
+                    write_valid_index(&root, "news");
+                    write_public_post(&root, "1.adoc", "= Canonical\n");
+                }
+                "numeric-alias-public-post" => {
+                    write_valid_index(&root, "Evo-Lutio");
+                    write_public_post(&root, "0001.adoc", "= Numeric alias\n");
+                }
+                other => panic!("unhandled safe-folder fixture {other}"),
+            }
+
+            let before = snapshot_tree(&root);
+            let (_, options) = app_for_folder(target, &root)
+                .run_request()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                options.output_dir.as_deref(),
+                Some(root.as_path()),
+                "{name}"
+            );
+            assert_eq!(options.resume, expected_resume, "{name}");
+            assert_eq!(
+                snapshot_tree(&root),
+                before,
+                "{name}: validation mutated root"
+            );
+        }
     }
 
     #[test]
@@ -505,7 +670,8 @@ mod tests {
         app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
 
         let error = app.run_request().unwrap_err();
-        assert!(error.contains("archive identity cannot be verified"));
+        assert!(error.starts_with(ARCHIVE_VALIDATION_PREFIX));
+        assert!(error.contains("missing controlled index"));
     }
 
     #[test]
@@ -531,12 +697,14 @@ mod tests {
         app.update_state(&Message::FolderChosen(Some(output)));
 
         let error = app.run_request().unwrap_err();
-        assert!(error.contains("archive identity cannot be verified"));
+        assert!(error.starts_with(ARCHIVE_VALIDATION_PREFIX));
+        assert!(error.contains("could not read selected directory"));
     }
 
     #[test]
     fn posts_file_is_rejected_when_inspection_fails() {
         let dir = tempdir().unwrap();
+        write_valid_index(dir.path(), "news");
         std::fs::write(dir.path().join("posts"), "not a directory\n").unwrap();
 
         let mut app = App::default();
@@ -544,6 +712,7 @@ mod tests {
         app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
 
         let error = app.run_request().unwrap_err();
-        assert!(error.contains("archive identity cannot be verified"));
+        assert!(error.starts_with(ARCHIVE_VALIDATION_PREFIX));
+        assert!(error.contains("posts path is not a directory"));
     }
 }
