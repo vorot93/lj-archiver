@@ -171,7 +171,9 @@ fn neutralize_inline_passthrough_macros(text: &str) -> String {
     while let Some(relative_start) = text[cursor..].find("pass:") {
         let start = cursor + relative_start;
 
-        if starts_inline_passthrough_macro(text, start) {
+        if starts_inline_passthrough_macro(text, start)
+            && !is_immediately_escaped(text.as_bytes(), start)
+        {
             let next = start + "pass:".len();
             output.push_str(&text[cursor..start]);
             output.push('\\');
@@ -229,7 +231,11 @@ fn neutralize_inline_passthrough_delimiters(text: &str) -> String {
         let end = content_start + relative_end + 3;
 
         output.push_str(&text[cursor..start]);
-        output.push_str(r"\+++");
+        if is_immediately_escaped(text.as_bytes(), start) {
+            output.push_str("+++");
+        } else {
+            output.push_str(r"\+++");
+        }
         output.push_str(&text[content_start..end]);
         cursor = end;
     }

@@ -1567,6 +1567,16 @@ mod tests {
     }
 
     #[test]
+    fn does_not_double_escape_preescaped_inline_passthrough_macros() {
+        assert_eq!(html_to_adoc(r"<p>\pass:[x]</p>"), "\\pass:[x]\n\n");
+    }
+
+    #[test]
+    fn does_not_double_escape_preescaped_inline_passthrough_delimiters() {
+        assert_eq!(html_to_adoc(r"<p>\+++x+++</p>"), "\\+++x+++\n\n");
+    }
+
+    #[test]
     fn keeps_malformed_inline_macro_and_attribute_reference_shapes_unchanged() {
         assert_eq!(
             html_to_adoc("<p>image:evil.png {secret {bad space}</p>"),
