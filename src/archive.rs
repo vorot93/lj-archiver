@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+    adoc,
     error::{LjError, Result},
     models::ArchivedPost,
 };
@@ -52,7 +53,7 @@ impl Archive {
         contents.push_str("|===\n|Post ID |Title\n\n");
         for post in posts {
             let path = self.index_path(&post.path);
-            let title = sanitize_index_label(&post.title);
+            let title = adoc::sanitize_xref_label(&post.title);
             contents.push_str(&format!(
                 "|{} |xref:{}[{}]\n",
                 post.id,
@@ -92,14 +93,6 @@ impl Archive {
     fn index_path(&self, path: &Path) -> PathBuf {
         path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
     }
-}
-
-fn sanitize_index_label(label: &str) -> String {
-    label
-        .split(|ch: char| matches!(ch, '|' | '[' | ']' | '\n' | '\r') || ch.is_whitespace())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
@@ -170,6 +163,27 @@ mod tests {
             .find(|line| line.starts_with("|166511 "))
             .unwrap();
         assert_eq!(row, "|166511 |xref:posts/166511.adoc[A tricky title]");
+    }
+
+    #[test]
+    fn neutralizes_active_asciidoc_in_index_titles() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("archive"), "news");
+        archive
+            .write_index(&[ArchivedPost {
+                id: 1,
+                title: "+++<img src=x onerror=alert(1)>+++".to_string(),
+                path: PathBuf::from("posts/1.adoc"),
+            }])
+            .unwrap();
+
+        let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
+        let row = index.lines().find(|line| line.starts_with("|1 ")).unwrap();
+        assert_eq!(
+            row,
+            "|1 |xref:posts/1.adoc[\\+++<img src=x onerror=alert(1)>+++]"
+        );
+        assert!(!index.contains("[+++<img"));
     }
 
     #[test]

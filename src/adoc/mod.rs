@@ -132,6 +132,15 @@ fn escape_title(value: &str) -> String {
     neutralize_plain_adoc_fragment_at_line_start(title.trim(), false)
 }
 
+pub(crate) fn sanitize_xref_label(value: &str) -> String {
+    let normalized = value
+        .split(|ch: char| matches!(ch, '|' | '[' | ']' | '\n' | '\r') || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    neutralize_plain_adoc_fragment_at_line_start(&normalized, false)
+}
+
 fn escape_attribute_value(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }

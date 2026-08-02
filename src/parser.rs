@@ -13,8 +13,6 @@ static ENTRY_TITLE: LazyLock<Selector> = LazyLock::new(|| {
 });
 static DOCUMENT_TITLE: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("title").expect("static selector must parse"));
-static ENTRY_AUTHOR: LazyLock<Selector> =
-    LazyLock::new(|| Selector::parse(".entry-author").expect("static selector must parse"));
 static ENTRY_DATE: LazyLock<Selector> = LazyLock::new(|| {
     Selector::parse("time.entry-date[datetime]").expect("static selector must parse")
 });
@@ -115,9 +113,7 @@ pub fn parse_post_page(html: &str, url: &Url) -> Result<Post> {
         .and_then(|article| first_text_in(article, &ENTRY_TITLE))
         .or_else(|| first_text(&document, &DOCUMENT_TITLE))
         .unwrap_or_else(|| format!("LiveJournal post {id}"));
-    let author = article
-        .and_then(|article| first_text_in(article, &ENTRY_AUTHOR))
-        .unwrap_or_else(|| journal.clone());
+    let author = journal.clone();
 
     let poster = entry
         .as_ref()
@@ -529,7 +525,7 @@ mod tests {
         assert_eq!(post.journal, "news");
         assert_eq!(post.id, 166515);
         assert_eq!(post.title, "Right title");
-        assert_eq!(post.author, "right-author");
+        assert_eq!(post.author, "news");
         assert_eq!(
             post.published_at,
             Some(
@@ -587,6 +583,27 @@ mod tests {
         assert_eq!(post.author, "news");
         assert_eq!(post.poster.as_deref(), Some("livejournal"));
         assert_eq!(post.published_at, DateTime::from_timestamp(1765987260, 0));
+    }
+
+    #[test]
+    fn canonical_journal_is_not_overridden_by_legacy_author() {
+        let html = r#"
+            <html><body>
+                <article data-journal="community" data-itemid="1">
+                    <span class="entry-author">alice</span>
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>
+                Site.entry = {"ditemid":1,"journal":"community","poster":"alice"};
+                </script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://community.livejournal.com/1.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "community");
+        assert_eq!(post.author, "community");
+        assert_eq!(post.poster.as_deref(), Some("alice"));
     }
 
     #[test]
