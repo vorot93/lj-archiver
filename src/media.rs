@@ -404,11 +404,40 @@ fn filename_for_url(url: &Url) -> String {
 }
 
 fn extension_for_url(url: &Url) -> &str {
-    Path::new(url.path())
+    let Some(extension) = Path::new(url.path())
         .extension()
         .and_then(|extension| extension.to_str())
-        .filter(|extension| !extension.is_empty())
-        .unwrap_or("bin")
+    else {
+        return "bin";
+    };
+
+    if !(1..=5).contains(&extension.len())
+        || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return "bin";
+    }
+
+    if extension.eq_ignore_ascii_case("jpg") {
+        "jpg"
+    } else if extension.eq_ignore_ascii_case("jpeg") {
+        "jpeg"
+    } else if extension.eq_ignore_ascii_case("png") {
+        "png"
+    } else if extension.eq_ignore_ascii_case("gif") {
+        "gif"
+    } else if extension.eq_ignore_ascii_case("webp") {
+        "webp"
+    } else if extension.eq_ignore_ascii_case("svg") {
+        "svg"
+    } else if extension.eq_ignore_ascii_case("avif") {
+        "avif"
+    } else if extension.eq_ignore_ascii_case("bmp") {
+        "bmp"
+    } else if extension.eq_ignore_ascii_case("ico") {
+        "ico"
+    } else {
+        "bin"
+    }
 }
 
 fn relative_asset_path(filename: &str) -> PathBuf {
@@ -443,28 +472,132 @@ fn find_next_img_tag(html: &str, cursor: usize) -> Option<usize> {
     let bytes = html.as_bytes();
     let mut index = cursor;
 
-    while index + 4 <= bytes.len() {
-        if starts_with_at(bytes, index, b"<!--") {
-            let comment_body_start = index + 4;
-            let comment_end_offset = html[comment_body_start..].find("-->")?;
-            index = comment_body_start + comment_end_offset + 3;
+    while let Some(relative_start) = html[index..].find('<') {
+        let tag_start = index + relative_start;
+
+        if starts_with_at(bytes, tag_start, b"<!--") {
+            index = find_html_comment_end(bytes, tag_start + 4);
             continue;
         }
 
-        if bytes[index] == b'<'
-            && bytes[index + 1].eq_ignore_ascii_case(&b'i')
-            && bytes[index + 2].eq_ignore_ascii_case(&b'm')
-            && bytes[index + 3].eq_ignore_ascii_case(&b'g')
-            && bytes
-                .get(index + 4)
-                .is_none_or(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
-        {
-            return Some(index);
+        let Some((is_closing, name_start, name_end)) = parse_html_tag_name(bytes, tag_start) else {
+            index = tag_start + 1;
+            continue;
+        };
+        let Some(tag_end) = find_tag_end(html, tag_start) else {
+            index = tag_start + 1;
+            continue;
+        };
+        let name = &html[name_start..name_end];
+
+        if !is_closing && name.eq_ignore_ascii_case("img") {
+            return Some(tag_start);
         }
-        index += 1;
+
+        if !is_closing && is_opaque_html_element(name) {
+            if name.eq_ignore_ascii_case("plaintext") {
+                return None;
+            }
+
+            index = find_opaque_html_element_end(html, tag_end, name);
+            continue;
+        }
+
+        index = tag_end;
     }
 
     None
+}
+
+fn parse_html_tag_name(bytes: &[u8], tag_start: usize) -> Option<(bool, usize, usize)> {
+    if bytes.get(tag_start) != Some(&b'<') {
+        return None;
+    }
+
+    let mut cursor = tag_start + 1;
+    let is_closing = bytes.get(cursor) == Some(&b'/');
+    if is_closing {
+        cursor += 1;
+    }
+
+    let name_start = cursor;
+    if !bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'>'))
+    {
+        cursor += 1;
+    }
+
+    Some((is_closing, name_start, cursor))
+}
+
+fn is_opaque_html_element(name: &str) -> bool {
+    [
+        "script",
+        "style",
+        "textarea",
+        "xmp",
+        "iframe",
+        "noembed",
+        "noframes",
+        "plaintext",
+    ]
+    .iter()
+    .any(|opaque_name| name.eq_ignore_ascii_case(opaque_name))
+}
+
+fn find_opaque_html_element_end(html: &str, content_start: usize, name: &str) -> usize {
+    let bytes = html.as_bytes();
+    let mut cursor = content_start;
+    let closing_name_end_offset = 2 + name.len();
+
+    while cursor + closing_name_end_offset <= bytes.len() {
+        let closing_name_end = cursor + closing_name_end_offset;
+        let has_appropriate_boundary = matches!(
+            bytes.get(closing_name_end),
+            Some(byte) if byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
+        );
+
+        if has_appropriate_boundary
+            && bytes.get(cursor..cursor + 2) == Some(b"</")
+            && bytes[cursor + 2..closing_name_end].eq_ignore_ascii_case(name.as_bytes())
+        {
+            return find_tag_end(html, cursor).unwrap_or(bytes.len());
+        }
+
+        cursor += 1;
+    }
+
+    bytes.len()
+}
+
+/// Return the first byte after an HTML-tokenizer-recognized comment end. `>` and
+/// `->` are abrupt endings immediately after `<!--`; `-->` and `--!>` end a
+/// comment from its body. An unclosed comment consumes the remainder.
+fn find_html_comment_end(bytes: &[u8], content_start: usize) -> usize {
+    if bytes.get(content_start) == Some(&b'>') {
+        return content_start + 1;
+    }
+    if bytes.get(content_start..content_start + 2) == Some(b"->") {
+        return content_start + 2;
+    }
+
+    let mut cursor = content_start;
+    while cursor < bytes.len() {
+        if bytes.get(cursor..cursor + 3) == Some(b"-->") {
+            return cursor + 3;
+        }
+        if bytes.get(cursor..cursor + 4) == Some(b"--!>") {
+            return cursor + 4;
+        }
+        cursor += 1;
+    }
+
+    bytes.len()
 }
 
 fn starts_with_at(bytes: &[u8], index: usize, needle: &[u8]) -> bool {
@@ -1164,6 +1297,243 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url.path(), "/real.jpg");
+    }
+
+    #[tokio::test]
+    async fn opaque_html_bodies_preserve_img_looking_bytes_without_requests() {
+        let server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let assets_dir = dir.path().join("assets");
+        let cases = [
+            ("script", r#"<script><img src="/fake.jpg"></script>"#),
+            (
+                "mixed-case style",
+                r#"<StYlE><img src="/fake.jpg"></sTyLe>"#,
+            ),
+            (
+                "textarea close-name lookalike",
+                r#"<textarea><img src="/fake.jpg"></textareax><img src="/still-fake.jpg"></textarea>"#,
+            ),
+            ("self-closing xmp", r#"<xmp/><img src="/fake.jpg"></xmp>"#),
+            ("unclosed iframe", r#"<iframe><img src="/fake.jpg">"#),
+            ("noembed", r#"<noembed><img src="/fake.jpg"></noembed>"#),
+            ("noframes", r#"<noframes><img src="/fake.jpg"></noframes>"#),
+            (
+                "plaintext",
+                r#"<plaintext><img src="/fake.jpg"></plaintext><img src="/still-fake.jpg">"#,
+            ),
+        ];
+
+        for (name, html) in cases {
+            let rewritten = rewrite_inline_media(
+                html,
+                &Url::parse(&server.uri()).unwrap(),
+                &assets_dir,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(rewritten.html, html, "case: {name}");
+            assert!(rewritten.assets.is_empty(), "case: {name}");
+        }
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(!assets_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn real_images_after_closed_opaque_bodies_are_downloaded_once_each() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7, 8, 9]))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let assets_dir = dir.path().join("assets");
+        let cases = [
+            ("script", r#"<script><img src="/fake.jpg"></script>"#),
+            ("style", r#"<style><img src="/fake.jpg"></style>"#),
+            ("textarea", r#"<textarea><img src="/fake.jpg"></textarea>"#),
+            ("xmp", r#"<xmp><img src="/fake.jpg"></xmp>"#),
+            ("iframe", r#"<iframe><img src="/fake.jpg"></iframe>"#),
+            ("noembed", r#"<noembed><img src="/fake.jpg"></noembed>"#),
+            ("noframes", r#"<noframes><img src="/fake.jpg"></noframes>"#),
+        ];
+
+        for (name, opaque) in cases {
+            let html = format!(r#"{opaque}<img src="/{name}-real.jpg">"#);
+            let rewritten = rewrite_inline_media(
+                &html,
+                &Url::parse(&server.uri()).unwrap(),
+                &assets_dir,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(rewritten.html.starts_with(opaque), "case: {name}");
+            assert!(
+                rewritten.html.ends_with(r#"">"#)
+                    && rewritten.html.contains(r#"<img src="../assets/"#),
+                "case: {name}; got: {}",
+                rewritten.html
+            );
+            assert_eq!(rewritten.assets.len(), 1, "case: {name}");
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/script-real.jpg",
+                "/style-real.jpg",
+                "/textarea-real.jpg",
+                "/xmp-real.jpg",
+                "/iframe-real.jpg",
+                "/noembed-real.jpg",
+                "/noframes-real.jpg",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_skips_tag_attributes_and_obeys_comment_terminators() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7, 8, 9]))
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let assets_dir = dir.path().join("assets");
+        let cases = [
+            (
+                "tag attribute",
+                r#"<div data-note='<img src="/fake-attribute.jpg">'></div><img src="/real-attribute.jpg">"#,
+                "/fake-attribute.jpg",
+                "/real-attribute.jpg",
+            ),
+            (
+                "normal comment end",
+                r#"<!-- <img src="/fake-normal.jpg"> --><img src="/real-normal.jpg">"#,
+                "/fake-normal.jpg",
+                "/real-normal.jpg",
+            ),
+            (
+                "bang comment end",
+                r#"<!-- <img src="/fake-bang.jpg"> --!><img src="/real-bang.jpg">"#,
+                "/fake-bang.jpg",
+                "/real-bang.jpg",
+            ),
+            (
+                "abrupt greater-than comment end",
+                r#"<!--><span data-note='<img src="/fake-greater.jpg">'></span><img src="/real-greater.jpg">"#,
+                "/fake-greater.jpg",
+                "/real-greater.jpg",
+            ),
+            (
+                "abrupt arrow comment end",
+                r#"<!---><span data-note='<img src="/fake-arrow.jpg">'></span><img src="/real-arrow.jpg">"#,
+                "/fake-arrow.jpg",
+                "/real-arrow.jpg",
+            ),
+        ];
+
+        for (name, html, fake_path, real_path) in cases {
+            let rewritten = rewrite_inline_media(
+                html,
+                &Url::parse(&server.uri()).unwrap(),
+                &assets_dir,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(rewritten.html.contains(fake_path), "case: {name}");
+            assert!(!rewritten.html.contains(real_path), "case: {name}");
+            assert_eq!(rewritten.assets.len(), 1, "case: {name}");
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/real-attribute.jpg",
+                "/real-normal.jpg",
+                "/real-bang.jpg",
+                "/real-greater.jpg",
+                "/real-arrow.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn portable_media_filenames_use_bounded_allowlisted_suffixes() {
+        let long_suffix = "a".repeat(300);
+        let mut cases: Vec<(String, &str)> = [
+            ("https://cdn.example.test/image.jpg", "jpg"),
+            ("https://cdn.example.test/image.JPEG", "jpeg"),
+            ("https://cdn.example.test/image.PNG", "png"),
+            ("https://cdn.example.test/image.GiF", "gif"),
+            ("https://cdn.example.test/image.WEBP", "webp"),
+            ("https://cdn.example.test/image.SvG", "svg"),
+            ("https://cdn.example.test/image.AVIF", "avif"),
+            ("https://cdn.example.test/image.BMP", "bmp"),
+            ("https://cdn.example.test/image.IcO", "ico"),
+            ("https://cdn.example.test/image.jpg:large", "bin"),
+            ("https://cdn.example.test/image.j@pg", "bin"),
+            ("https://cdn.example.test/image.jpg.", "bin"),
+            ("https://cdn.example.test/image.jpg%20", "bin"),
+            ("https://cdn.example.test/image%2ejpg", "bin"),
+            ("https://cdn.example.test/image.tiff", "bin"),
+            ("https://cdn.example.test/image", "bin"),
+        ]
+        .into_iter()
+        .map(|(input, expected_extension)| (input.to_owned(), expected_extension))
+        .collect();
+        cases.push((
+            format!("https://cdn.example.test/image.{long_suffix}"),
+            "bin",
+        ));
+
+        for (input, expected_extension) in cases {
+            let url = Url::parse(&input).unwrap();
+
+            assert_eq!(extension_for_url(&url), expected_extension, "url: {url}");
+
+            let filename = filename_for_url(&url);
+            let (stem, extension) = filename.split_once('.').unwrap();
+            assert_eq!(extension, expected_extension, "url: {url}");
+            assert_eq!(stem.len(), 12, "url: {url}");
+            assert!(
+                stem.bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "url: {url}; filename: {filename}"
+            );
+            assert!(filename.len() < 64, "url: {url}; filename: {filename}");
+            assert!(
+                !filename.bytes().any(|byte| matches!(
+                    byte,
+                    b'<' | b'>' | b':' | b'"' | b'/' | b'\\' | b'|' | b'?' | b'*'
+                )),
+                "url: {url}; filename: {filename}"
+            );
+            assert!(
+                !filename.ends_with(['.', ' ']),
+                "url: {url}; filename: {filename}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -51,3 +51,4 @@ jobs:
       - run: cargo test -p lj-archiver storage::tests
       - run: cargo test -p lj-archiver archive::tests
       - run: cargo test -p lj-archiver media::tests::concurrent_rewrites_share_one_final_asset_without_temporary_files
+      - run: cargo test -p lj-archiver media::tests::portable_

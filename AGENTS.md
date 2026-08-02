@@ -187,6 +187,15 @@ absolute remote URL on no-media, address/redirect rejection, HTTP or transport
 failure, and body-cap failure. Invalid and non-HTTP(S) values issue no request
 and rely on the renderer's inert visible-text fallback.
 
+Inline-media discovery is a forward-only byte-span scan so untouched HTML
+stays byte-identical. It treats `script`, `style`, `textarea`, `xmp`, `iframe`,
+`noembed`, `noframes`, and `plaintext` contents as opaque (including
+tag-looking text), and follows HTML-tokenizer comment endings; keep those
+skips linear and rewrite only real `src` value spans. Download filenames keep
+a 12-hex digest stem and use only lowercase allowlisted image suffixes (`jpg`,
+`jpeg`, `png`, `gif`, `webp`, `svg`, `avif`, `bmp`, `ico`), falling back to
+`bin` so each filename component remains portable and bounded.
+
 The current media checks do not resolve DNS names to block private networks. Do not document or rely on DNS-based private-network blocking unless that behavior is implemented and tested.
 
 Downloads are size-capped and enforced while streaming — 64 MiB per page fetch, 50 MiB per media asset — and a response exceeding its cap is abandoned mid-stream, never truncated into the archive. The page-fetch client retries transient 5xx responses, transport errors, and interrupted response bodies a couple of times before surfacing a failure; interrupted-body attempts discard their partial bytes before retrying.
