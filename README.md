@@ -173,6 +173,7 @@ with a generated `:toc:`:
 = <journal> Archive
 :doctype: book
 :toc:
+:imagesdir: posts
 
 include::index.adoc[leveloffset=+1]
 
@@ -180,8 +181,20 @@ include::posts/166511.adoc[leveloffset=+1]
 ```
 
 `book.adoc` is regenerated on every run (including with `--resume`) and lists
-exactly the posts `index.adoc` lists. Convert it with a tool such as `asciidoctor`
-or `asciidoctor-pdf` to render the journal as a single HTML page or PDF.
+exactly the posts `index.adoc` lists. The `:imagesdir: posts` attribute preserves
+the `../assets/...` references used by included standalone posts. To keep
+downloaded media resolvable, run the converter from the archive root and leave
+its output beside `book.adoc`:
+
+```sh
+cd archive/news
+asciidoctor book.adoc
+# Or: asciidoctor-pdf book.adoc
+```
+
+If `--output-dir` selected a different archive root, change into that directory
+instead. Arbitrary converter output directories outside the archive are not
+guaranteed to preserve relative media paths.
 
 ## Behavior
 

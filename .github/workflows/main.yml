@@ -21,6 +21,12 @@ jobs:
           tool: cargo-hack
       - run: cargo hack clippy -p lj-archiver --each-feature -- -D warnings
       - run: cargo hack test -p lj-archiver --each-feature
+      - name: Install Asciidoctor
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes asciidoctor
+      - name: Verify book media rendering
+        run: cargo test -p lj-archiver --test book_render_smoke -- --ignored --exact book_media_resolves_to_archive_root_asset
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
