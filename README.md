@@ -126,7 +126,7 @@ public journal.
 
 | Option | Description |
 | --- | --- |
-| `--output-dir <DIR>` | Write the archive to `DIR` instead of `archive/<journal>` |
+| `--output-dir <DIR>` | Write the archive to `DIR` instead of `archive/<journal>`. A nonempty directory must be a valid `lj-archiver` archive for the requested journal |
 | `--no-comments` | Do not include comments |
 | `--no-media` | Do not download inline media; keep remote URLs in the output |
 | `--concurrency <N>` | Set the number of posts processed concurrently during journal archives. Defaults to `4` |
@@ -154,7 +154,11 @@ archive/<journal>/
 
 `index.adoc` is a table of contents that links to archived posts.
 
-Each post is written to `posts/<id>.adoc`. The post file contains document metadata, the post body, and comments when comment archiving is enabled.
+New posts are written to `posts/<id>.adoc`. When updating a validated existing
+archive, a positive numeric filename spelling such as `01.adoc` is preserved
+consistently for replacement, link repair, index/book entries, and local text or
+image links. The post file contains document metadata, the post body, and
+comments when comment archiving is enabled.
 
 During a completed journal export, links to other exported posts become local
 cross-references. Other root-relative, path-relative, and protocol-relative
@@ -187,8 +191,10 @@ include::index.adoc[leveloffset=+1]
 include::posts/166511.adoc[leveloffset=+1]
 ```
 
-`book.adoc` is regenerated on every run (including with `--resume`) and lists
-exactly the posts `index.adoc` lists. The `:imagesdir: posts` attribute preserves
+After a book has been created, later successful updates regenerate it even when
+`--book` is omitted, so it cannot become stale. Otherwise book generation
+remains opt-in. A regenerated book (including during `--resume`) lists exactly
+the posts `index.adoc` lists. The `:imagesdir: posts` attribute preserves
 the `../assets/...` references used by included standalone posts. The internal
 post-link prefix similarly preserves click targets on images that link to
 other archived posts. To keep downloaded media and those post targets
@@ -206,6 +212,26 @@ instead. Arbitrary converter output directories outside the archive are not
 guaranteed to preserve relative media paths.
 
 ## Behavior
+
+Before using a nonempty output directory, `lj-archiver` verifies that it is a
+controlled archive whose `index.adoc` identifies the requested journal (with
+the normal hyphen/underscore aliasing). Missing or malformed archive identity,
+a different journal, or malformed public post files cause the run to fail
+before networking or writes. A missing or truly empty directory can start a new
+archive.
+
+Validated existing posts seed an additive archive set for both single-post and
+full-journal updates. A successful current fetch replaces or adds its post;
+posts omitted by partial rediscovery, and existing posts whose refetch fails,
+remain in `index.adoc` and an existing or requested `book.adoc`. Progress and
+summary counters describe current-run work only, so merely retained posts are
+not counted as archived or skipped.
+
+Retained and resume-skipped files receive a best-effort stale local-link repair
+after the final post set is known. If that repair or a current post's second
+local-link pass fails, the already public file is retained; a successfully
+finalized current post always has complete external fallback targets rather
+than internal staging markers.
 
 While archiving, `lj-archiver` prints progress to standard error. On an
 interactive terminal it shows a discovery spinner and then a progress bar with a
@@ -238,7 +264,9 @@ For full journal archives, individual post failures do not stop the entire run. 
 
 Transient HTTP 5xx responses are retried automatically.
 
-With `--resume` during full journal archives, existing `posts/<id>.adoc` files are not fetched or rewritten.
+With `--resume` during full journal archives, validated existing post files are
+not refetched. Their bytes change only when the best-effort stale-link repair
+has work to do.
 
 ## Current Limits
 
