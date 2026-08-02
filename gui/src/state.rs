@@ -67,8 +67,14 @@ pub enum Message {
     ToggleMedia(bool),
     ToggleBook(bool),
     Start,
-    Progress(ProgressEvent),
-    Finished(Result<RunOutcome, String>),
+    Progress {
+        run_id: u64,
+        event: ProgressEvent,
+    },
+    Finished {
+        run_id: u64,
+        result: Result<RunOutcome, String>,
+    },
     OpenFolder,
     OpenUrl(String),
 }
@@ -77,6 +83,8 @@ pub enum Message {
 pub struct App {
     pub config: RunConfig,
     pub state: State,
+    next_run_id: u64,
+    active_run_id: Option<u64>,
 }
 
 impl App {
@@ -94,22 +102,45 @@ impl App {
             Message::ToggleComments(on) => self.config.include_comments = *on,
             Message::ToggleMedia(on) => self.config.download_media = *on,
             Message::ToggleBook(on) => self.config.generate_book = *on,
-            Message::Start => self.state = State::Running(Phase::Discovering { found: 0 }),
-            Message::Progress(event) => self.apply_progress(event),
-            Message::Finished(Ok(outcome)) => {
-                self.state = State::Done {
-                    root: outcome.root.clone(),
-                    archived: outcome.archived,
-                    skipped: outcome.skipped,
-                    failed: outcome.failed,
-                    failed_pages: outcome.failed_pages,
-                    failures: outcome.failures.clone(),
-                };
+            Message::Start => {
+                if matches!(self.state, State::Running(_)) {
+                    return;
+                }
+                self.next_run_id = self.next_run_id.wrapping_add(1);
+                if self.next_run_id == 0 {
+                    self.next_run_id = 1;
+                }
+                self.active_run_id = Some(self.next_run_id);
+                self.state = State::Running(Phase::Discovering { found: 0 });
             }
-            Message::Finished(Err(message)) => {
-                self.state = State::Error {
-                    message: message.clone(),
-                };
+            Message::Progress { run_id, event } => {
+                if Some(*run_id) != self.active_run_id {
+                    return;
+                }
+                self.apply_progress(event);
+            }
+            Message::Finished { run_id, result } => {
+                if Some(*run_id) != self.active_run_id {
+                    return;
+                }
+                match result {
+                    Ok(outcome) => {
+                        self.state = State::Done {
+                            root: outcome.root.clone(),
+                            archived: outcome.archived,
+                            skipped: outcome.skipped,
+                            failed: outcome.failed,
+                            failed_pages: outcome.failed_pages,
+                            failures: outcome.failures.clone(),
+                        };
+                    }
+                    Err(message) => {
+                        self.state = State::Error {
+                            message: message.clone(),
+                        };
+                    }
+                }
+                self.active_run_id = None;
             }
             Message::ChooseFolder | Message::OpenFolder | Message::OpenUrl(_) => {}
         }
@@ -152,6 +183,10 @@ impl App {
         !self.config.target.trim().is_empty()
             && self.config.folder.is_some()
             && !matches!(self.state, State::Running(_))
+    }
+
+    pub(crate) fn active_run_id(&self) -> Option<u64> {
+        self.active_run_id
     }
 
     /// The target string and `RunOptions` for a launch, or `None` if not
@@ -287,6 +322,11 @@ mod tests {
         }
     }
 
+    fn start_run(app: &mut App) -> u64 {
+        app.update_state(&Message::Start);
+        app.active_run_id().expect("Start should activate a run")
+    }
+
     #[test]
     fn defaults_to_idle_with_comments_and_media_on() {
         let app = App::default();
@@ -322,34 +362,45 @@ mod tests {
         let mut app = App::default();
         app.update_state(&Message::TargetChanged("news".to_string()));
         app.update_state(&Message::FolderChosen(Some(PathBuf::from("/tmp/out"))));
-        app.update_state(&Message::Start);
+        let run_id = start_run(&mut app);
+        assert_eq!(run_id, 1);
         assert!(matches!(
             app.state,
             State::Running(Phase::Discovering { found: 0 })
         ));
 
-        app.update_state(&Message::Progress(ProgressEvent::DiscoveryTick {
-            label: "/2024/".to_string(),
-            found: 5,
-        }));
+        app.update_state(&Message::Progress {
+            run_id,
+            event: ProgressEvent::DiscoveryTick {
+                label: "/2024/".to_string(),
+                found: 5,
+            },
+        });
         assert!(matches!(
             app.state,
             State::Running(Phase::Discovering { found: 5 })
         ));
 
-        app.update_state(&Message::Progress(ProgressEvent::ArchivingStarted {
-            total: 2,
-        }));
+        app.update_state(&Message::Progress {
+            run_id,
+            event: ProgressEvent::ArchivingStarted { total: 2 },
+        });
         assert!(matches!(
             app.state,
             State::Running(Phase::Archiving { done: 0, total: 2 })
         ));
 
-        app.update_state(&Message::Progress(ProgressEvent::PostDone {
-            id: 1,
-            title: "t".to_string(),
-        }));
-        app.update_state(&Message::Progress(ProgressEvent::PostFailed { id: 2 }));
+        app.update_state(&Message::Progress {
+            run_id,
+            event: ProgressEvent::PostDone {
+                id: 1,
+                title: "t".to_string(),
+            },
+        });
+        app.update_state(&Message::Progress {
+            run_id,
+            event: ProgressEvent::PostFailed { id: 2 },
+        });
         assert!(matches!(
             app.state,
             State::Running(Phase::Archiving { done: 2, total: 2 })
@@ -359,16 +410,16 @@ mod tests {
     #[test]
     fn finished_ok_with_failures_reaches_done_carrying_failures() {
         let mut app = App::default();
+        let run_id = start_run(&mut app);
         let failures = vec![PostFailure {
             id: 2,
             url: Url::parse("https://news.livejournal.com/2.html").unwrap(),
             message: "boom".to_string(),
         }];
-        app.update_state(&Message::Finished(Ok(outcome(
-            PathBuf::from("/tmp/out"),
-            1,
-            failures.clone(),
-        ))));
+        app.update_state(&Message::Finished {
+            run_id,
+            result: Ok(outcome(PathBuf::from("/tmp/out"), 1, failures.clone())),
+        });
         match &app.state {
             State::Done {
                 failed,
@@ -387,6 +438,7 @@ mod tests {
     #[test]
     fn finished_ok_retains_failed_archive_pages() {
         let mut app = App::default();
+        let run_id = start_run(&mut app);
         let outcome = RunOutcome {
             root: PathBuf::from("/tmp/out"),
             archived: 3,
@@ -397,7 +449,10 @@ mod tests {
             journal: Some("news".to_string()),
         };
 
-        app.update_state(&Message::Finished(Ok(outcome)));
+        app.update_state(&Message::Finished {
+            run_id,
+            result: Ok(outcome),
+        });
 
         assert!(matches!(
             app.state,
@@ -412,27 +467,169 @@ mod tests {
     #[test]
     fn finished_err_reaches_error() {
         let mut app = App::default();
-        app.update_state(&Message::Finished(Err("bad target".to_string())));
+        let run_id = start_run(&mut app);
+        app.update_state(&Message::Finished {
+            run_id,
+            result: Err("bad target".to_string()),
+        });
         assert!(matches!(app.state, State::Error { .. }));
     }
 
     #[test]
     fn late_progress_event_does_not_reset_terminal_state() {
         let mut app = App::default();
-        app.update_state(&Message::Finished(Ok(outcome(
-            PathBuf::from("/tmp/out"),
-            0,
-            vec![],
-        ))));
+        let run_id = start_run(&mut app);
+        app.update_state(&Message::Finished {
+            run_id,
+            result: Ok(outcome(PathBuf::from("/tmp/out"), 0, vec![])),
+        });
         assert!(matches!(app.state, State::Done { .. }));
         // A stray progress event arriving after completion must be ignored.
-        app.update_state(&Message::Progress(ProgressEvent::ArchivingStarted {
-            total: 5,
-        }));
+        app.update_state(&Message::Progress {
+            run_id,
+            event: ProgressEvent::ArchivingStarted { total: 5 },
+        });
         assert!(
             matches!(app.state, State::Done { .. }),
             "late progress event must not reset Done back to Running"
         );
+    }
+
+    #[test]
+    fn late_run_one_messages_do_not_mutate_run_two() {
+        let mut app = App::default();
+        let run_one = start_run(&mut app);
+        app.update_state(&Message::Finished {
+            run_id: run_one,
+            result: Ok(outcome(PathBuf::from("/tmp/run-one"), 0, vec![])),
+        });
+        let run_two = start_run(&mut app);
+        assert_eq!((run_one, run_two), (1, 2));
+        app.update_state(&Message::Progress {
+            run_id: run_two,
+            event: ProgressEvent::ArchivingStarted { total: 3 },
+        });
+        let run_two_snapshot = format!("{app:?}");
+
+        let late_messages = [
+            Message::Progress {
+                run_id: run_one,
+                event: ProgressEvent::DiscoveryTick {
+                    label: "/late-run-one/".to_string(),
+                    found: 99,
+                },
+            },
+            Message::Progress {
+                run_id: run_one,
+                event: ProgressEvent::PostDone {
+                    id: 1,
+                    title: "late".to_string(),
+                },
+            },
+            Message::Finished {
+                run_id: run_one,
+                result: Ok(outcome(PathBuf::from("/tmp/late-success"), 0, vec![])),
+            },
+            Message::Finished {
+                run_id: run_one,
+                result: Err("late error".to_string()),
+            },
+        ];
+        for message in late_messages {
+            app.update_state(&message);
+            assert_eq!(format!("{app:?}"), run_two_snapshot);
+        }
+    }
+
+    #[test]
+    fn wrong_generation_messages_are_ignored_while_running() {
+        let mut app = App::default();
+        let run_id = start_run(&mut app);
+        let running_snapshot = format!("{app:?}");
+
+        let wrong_generation = run_id + 1;
+        let messages = [
+            Message::Progress {
+                run_id: wrong_generation,
+                event: ProgressEvent::DiscoveryTick {
+                    label: "/wrong/".to_string(),
+                    found: 9,
+                },
+            },
+            Message::Finished {
+                run_id: wrong_generation,
+                result: Ok(outcome(PathBuf::from("/tmp/wrong"), 0, vec![])),
+            },
+            Message::Finished {
+                run_id: wrong_generation,
+                result: Err("wrong generation".to_string()),
+            },
+        ];
+        for message in messages {
+            app.update_state(&message);
+            assert_eq!(format!("{app:?}"), running_snapshot);
+        }
+    }
+
+    #[test]
+    fn matching_terminal_result_retires_generation_and_makes_trailing_messages_inert() {
+        let mut app = App::default();
+        let run_id = start_run(&mut app);
+        app.update_state(&Message::Finished {
+            run_id,
+            result: Ok(outcome(PathBuf::from("/tmp/out"), 0, vec![])),
+        });
+        assert_eq!(app.active_run_id(), None);
+        let terminal_snapshot = format!("{app:?}");
+
+        let trailing_messages = [
+            Message::Progress {
+                run_id,
+                event: ProgressEvent::DiscoveryTick {
+                    label: "/trailing/".to_string(),
+                    found: 50,
+                },
+            },
+            Message::Finished {
+                run_id,
+                result: Err("duplicate terminal result".to_string()),
+            },
+        ];
+        for message in trailing_messages {
+            app.update_state(&message);
+            assert_eq!(format!("{app:?}"), terminal_snapshot);
+        }
+    }
+
+    #[test]
+    fn valid_restart_gets_fresh_nonzero_generation_even_across_wrap() {
+        let mut app = App {
+            next_run_id: u64::MAX - 1,
+            ..App::default()
+        };
+
+        let before_wrap = start_run(&mut app);
+        assert_eq!(before_wrap, u64::MAX);
+        app.update_state(&Message::Finished {
+            run_id: before_wrap,
+            result: Err("finish before wrap".to_string()),
+        });
+
+        let after_wrap = start_run(&mut app);
+        assert_eq!(after_wrap, 1);
+        assert_ne!(after_wrap, 0);
+    }
+
+    #[test]
+    fn start_while_running_does_not_advance_generation() {
+        let mut app = App::default();
+        let run_id = start_run(&mut app);
+        let running_snapshot = format!("{app:?}");
+
+        app.update_state(&Message::Start);
+
+        assert_eq!(app.active_run_id(), Some(run_id));
+        assert_eq!(format!("{app:?}"), running_snapshot);
     }
 
     #[test]

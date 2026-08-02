@@ -1,3 +1,4 @@
+use crate::state::{App, Message, Phase, State};
 use iced::{
     Element, Task,
     widget::{
@@ -6,10 +7,16 @@ use iced::{
 };
 use lj_archiver::{
     progress::{Progress, ProgressEvent},
-    run::run_archive,
+    run::{RunOutcome, run_archive},
 };
 
-use crate::state::{App, Message, Phase, State};
+fn progress_message(run_id: u64, event: ProgressEvent) -> Message {
+    Message::Progress { run_id, event }
+}
+
+fn finished_message(run_id: u64, result: Result<RunOutcome, String>) -> Message {
+    Message::Finished { run_id, result }
+}
 
 impl App {
     pub fn boot() -> (App, Task<Message>) {
@@ -51,6 +58,9 @@ impl App {
             }
         };
         self.update_state(&Message::Start);
+        let run_id = self
+            .active_run_id()
+            .expect("validated Start should activate a run generation");
 
         let (tx, rx) = futures::channel::mpsc::unbounded::<ProgressEvent>();
         let progress = Progress::channel(tx);
@@ -61,8 +71,8 @@ impl App {
         };
 
         Task::batch([
-            Task::run(rx, Message::Progress),
-            Task::perform(job, Message::Finished),
+            Task::run(rx, move |event| progress_message(run_id, event)),
+            Task::perform(job, move |result| finished_message(run_id, result)),
         ])
     }
 
@@ -161,6 +171,52 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn callback_constructors_tag_messages_with_captured_active_generation() {
+        let mut app = App::default();
+        app.update_state(&Message::Start);
+        let run_id = app.active_run_id().unwrap();
+
+        let progress = progress_message(
+            run_id,
+            ProgressEvent::DiscoveryTick {
+                label: "/2024/".to_string(),
+                found: 4,
+            },
+        );
+        assert!(matches!(
+            progress,
+            Message::Progress {
+                run_id: tagged_id,
+                event: ProgressEvent::DiscoveryTick { found: 4, .. },
+            } if tagged_id == run_id
+        ));
+
+        let finished = finished_message(run_id, Err("terminal".to_string()));
+        assert!(matches!(
+            finished,
+            Message::Finished {
+                run_id: tagged_id,
+                result: Err(message),
+            } if tagged_id == run_id && message == "terminal"
+        ));
+    }
+
+    #[test]
+    fn valid_start_activates_generation_before_scheduling_callbacks() {
+        let dir = tempdir().unwrap();
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("news".to_string()));
+        app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
+
+        let task = app.update(Message::Start);
+
+        assert_eq!(app.active_run_id(), Some(1));
+        assert!(matches!(app.state, State::Running(_)));
+        assert_eq!(task.units(), 2);
+        drop(task);
+    }
+
+    #[test]
     fn start_routes_invalid_folder_to_error_without_launch() {
         let dir = tempdir().unwrap();
         let output = dir.path().join("output");
@@ -188,5 +244,49 @@ mod tests {
             !message.contains("posts folder"),
             "selected-path errors must not claim that a posts folder was inspected: {message}"
         );
+        assert_eq!(app.active_run_id(), None);
+        app.update_state(&Message::Start);
+        assert_eq!(app.active_run_id(), Some(1));
+    }
+
+    #[test]
+    fn invalid_target_schedules_no_work_and_does_not_advance_generation() {
+        let dir = tempdir().unwrap();
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged(
+            "https://example.com/not-livejournal".to_string(),
+        ));
+        app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
+        let task = app.update(Message::Start);
+
+        assert_eq!(task.units(), 0);
+        drop(task);
+        assert_eq!(app.active_run_id(), None);
+        assert!(matches!(app.state, State::Error { .. }));
+        app.update_state(&Message::Start);
+        assert_eq!(app.active_run_id(), Some(1));
+    }
+
+    #[test]
+    fn start_while_running_schedules_no_work_and_does_not_advance_generation() {
+        let dir = tempdir().unwrap();
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("news".to_string()));
+        app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
+        app.update_state(&Message::Start);
+        let run_id = app.active_run_id().unwrap();
+
+        let task = app.update(Message::Start);
+
+        assert_eq!(task.units(), 0);
+        drop(task);
+        assert_eq!(app.active_run_id(), Some(run_id));
+        assert!(matches!(app.state, State::Running(_)));
+        app.update_state(&Message::Finished {
+            run_id,
+            result: Err("finished".to_string()),
+        });
+        app.update_state(&Message::Start);
+        assert_eq!(app.active_run_id(), Some(2));
     }
 }
