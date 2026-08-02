@@ -909,10 +909,11 @@ fn find_html_bogus_comment_end(
     bytes.len()
 }
 
-/// Consume a DOCTYPE with the tokenizer states that determine whether `>` is
-/// data in a quoted public/system identifier or the declaration terminator.
-/// Malformed states fall through to bogus-DOCTYPE handling, where the first
-/// `>` ends the declaration. EOF always consumes the remainder.
+/// Consume a DOCTYPE according to the tokenizer's declaration-end states. A raw
+/// `>` abruptly terminates and emits the DOCTYPE even inside a quoted public or
+/// system identifier; a matching quote instead continues the state machine.
+/// Malformed states use bogus-DOCTYPE handling, where the first `>` ends the
+/// declaration. EOF always consumes the remainder.
 fn find_html_doctype_end(bytes: &[u8], content_start: usize, scan_steps: &mut usize) -> usize {
     let mut cursor = content_start;
 
