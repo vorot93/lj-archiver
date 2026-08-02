@@ -150,6 +150,7 @@ pub fn html_to_adoc_with_links(html: &str, link_rewriter: Option<&LinkRewriter>)
         source_html: html,
         source_map: &source_map,
         depth: 0,
+        list_depth: 0,
         link_rewriter,
     };
 
@@ -213,6 +214,7 @@ struct RenderCtx<'a> {
     source_html: &'a str,
     source_map: &'a HashMap<NodeId, String>,
     depth: usize,
+    list_depth: usize,
     link_rewriter: Option<&'a LinkRewriter>,
 }
 
@@ -220,6 +222,13 @@ impl RenderCtx<'_> {
     fn deeper(self) -> Self {
         Self {
             depth: self.depth + 1,
+            ..self
+        }
+    }
+
+    fn in_list(self) -> Self {
+        Self {
+            list_depth: self.list_depth + 1,
             ..self
         }
     }
@@ -271,6 +280,14 @@ fn render_paragraph(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
 }
 
 fn render_inline_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+    render_inline_children_with_options(element, ctx, false)
+}
+
+fn render_inline_children_with_options(
+    element: ElementRef<'_>,
+    ctx: RenderCtx<'_>,
+    skip_direct_lists: bool,
+) -> String {
     let mut output = String::new();
     let mut plain_text = String::new();
     let mut pending_breaks: usize = 0;
@@ -286,6 +303,10 @@ fn render_inline_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String
             }
             Node::Element(_) => {
                 if let Some(child_element) = ElementRef::wrap(child) {
+                    if skip_direct_lists && matches!(child_element.value().name(), "ul" | "ol") {
+                        continue;
+                    }
+
                     if child_element.value().name() == "br" {
                         pending_breaks += 1;
                         continue;
@@ -480,6 +501,7 @@ fn render_inline_code(element: ElementRef<'_>) -> String {
 
 fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> String {
     let mut output = String::new();
+    let marker = marker.repeat(ctx.list_depth + 1);
 
     for child in element.children() {
         let Some(child_node) = child.value().as_element() else {
@@ -491,16 +513,28 @@ fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> Str
                 continue;
             };
 
-            output.push_str(marker);
+            output.push_str(&marker);
             output.push(' ');
             output.push_str(&trim_trailing_hard_breaks(
-                render_inline_children(child_element, ctx).trim_start(),
+                render_inline_children_with_options(child_element, ctx, true).trim_start(),
             ));
             output.push('\n');
+
+            for list_child in child_element.children() {
+                let Some(list_element) = ElementRef::wrap(list_child) else {
+                    continue;
+                };
+
+                match list_element.value().name() {
+                    "ul" => output.push_str(&render_element(list_element, ctx.in_list().deeper())),
+                    "ol" => output.push_str(&render_element(list_element, ctx.in_list().deeper())),
+                    _ => {}
+                }
+            }
         }
     }
 
-    if !output.is_empty() {
+    if !output.is_empty() && !output.ends_with("\n\n") {
         output.push('\n');
     }
 
@@ -742,6 +776,38 @@ mod tests {
         assert!(adoc.contains("* one\n* two"));
         assert!(adoc.contains("----\nlet x = 1;\n----"));
         assert!(adoc.contains("image::../assets/166511/image-1.jpg[alt text]"));
+    }
+
+    #[test]
+    fn preserves_nested_unordered_list_depth() {
+        assert_eq!(
+            html_to_adoc("<ul><li>outer<ul><li>inner</li></ul></li></ul>"),
+            "* outer\n** inner\n\n"
+        );
+    }
+
+    #[test]
+    fn preserves_nested_ordered_list_depth() {
+        assert_eq!(
+            html_to_adoc("<ol><li>outer<ol><li>inner</li></ol></li></ol>"),
+            ". outer\n.. inner\n\n"
+        );
+    }
+
+    #[test]
+    fn preserves_nested_mixed_unordered_ordered_list_depth() {
+        assert_eq!(
+            html_to_adoc("<ul><li>outer<ol><li>inner</li></ol></li></ul>"),
+            "* outer\n.. inner\n\n"
+        );
+    }
+
+    #[test]
+    fn preserves_nested_mixed_ordered_unordered_list_depth() {
+        assert_eq!(
+            html_to_adoc("<ol><li>outer<ul><li>inner</li></ul></li></ol>"),
+            ". outer\n** inner\n\n"
+        );
     }
 
     #[test]
