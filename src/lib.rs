@@ -5,6 +5,9 @@ pub mod client;
 pub mod discover;
 pub mod error;
 mod html_scan;
+// The private codec is wired into archive persistence separately.
+#[allow(dead_code)]
+mod link_metadata;
 mod links;
 pub mod media;
 pub mod models;

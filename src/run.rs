@@ -7,8 +7,7 @@ use crate::{
     discover::discover_post_ids,
     error::LjError,
     links::{
-        LinkRewriter, PendingLink, PendingLinkError, repair_retained_links, resolve_pending_links,
-        validate_pending_links,
+        LinkRewriter, PendingLink, PendingLinkError, resolve_pending_links, validate_pending_links,
     },
     media::rewrite_inline_media,
     models::{ArchiveTarget, ArchivedPost, Post, PostFailure, RunOptions},
@@ -321,11 +320,6 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     }
 
     let final_ids = posts.keys().copied().collect::<HashSet<_>>();
-    let final_targets = trusted_target_filenames(&posts)?;
-    let finalized_ids = finalized
-        .iter()
-        .map(|post| post.archived.id)
-        .collect::<HashSet<_>>();
 
     for post in &finalized {
         match archive.read_pending_post(&post.pending_path) {
@@ -361,40 +355,6 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
             }
         }
         cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
-    }
-
-    for post in posts
-        .values()
-        .filter(|post| !finalized_ids.contains(&post.id))
-    {
-        match std::fs::read_to_string(&post.path) {
-            Ok(existing) => match repair_retained_links(&existing, &journal, &final_targets) {
-                Ok(repaired) if repaired != existing => {
-                    if let Err(error) = archive.write_post_at(&post.path, &repaired) {
-                        tracing::warn!(
-                            post_id = post.id,
-                            error = %error,
-                            "could not repair retained post links; retaining existing post"
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        post_id = post.id,
-                        error = %error,
-                        "could not resolve retained post links; retaining existing post"
-                    );
-                }
-            },
-            Err(error) => {
-                tracing::warn!(
-                    post_id = post.id,
-                    error = %error,
-                    "could not read retained post for link repair; retaining existing post"
-                );
-            }
-        }
     }
 
     progress.archiving_finished();
@@ -2866,8 +2826,6 @@ mod tests {
             .await;
         let dir = tempdir().unwrap();
         let baseline = "= Existing Alias\n\nxref:2.adoc[Post two]\n";
-        let repaired_baseline =
-            "= Existing Alias\n\nhttps://news.livejournal.com/2.html[Post two]\n";
         seed_existing_archive_at(
             dir.path(),
             &[(1, "01.adoc", "Existing Alias", baseline)],
@@ -2886,7 +2844,7 @@ mod tests {
         assert_eq!(writer.calls_for(1), 1);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("out/posts/01.adoc")).unwrap(),
-            repaired_baseline
+            baseline
         );
         assert!(!dir.path().join("out/posts/1.adoc").exists());
         assert_eq!(
@@ -3031,7 +2989,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_repairs_xrefs_to_missing_failed_posts() {
+    async fn resume_without_metadata_preserves_retained_post_bytes() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/news/calendar"))
@@ -3071,10 +3029,9 @@ mod tests {
         assert_eq!(outcome.archived, 0);
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.failed, 1);
-        let repaired = std::fs::read_to_string(existing).unwrap();
         assert_eq!(
-            repaired,
-            "= Existing\n\nhttps://news.livejournal.com/2.html[Post two]\n"
+            std::fs::read_to_string(existing).unwrap(),
+            "= Existing\n\nxref:2.adoc[Post two]\n"
         );
         let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
         assert!(
@@ -3085,7 +3042,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_repair_uses_exact_alias_targets_for_text_images_and_manifests() {
+    async fn resume_without_metadata_preserves_alias_post_bytes_and_manifests() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/news/calendar"))
@@ -3115,12 +3072,6 @@ mod tests {
             "image:../assets/p.jpg[,link={lj-archiver-post-link-prefix}1.adoc]\n",
             "image:../assets/q.jpg[,link={lj-archiver-post-link-prefix}2.adoc]\n",
         );
-        let expected = concat!(
-            "= Existing Alias\n\n",
-            "xref:01.adoc[Self] https://news.livejournal.com/2.html[Failed peer]\n",
-            "image:../assets/p.jpg[,link={lj-archiver-post-link-prefix}01.adoc]\n",
-            "image:../assets/q.jpg[,link=https://news.livejournal.com/2.html]\n",
-        );
         seed_existing_archive_at(
             dir.path(),
             &[(1, "01.adoc", "Existing Alias", baseline)],
@@ -3137,7 +3088,7 @@ mod tests {
         assert_eq!(outcome.failed, 1);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("out/posts/01.adoc")).unwrap(),
-            expected
+            baseline
         );
         assert!(!dir.path().join("out/posts/1.adoc").exists());
         let inspected = Archive::new(dir.path().join("out"), "news")
