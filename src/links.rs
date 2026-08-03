@@ -288,6 +288,14 @@ struct PendingCandidate {
     end: usize,
     recorded: bool,
     pending_token_shape: bool,
+    pending_token_prefix: bool,
+}
+
+fn has_pending_token_prefix(candidate: &str) -> bool {
+    candidate
+        .strip_prefix(PENDING_LINK_SEPARATOR)
+        .and_then(|candidate| candidate.strip_suffix(PENDING_LINK_SEPARATOR))
+        .is_some_and(|body| body.starts_with("lj-archiver-link:"))
 }
 
 fn has_pending_token_shape(candidate: &str) -> bool {
@@ -318,6 +326,23 @@ fn has_pending_token_shape(candidate: &str) -> bool {
         && target_id.parse::<u64>().is_ok()
         && ordinal.parse::<usize>().is_ok()
         && parts.next().is_none()
+}
+
+fn preserves_complete_unrecorded_candidate(candidates: &[PendingCandidate], index: usize) -> bool {
+    let candidate = candidates[index];
+    debug_assert!(!candidate.recorded);
+    if candidate.pending_token_shape {
+        return true;
+    }
+    if candidate.pending_token_prefix {
+        return false;
+    }
+
+    let preceded_by_token =
+        index > 0 && (candidates[index - 1].recorded || candidates[index - 1].pending_token_shape);
+    let followed_by_token = index + 1 < candidates.len()
+        && (candidates[index + 1].recorded || candidates[index + 1].pending_token_shape);
+    !(preceded_by_token && followed_by_token)
 }
 
 fn resolve_pending_links_with_scan_stats(
@@ -358,6 +383,7 @@ fn resolve_pending_links_with_scan_stats(
                 end,
                 recorded: replacements.contains_key(candidate),
                 pending_token_shape: has_pending_token_shape(candidate),
+                pending_token_prefix: has_pending_token_prefix(candidate),
             }
         })
         .collect::<Vec<_>>();
@@ -380,14 +406,15 @@ fn resolve_pending_links_with_scan_stats(
 
         let mut replacement_start = candidate.start;
         if index > 0
-            && (candidates[index - 1].recorded || candidates[index - 1].pending_token_shape)
+            && (candidates[index - 1].recorded
+                || preserves_complete_unrecorded_candidate(&candidates, index - 1))
         {
             replacement_start += separator_len;
         }
         let mut replacement_end = candidate.end;
         if index + 1 < candidates.len()
             && !candidates[index + 1].recorded
-            && candidates[index + 1].pending_token_shape
+            && preserves_complete_unrecorded_candidate(&candidates, index + 1)
         {
             replacement_end -= separator_len;
         }
@@ -1030,6 +1057,56 @@ mod tests {
                 links: vec![ActiveLink {
                     start: 7,
                     end: 18,
+                    target_id: 7,
+                    context: ActiveLinkContext::Xref,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn pending_resolution_preserves_ordinary_text_sharing_recorded_closing_separator() {
+        let recorded = "\u{1f}recorded\u{1f}";
+        let links = [pending_link(
+            recorded,
+            7,
+            "xref:7.adoc",
+            "https://news.livejournal.com/7.html",
+        )];
+        let text = "before \u{1f}recorded\u{1f}ordinary\u{1f} after";
+
+        assert_eq!(
+            resolve_pending_links(text, &links, &HashSet::from([7])).unwrap(),
+            ResolvedLinks {
+                contents: "before xref:7.adoc\u{1f}ordinary\u{1f} after".to_string(),
+                links: vec![ActiveLink {
+                    start: 7,
+                    end: 18,
+                    target_id: 7,
+                    context: ActiveLinkContext::Xref,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn pending_resolution_preserves_ordinary_text_sharing_recorded_opening_separator() {
+        let recorded = "\u{1f}recorded\u{1f}";
+        let links = [pending_link(
+            recorded,
+            7,
+            "xref:7.adoc",
+            "https://news.livejournal.com/7.html",
+        )];
+        let text = "before \u{1f}ordinary\u{1f}recorded\u{1f} after";
+
+        assert_eq!(
+            resolve_pending_links(text, &links, &HashSet::from([7])).unwrap(),
+            ResolvedLinks {
+                contents: "before \u{1f}ordinary\u{1f}xref:7.adoc after".to_string(),
+                links: vec![ActiveLink {
+                    start: 17,
+                    end: 28,
                     target_id: 7,
                     context: ActiveLinkContext::Xref,
                 }],
