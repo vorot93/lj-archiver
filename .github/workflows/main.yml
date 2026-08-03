@@ -31,8 +31,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes asciidoctor
-      - name: Verify book media rendering
-        run: cargo test -p lj-archiver --test book_render_smoke -- --ignored
+      - name: Test renderer semantics with Asciidoctor
+        run: cargo test -p lj-archiver --lib -- --ignored --test-threads=1
+      - name: Test assembled book rendering
+        run: cargo test -p lj-archiver --test book_render_smoke -- --ignored --test-threads=1
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit

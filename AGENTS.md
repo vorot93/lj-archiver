@@ -24,10 +24,11 @@ The current tool is public-content only. Do not add login, private-content acces
 - `src/tls.rs` builds the shared rustls `ClientConfig` applied to every HTTP client (see HTTP And Media Safety).
 - `src/discover.rs` finds journal post IDs by walking the calendar, per-year pages, and month archive pages.
 - `src/parser.rs` parses LiveJournal HTML into post and comment models.
-- `src/links.rs` resolves references against each delivered post URL, records and resolves same-journal post links after bulk-export write outcomes are known, and repairs stale local cross-references in retained posts.
+- `src/links.rs` resolves references against each delivered post URL and records typed active same-journal link spans for resolution and trusted retained-post upgrades.
+- `src/link_metadata.rs` validates, serializes, and applies digest-bound active-link metadata for retained posts without scanning their source for link-like text.
 - `src/media.rs` finds inline media, canonicalizes safe sources even when downloads are disabled, downloads allowed assets, rewrites HTML references, validates redirects, and rejects unsafe media URLs based on scheme, host presence, literal `localhost` hosts, and restricted IP literals.
 - `src/adoc/` converts supported HTML into AsciiDoc and preserves unsupported structures with passthrough output (submodules `mod`, `classify`, `source_html`, `escape`).
-- `src/archive.rs` owns archive paths, fail-closed existing-archive inspection, pending-post staging, atomic per-post writes, index writes, and the optional single-file `book.adoc` assembly (`write_book`).
+- `src/archive.rs` owns archive paths, fail-closed existing-archive inspection, pending-post staging, controlled post-and-link-sidecar publication, index writes, and the optional single-file `book.adoc` assembly (`write_book`).
 - `src/storage.rs` atomically replaces archive files through same-directory temporary-file persistence, which safely clobbers existing files on Windows, and serializes AsciiDoc paths with forward slashes independently of the host filesystem.
 - `src/run.rs` orchestrates target parsing, discovery, fetching, parsing, media rewriting, rendering, bounded staging, and archive finalization.
 - `src/progress.rs` owns user-facing progress output: a `Progress` handle with Interactive (indicatif bar/spinner via `tracing-indicatif`), Plain (stderr lines), and Quiet modes, plus `init_logging`. Progress is stderr-only UI, independent of the log level; `--verbose` keeps the bar and prints logs above it, `--quiet` suppresses progress.
@@ -100,6 +101,18 @@ The workspace root is itself the `lj-archiver` package, so bare `cargo test` and
 
 CI enforces the exact `fmt` invocation above. There is no `rustfmt.toml`, so the `--config=imports_granularity=Crate` flag is required; plain `cargo fmt` reformats imports differently and will fail the check.
 
+After installing Asciidoctor, Ubuntu CI explicitly runs both ignored converter
+harnesses. The library command covers renderer semantics and the integration
+command covers assembled-book rendering:
+
+```sh
+cargo test -p lj-archiver --lib -- --ignored --test-threads=1
+cargo test -p lj-archiver --test book_render_smoke -- --ignored --test-threads=1
+```
+
+Both commands must execute nonzero tests; a filtered-to-zero result is not
+converter coverage.
+
 The Windows CI job owns coverage for same-directory atomic replacement and the
 concurrent media replacement path.
 
@@ -146,7 +159,7 @@ For journal archives, preserve the current resilient behavior: continue past ind
 
 The AsciiDoc renderer (`src/adoc/`) produces byte-exact output guarded by a large black-box test suite; change it with care and assert exact output. Passthrough source recovery precomputes range-backed original-byte mappings with one tokenizer-compatible source scan plus one DOM traversal; both must remain linear. The shared scanner treats comments, declarations, and raw-text/RCDATA payloads as opaque, and aligns tokenizer-decoded attributes with ranges into the unchanged input rather than decoding or rescanning source values itself. Script payload scanning must retain ScriptData escaped and double-escaped states: an appropriate `</script>` in double-escaped data only returns to escaped data, so it is not the element's structural close. Quotes enter quoted attribute-value state only after `=`, and a self-closing non-void tag stays on the tag stack so normalized fallback retains its trailing children. A `ScanError` means alignment is unavailable: callers must use their explicit conservative fallback or return a parse error, never guess source ranges or attributes. Raw-text collection is iterative, while recursive rendering and plain-inline collection are capped at `MAX_RENDER_DEPTH`; missing a recursive cap lets deeply nested input overflow the stack (an uncatchable abort).
 
-The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), delimiter, and related AsciiDoc syntax stays inert. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
+The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
 A same-journal target in a linked image's `link=` attribute is a contextual
 `{lj-archiver-post-link-prefix}<id>.adoc` URI, not a complete
@@ -158,6 +171,12 @@ Pending link records retain that output context: ordinary links resolve
 locally to `xref:`, linked images resolve to the contextual URI, and a
 linked-image external fallback has commas encoded before token substitution so
 it cannot split the image attribute list.
+
+Pending tokens use a fresh random 128-bit namespace for each render. The
+complete rendered post is validated so every recorded token occurs exactly
+once before it can be staged or resolved. A namespace collision causes a full
+rerender with another fresh namespace; four-attempt exhaustion is a
+`LinkIntegrity` failure rather than permission to substitute ambiguous text.
 
 Unsupported HTML remains exact source-preserved raw passthrough only when the
 shared scanner classifies every tokenizer-decoded capability as reviewed and
@@ -188,14 +207,15 @@ splice guessed descendant source into literal text. (`script` and `style`
 bodies parse as raw text nodes, so they cannot contain parsed element
 descendants.) Never guess source ranges or serialize a safety DOM.
 
-Every generated block delimiter is chosen with one pass over `content.lines()`:
+All generated listings declare `[subs=specialcharacters]` immediately before
+the delimiter. Every generated block delimiter is chosen with one pass over `content.lines()`:
 inspect each line once, remember the longest line made only of the delimiter
 character, and emit one more character than that length (with four characters
 as the minimum). Do not restore a candidate-by-candidate rescan ladder.
 
 The composed document ends with exactly one newline **by construction**, not a post-hoc trim: each block ends with a single `\n` (`push_body`) and the blank-line separator is inserted *before* each block (`render_post`, `render_comment`). Do not switch to per-block `\n\n` plus a trailing trim.
 
-The optional `book.adoc` (opt-in initially via `--book` or the GUI checkbox, both setting `RunOptions::generate_book`) is assembled by `archive::Archive::write_book`, called after `write_index` in both run paths (`archive_post`, `archive_journal`) from the **same sorted `&[ArchivedPost]` slice** — so it lists exactly what `index.adoc` lists, oldest-first. Once a validated archive already has a book, every later successful update rewrites it even when the current run omits the option; otherwise generation remains opt-in. Its output is byte-exact and asserted like the rest of `archive.rs` (the `write_book` unit tests pin the exact bytes): a `= <journal> Archive` title carrying `:doctype: book`, `:toc:`, `:imagesdir: posts`, and `:lj-archiver-post-link-prefix: posts/`, then `include::index.adoc[leveloffset=+1]`, then one include for each post's surviving actual path. Two load-bearing invariants: a blank line precedes **every** include (block separation — without it an included post's now-`==` chapter title is absorbed into the preceding post's trailing paragraph), and the file ends with exactly one newline. `leveloffset=+1` demotes each standalone post's level-0 `= Title` to a `==` chapter under `:doctype: book`, and `:toc:` supplies in-document navigation; the included `index.adoc`'s path-based `xref:` links deliberately resolve to the sibling post files, not in-book anchors (they need no existing target, so no converter warning). `:imagesdir: posts` is load-bearing for downloaded media: included post targets such as `../assets/<hash>.<ext>` then render as archive-root `assets/...` paths when converter output is written beside `book.adoc`. The internal post-link prefix is independently load-bearing for linked images whose click target is another archived post: standalone posts default it to empty (for example, `01.adoc`), while the book keeps it as `posts/` (for example, `posts/01.adoc`). `write_book` shares `ensure_root()` (archive-root creation) with `write_index`; `write_post` delegates to `write_post_at`, whose parent creation serves a different path — do not merge those. Apart from those context attributes, book assembly emits only include directives and leaves the rendered post body unchanged. The ignored `book_render_smoke` integration test invokes Asciidoctor and is run explicitly by Ubuntu CI; normal Rust test runs remain converter-independent. Manually run the same ignored test after converter-specific changes when Asciidoctor is available locally.
+The optional `book.adoc` (opt-in initially via `--book` or the GUI checkbox, both setting `RunOptions::generate_book`) is assembled by `archive::Archive::write_book`, called after `write_index` in both run paths (`archive_post`, `archive_journal`) from the **same sorted `&[ArchivedPost]` slice** — so it lists exactly what `index.adoc` lists, oldest-first. Once a validated archive already has a book, every later successful update rewrites it even when the current run omits the option; otherwise generation remains opt-in. Its output is byte-exact and asserted like the rest of `archive.rs` (the `write_book` unit tests pin the exact bytes): a `= <journal> Archive` title carrying `:doctype: book`, `:toc:`, `:imagesdir: posts`, and `:lj-archiver-post-link-prefix: posts/`, then `include::index.adoc[leveloffset=+1]`, then one include for each post's surviving actual path. Two load-bearing invariants: a blank line precedes **every** include (block separation — without it an included post's now-`==` chapter title is absorbed into the preceding post's trailing paragraph), and the file ends with exactly one newline. `leveloffset=+1` demotes each standalone post's level-0 `= Title` to a `==` chapter under `:doctype: book`, and `:toc:` supplies in-document navigation; the included `index.adoc`'s path-based `xref:` links deliberately resolve to the sibling post files, not in-book anchors (they need no existing target, so no converter warning). `:imagesdir: posts` is load-bearing for downloaded media: included post targets such as `../assets/<hash>.<ext>` then render as archive-root `assets/...` paths when converter output is written beside `book.adoc`. The internal post-link prefix is independently load-bearing for linked images whose click target is another archived post: standalone posts default it to empty (for example, `01.adoc`), while the book keeps it as `posts/` (for example, `posts/01.adoc`). `write_book` shares `ensure_root()` (archive-root creation) with `write_index`; `write_post` keeps its own controlled post-only write path for a different purpose — do not merge those. Apart from those context attributes, book assembly emits only include directives and leaves the rendered post body unchanged. Ubuntu CI explicitly runs the ignored library Asciidoctor tests for renderer semantics and the ignored `book_render_smoke` integration tests for assembled output; normal Rust test runs remain converter-independent.
 
 ## LiveJournal Discovery And URL Structure
 
@@ -215,12 +235,15 @@ Accepted target forms (`src/target.rs`): a bare journal name, a `*.livejournal.c
 
 Real post pages use `aentry-post*` markup — body `.aentry-post__text`, title `.aentry-post__title-text`, tags `.aentry-tags a` — with the older `.entry-*` classes kept only as fallbacks. Real post pages embed a server-rendered `Site.entry = {…}` JSON object carrying the post's `journal` (the canonical account name), `poster` (the authoring account, distinct from the journal), and `eventtime` (a Unix-epoch publication timestamp). `src/parser.rs` anchors on `Site.entry` (the page also carries many unrelated `"poster"` values in sidebar JSON), deserializes the single leading object with `serde_json`, and trusts it only when its `ditemid` equals the resolved post id. `poster` populates `:lj-poster:`; `eventtime` populates `:lj-date:` via `DateTime::from_timestamp`, falling back to the older `time.entry-date[datetime]` selector when `Site.entry` is absent. Post pages otherwise have no `datetime` attribute, meta tag, or JSON-LD date. `eventtime` is recorded as a UTC instant, but LiveJournal's event time historically reflects the poster's local wall-clock, so treat `:lj-date:` as a best-effort date (reliable to the day). The journal is sourced from `Site.entry.journal` when its `ditemid` matches (then `data-journal`, then the URL host), so `:lj-author:` is the canonical account name; the poster is a separate `:lj-poster:` attribute.
 
-Before either run path constructs a client, `Archive::inspect_existing` validates
-every nonempty output root as a controlled archive. Its index journal must alias
-the requested journal, and public post candidates must be readable regular
-files with lone positive numeric `.adoc` stems and nonempty level-zero titles.
-Malformed, unverified, or mismatched roots fail closed before networking or
-writes. Missing and truly empty roots alone begin without a snapshot.
+Before either run path constructs a client, `Archive::inspect_existing`
+preflights every nonempty output root as a controlled archive, including the
+`assets`, `.lj-archiver`, and `.lj-archiver/links` paths. Existing symlinks,
+non-directory controlled components, and non-regular controlled leaves are
+rejected before networking. The index journal must alias the requested journal,
+and public post candidates must be readable regular files with lone positive
+numeric `.adoc` stems and nonempty level-zero titles. Malformed, unverified, or
+mismatched roots fail closed before networking or writes. Missing and truly
+empty roots alone begin without a snapshot.
 
 Validated snapshot posts seed an ID-keyed additive final map for single-post and
 journal updates. Current successes replace/add; resume skips, failed refetches,
@@ -233,7 +256,43 @@ image targets retain the actual inspected filename (for example `01.adoc` for
 ID 1). New IDs alone use canonical `<id>.adoc`; never migrate, delete, or create
 a canonical duplicate for a validated alias.
 
-On a bulk journal export, rendered bodies and their pending links are staged on disk as non-public `posts/*.pending` files while the fetch stream remains bounded by `RunOptions::concurrency`. As each preparation completes, first-stage finalization resolves every staged link to its absolute href from that post's delivered URL and atomically publishes an externally complete `.adoc` at the selected actual path; successful posts therefore become public incrementally rather than waiting for every peer. A best-effort atomic second pass upgrades links to IDs in the additive final set, so a failed upgrade retains the complete external fallback and public files never contain staging tokens. After outcomes are known, every non-finalized retained entry, including resume skips, receives a best-effort repair against the exact trusted final filename map: active `xref:<positive digits>.adoc[…]` text targets and contextual `link={lj-archiver-post-link-prefix}<positive digits>.adoc]` linked-image targets use the surviving post's exact filename, while absent IDs become canonical external journal post URLs. The repair pass ignores candidates immediately preceded by `\`, preserves labels and image attributes, advances one monotonic cursor through the original bytes, and never scans replacement text; repair failure leaves the existing public bytes intact. Pending cleanup is also best effort: it is attempted after first-stage failure and after the upgrade pass, but an unlink failure may leave a non-public pending file without invalidating the externally complete public fallback. Pending-link substitution likewise scans input tokens with one monotonic cursor and must remain linear. A failed new post stays out of `index.adoc` and `book.adoc`, while a failed existing post retains its validated baseline entry. Journal names are matched with `-`/`_` folded together (LiveJournal serves an underscore username `a_b` at the hyphen subdomain `a-b.livejournal.com`, so the two spellings denote one journal). Downloaded media is stored once in a single `assets/` folder at the archive root (filenames are a URL hash, so a reused image is stored once and referenced as `../assets/<hash>.<ext>`).
+On a bulk journal export, rendered bodies and their validated pending links are
+staged on disk as non-public `posts/*.pending` files while the fetch stream
+remains bounded by `RunOptions::concurrency`. As each preparation completes,
+first-stage finalization resolves every staged link to its absolute href from
+that post's delivered URL and atomically publishes an externally complete
+`.adoc` at the selected actual path. A best-effort atomic second pass upgrades
+links to IDs in the additive final set, so a failed upgrade retains the complete
+external fallback and public files never contain staging tokens. Pending-link
+substitution uses the validated exact-once records and one monotonic cursor and
+must remain linear.
+
+Every published post has an implementation-owned sidecar under
+`.lj-archiver/links`. A sidecar binds strictly sorted, nonoverlapping typed
+active spans to the exact SHA-256 digest of the full public post. Retained
+repair first validates the digest, span boundaries, context, target identity,
+and current expression, then touches only those valid recorded spans. Missing,
+older, stale, malformed, or user-invalidated sidecars preserve the post and
+warn; there is no heuristic or broad-source fallback repair.
+
+Publication derives and validates both the numeric `posts/*.adoc` path and its
+hidden metadata path before either write. Controlled paths accept normalized
+components only, create or inspect real directory parents, reject symlinks and
+non-regular destinations, and verify canonical parent containment within the
+archive root. This applies to asset writes as well as hidden metadata writes.
+Publication writes the post first and then its sidecar. A post-success/sidecar
+I/O failure is a warning because the externally complete post is already
+public; serialization or path-validation failure before publication remains a
+hard error.
+
+Pending cleanup is best effort: it is attempted after first-stage failure and
+after the upgrade pass, but an unlink failure may leave a non-public pending
+file without invalidating the externally complete public fallback. A failed new
+post stays out of `index.adoc` and `book.adoc`, while a failed existing post
+retains its validated baseline entry. Journal names are matched with `-`/`_`
+folded together. Downloaded media is stored once in a single `assets/` folder
+at the archive root (filenames are a URL hash, so a reused image is stored once
+and referenced as `../assets/<hash>.<ext>`).
 
 Fetched posts are parsed against the delivered final response URL, which is
 preserved as `Post.url` for rendering and downstream processing. Before media

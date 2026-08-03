@@ -133,7 +133,7 @@ public journal.
 | `--no-comments` | Do not include comments |
 | `--no-media` | Do not download inline media; keep remote URLs in the output |
 | `--concurrency <N>` | Set the number of posts processed concurrently during journal archives. Defaults to `4` |
-| `--resume` | During full journal archives, do not refetch discovered posts present in the validated existing archive; their local links may still be repaired |
+| `--resume` | During full journal archives, do not refetch discovered posts present in the validated existing archive; trusted metadata may still upgrade their local links |
 | `--book` | Also write `book.adoc` at the archive root: one AsciiDoc document that `include::`s `index.adoc` and every archived post (`leveloffset=+1`), under `:doctype: book` with a generated `:toc:` |
 | `--journal <NAME>` | Journal name for bare `@id` targets |
 | `--user-agent <STRING>` | Send this `User-Agent` header on every request. By default no `User-Agent` is sent |
@@ -163,6 +163,13 @@ consistently for replacement, link repair, index/book entries, and local text or
 image links. The post file contains document metadata, the post body, and
 comments when comment archiving is enabled.
 
+`.lj-archiver/links/*.json` is implementation-owned metadata used to upgrade
+cross-references safely when a post is retained or skipped by `--resume`. Keep
+this directory with `posts/` if you want those upgrades on later runs. Each
+post file remains independently usable without its metadata. Older, missing,
+stale, or user-invalidated metadata never triggers a broad scan of the post
+source: the post stays unchanged and the run prints a warning.
+
 During a completed journal export, links to other exported posts become local
 cross-references. Other root-relative, path-relative, and protocol-relative
 HTTP(S) references are resolved against the individual post's delivered final
@@ -175,6 +182,8 @@ Unsupported HTML is preserved as raw HTML only when every element, attribute,
 and URL belongs to a reviewed inert subset. Active HTML and custom, namespaced,
 or otherwise unknown capabilities remain visible in source listings instead of
 being emitted as raw HTML.
+Inline code and preserved source may use deliberate inert AsciiDoc encodings;
+when converted, the visible result retains the text authored in the post.
 Archive paths written into AsciiDoc always use portable forward slashes.
 An image that links to another exported post also stays local: its click target
 resolves correctly both from a standalone file in `posts/` and when that post
@@ -243,13 +252,15 @@ summary counters describe current-run work only, so merely retained posts are
 not counted as archived or skipped. Current post and discovery-page failures
 remain explicit even when the validated snapshot keeps the manifests intact.
 
-Retained and resume-skipped files receive a best-effort stale local-link repair
-after the final post set is known. Ordinary cross-references and linked-image
-click targets are retargeted to each surviving post's exact validated filename;
-targets absent from the final set revert to canonical external journal post
-URLs. If that repair or a current post's second local-link pass fails, the
-already public file is retained; a successfully finalized current post always
-has complete external fallback targets rather than internal staging markers.
+After the final post set is known, retained and resume-skipped files may have
+recorded cross-references upgraded from their trusted metadata. Ordinary
+cross-references and linked-image click targets are retargeted to each
+surviving post's exact validated filename; targets absent from the final set
+revert to canonical external journal post URLs. Missing or invalid metadata,
+or a failed upgrade, preserves the existing post unchanged and prints a
+warning. There is no fallback scan for link-like text. A successfully finalized
+current post always has complete external fallback targets rather than internal
+staging markers.
 
 While archiving, `lj-archiver` prints progress to standard error. On an
 interactive terminal it shows a discovery spinner and then a progress bar with a
@@ -286,8 +297,9 @@ discarded before retrying. Unusable media responses are not turned into broken
 local paths; the post retains the resolved absolute remote target instead.
 
 With `--resume` during full journal archives, validated existing post files are
-not refetched. After the final post set is known, stale local cross-references
-may be repaired with an atomic rewrite; if no repair is needed, their bytes stay
+not refetched. After the final post set is known, cross-references recorded in
+valid implementation metadata may be upgraded with a controlled rewrite; if no
+upgrade is needed, or the metadata cannot be trusted, their bytes stay
 unchanged.
 
 ## Current Limits
