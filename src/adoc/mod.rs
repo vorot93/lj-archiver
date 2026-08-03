@@ -964,6 +964,20 @@ mod tests {
     }
 
     #[test]
+    fn space_prefixed_marker_hides_protection_and_active_control_stays_protected() {
+        assert_eq!(
+            html_to_adoc(concat!(
+                "<p>before<br> <<< <br>after</p>",
+                "<p>control-before<br><br>include::secret[]<br><br>control-after</p>",
+            )),
+            concat!(
+                "before +\n&#60;<< +\nafter\n\n",
+                "control-before\n\n\\include::secret[]\n\ncontrol-after\n\n",
+            )
+        );
+    }
+
+    #[test]
     fn no_rewriter_rejects_explicit_non_http_image_schemes() {
         for src in [
             "data:image/svg+xml;base64,PHN2Zy8+",
@@ -4359,6 +4373,49 @@ mod tests {
         assert_eq!(
             document.select(&Selector::parse("table").unwrap()).count(),
             0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn space_prefixed_block_constructs_hide_protection_after_conversion() {
+        let markers = [
+            "<<<",
+            "'''",
+            ".Authored title",
+            "--",
+            "|===",
+            ",===",
+            ":===",
+            "!===",
+        ];
+        let spaced = markers
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| format!("<p>before-{index}<br> {marker} <br>after-{index}</p>"))
+            .collect::<String>();
+        let html =
+            format!("{spaced}<p>control-before<br><br>include::secret[]<br><br>control-after</p>");
+        let converted = convert_with_asciidoctor(&html_to_adoc(&html));
+        let document = Html::parse_document(&converted);
+        let visible = document.root_element().text().collect::<String>();
+
+        for (index, marker) in markers.iter().enumerate() {
+            assert!(visible.contains(marker), "{marker}: {converted}");
+            assert!(visible.contains(&format!("after-{index}")), "{converted}");
+        }
+        assert!(visible.contains("include::secret[]"), "{converted}");
+        assert!(visible.contains("control-after"), "{converted}");
+        assert!(
+            !visible.contains('\\'),
+            "visible protection slash: {converted}"
+        );
+        assert!(
+            document
+                .select(&Selector::parse("table, hr, .title, [style*='page-break']").unwrap())
+                .next()
+                .is_none(),
+            "activated authored construct: {converted}"
         );
     }
 

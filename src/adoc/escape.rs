@@ -46,18 +46,33 @@ pub(crate) fn neutralize_active_adoc_lines(text: &str) -> String {
             continue;
         }
 
-        if starts_with_active_adoc_syntax(line_without_newline)
+        let protect_active_syntax = starts_with_active_adoc_syntax(line_without_newline)
             && (neutralized_description_markers.is_none()
-                || starts_with_non_description_active_adoc_syntax(line_without_newline))
-        {
-            output.push('\\');
-        }
+                || starts_with_non_description_active_adoc_syntax(line_without_newline));
 
         if let Some(neutralized_description_markers) = neutralized_description_markers {
             let leading_len = line_without_newline.len() - trimmed.len();
             output.push_str(&line[..leading_len]);
+            if protect_active_syntax {
+                output.push('\\');
+            }
             output.push_str(&neutralized_description_markers);
             output.push_str(&line[line_without_newline.len()..]);
+        } else if protect_active_syntax {
+            let leading_len = line_without_newline.len() - trimmed.len();
+            output.push_str(&line[..leading_len]);
+            let protected = &line[leading_len..];
+            if leading_len > 0 && starts_with_additional_block_construct(trimmed) {
+                // Appending at a generated line start trims the retained space.
+                // Encode the first marker glyph so it stays inert without
+                // exposing a backslash after AsciiDoc conversion.
+                let first = protected.chars().next().expect("active syntax is nonempty");
+                output.push_str(&format!("&#{};", u32::from(first)));
+                output.push_str(&protected[first.len_utf8()..]);
+            } else {
+                output.push('\\');
+                output.push_str(protected);
+            }
         } else {
             output.push_str(line);
         }
@@ -881,6 +896,18 @@ mod tests {
                 format!(r"\{authored}")
             );
         }
+    }
+
+    #[test]
+    fn places_active_line_protection_after_retained_leading_whitespace() {
+        assert_eq!(
+            neutralize_plain_adoc_fragment_at_line_start(" <<< ", true),
+            " &#60;<< "
+        );
+        assert_eq!(
+            neutralize_plain_adoc_fragment_at_line_start("<<<", true),
+            "\\<<<"
+        );
     }
 
     #[test]
