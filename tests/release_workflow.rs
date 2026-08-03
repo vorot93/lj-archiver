@@ -22,31 +22,39 @@ fn assert_external_actions_use_full_shas(workflow: &str) {
 #[test]
 fn publisher_revalidates_and_peels_the_remote_tag_before_the_sole_create() {
     let workflow = include_str!("../.github/workflows/release.yml");
-    assert_eq!(workflow.matches("gh release create").count(), 1);
-    let ref_query = workflow
-        .find("git/ref/tags/$GITHUB_REF_NAME")
-        .expect("publisher must query the live remote tag");
-    let peel_query = workflow
-        .find("git/tags/$tag_sha")
-        .expect("publisher must peel annotated tag objects");
-    let equality = workflow
-        .find(r#"test "$tag_sha" = "$GITHUB_SHA""#)
-        .expect("publisher must bind the peeled commit to the triggering SHA");
-    let existence_check = workflow
-        .find(r#"if gh release view "$GITHUB_REF_NAME""#)
-        .expect("publisher must reject an existing release");
-    let create = workflow.find("gh release create").unwrap();
-    assert!(ref_query < peel_query);
-    assert!(peel_query < equality);
-    assert!(equality < existence_check);
-    assert!(existence_check < create);
-    assert!(workflow.contains("for peel_depth in 1 2 3 4 5 6 7 8"));
-
     assert_eq!(workflow.matches("\n  publish:\n").count(), 1);
     let publisher = workflow
         .split_once("\n  publish:\n")
         .expect("workflow must have one publisher")
         .1;
+    assert!(
+        !publisher
+            .lines()
+            .any(|line| line.starts_with("  ") && !line.starts_with("    ")),
+        "publish must remain the final job so its block is unambiguous"
+    );
+
+    assert_eq!(publisher.matches("gh release create").count(), 1);
+    let ref_query = publisher
+        .find("git/ref/tags/$GITHUB_REF_NAME")
+        .expect("publisher must query the live remote tag");
+    let peel_query = publisher
+        .find("git/tags/$tag_sha")
+        .expect("publisher must peel annotated tag objects");
+    let equality = publisher
+        .find(r#"test "$tag_sha" = "$GITHUB_SHA""#)
+        .expect("publisher must bind the peeled commit to the triggering SHA");
+    let existence_check = publisher
+        .find(r#"if gh release view "$GITHUB_REF_NAME""#)
+        .expect("publisher must reject an existing release");
+    let create = publisher.find("gh release create").unwrap();
+    assert!(ref_query < peel_query);
+    assert!(peel_query < equality);
+    assert!(equality < existence_check);
+    assert!(existence_check < create);
+    assert!(publisher.contains("for peel_depth in 1 2 3 4 5 6 7 8"));
+    assert!(publisher.contains("GH_REPO: ${{ github.repository }}"));
+
     assert!(publisher.contains("set -euo pipefail"));
     assert!(publisher.contains("permissions:\n      contents: write"));
     assert!(!publisher.contains("actions/checkout"));
@@ -67,7 +75,6 @@ fn publisher_revalidates_and_peels_the_remote_tag_before_the_sole_create() {
     assert!(workflow.contains("permissions:\n  contents: read"));
     assert!(workflow.contains("package:\n    needs: gates"));
     assert!(workflow.contains("publish:\n    needs: package"));
-    assert!(workflow.contains("GH_REPO: ${{ github.repository }}"));
 
     assert!(workflow.contains(r#"test "${#all[@]}" -eq 5"#));
     assert!(workflow.contains(r#"test "${#deb[@]}" -eq 1"#));
