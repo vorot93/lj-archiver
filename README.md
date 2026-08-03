@@ -91,7 +91,9 @@ lj-archiver --user-agent "my-archiver/1.0" news
 A desktop GUI is available alongside the command-line tool. It lets you enter a
 target (a journal name, `journal/id`, or a post URL), choose an output folder,
 toggle comments and media, optionally generate a single-file `book.adoc`, watch
-archiving progress, and open the finished archive folder. It shows a count
+folder validation and archiving progress, and open the finished archive folder.
+Folder validation runs in the background and appears as a visible validating
+stage. It shows a count
 warning when archive pages fail, lists failed posts with clickable links, and
 lists integrity warnings such as preserved post bytes or unavailable trusted
 link metadata in the final completion view.
@@ -100,6 +102,8 @@ journal; the GUI automatically resumes a matching archive.
 Delayed updates from an earlier run cannot change a later run. Intermediate
 progress updates are bounded and may be dropped when the GUI is busy, but the
 final result supplies the exact counts, failure details, and integrity warnings.
+If opening the archive folder or a failed-post link does not launch, the GUI
+shows a non-terminal error without replacing those completion details.
 
 Download an installer for your platform from the project's GitHub Releases:
 

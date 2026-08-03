@@ -22,6 +22,22 @@ pub struct RunConfig {
     pub generate_book: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingRunValidation {
+    pub target: String,
+    pub folder: PathBuf,
+    pub requested_journal: String,
+    pub include_comments: bool,
+    pub download_media: bool,
+    pub generate_book: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedRun {
+    pub target: String,
+    pub options: RunOptions,
+}
+
 impl Default for RunConfig {
     fn default() -> Self {
         RunConfig {
@@ -36,6 +52,7 @@ impl Default for RunConfig {
 
 #[derive(Debug, Clone)]
 pub enum Phase {
+    Validating,
     Discovering { found: usize },
     FetchingPost,
     Archiving { done: usize, total: usize },
@@ -69,6 +86,10 @@ pub enum Message {
     ToggleMedia(bool),
     ToggleBook(bool),
     Start,
+    ValidationFinished {
+        run_id: u64,
+        result: Result<ValidatedRun, String>,
+    },
     Progress {
         run_id: u64,
         event: ProgressEvent,
@@ -76,6 +97,10 @@ pub enum Message {
     Finished {
         run_id: u64,
         result: Result<RunOutcome, String>,
+    },
+    LaunchFinished {
+        launch_id: u64,
+        result: Result<(), String>,
     },
     OpenFolder,
     OpenUrl(String),
@@ -85,8 +110,11 @@ pub enum Message {
 pub struct App {
     pub config: RunConfig,
     pub state: State,
+    pub launch_notice: Option<String>,
     next_run_id: u64,
     active_run_id: Option<u64>,
+    next_launch_id: u64,
+    active_launch_id: Option<u64>,
 }
 
 impl App {
@@ -108,16 +136,37 @@ impl App {
                 if matches!(self.state, State::Running(_)) {
                     return;
                 }
+                self.launch_notice = None;
                 self.next_run_id = self.next_run_id.wrapping_add(1);
                 if self.next_run_id == 0 {
                     self.next_run_id = 1;
                 }
                 self.active_run_id = Some(self.next_run_id);
-                let phase = match parse_target(self.config.target.trim(), None) {
-                    Ok(ArchiveTarget::Post { .. }) => Phase::FetchingPost,
-                    Ok(ArchiveTarget::Journal { .. }) | Err(_) => Phase::Discovering { found: 0 },
-                };
-                self.state = State::Running(phase);
+                self.state = State::Running(Phase::Validating);
+            }
+            Message::ValidationFinished { run_id, result } => {
+                if Some(*run_id) != self.active_run_id
+                    || !matches!(self.state, State::Running(Phase::Validating))
+                {
+                    return;
+                }
+                match result {
+                    Ok(validated) => {
+                        let phase = match parse_target(&validated.target, None) {
+                            Ok(ArchiveTarget::Post { .. }) => Phase::FetchingPost,
+                            Ok(ArchiveTarget::Journal { .. }) | Err(_) => {
+                                Phase::Discovering { found: 0 }
+                            }
+                        };
+                        self.state = State::Running(phase);
+                    }
+                    Err(message) => {
+                        self.state = State::Error {
+                            message: message.clone(),
+                        };
+                        self.active_run_id = None;
+                    }
+                }
             }
             Message::Progress { run_id, event } => {
                 if Some(*run_id) != self.active_run_id {
@@ -148,6 +197,13 @@ impl App {
                     }
                 }
                 self.active_run_id = None;
+            }
+            Message::LaunchFinished { launch_id, result } => {
+                if Some(*launch_id) != self.active_launch_id {
+                    return;
+                }
+                self.launch_notice = result.as_ref().err().cloned();
+                self.active_launch_id = None;
             }
             Message::ChooseFolder | Message::OpenFolder | Message::OpenUrl(_) => {}
         }
@@ -199,10 +255,22 @@ impl App {
         self.active_run_id
     }
 
-    /// The target string and `RunOptions` for a launch, or `None` if not
-    /// startable. Auto-detects resume from the chosen folder and rejects an
-    /// existing archive whose journal identity cannot be verified or matched.
-    pub fn run_request(&self) -> Result<Option<(String, RunOptions)>, String> {
+    pub(crate) fn begin_launch(&mut self) -> u64 {
+        self.next_launch_id = self.next_launch_id.wrapping_add(1);
+        if self.next_launch_id == 0 {
+            self.next_launch_id = 1;
+        }
+        self.active_launch_id = Some(self.next_launch_id);
+        debug_assert_eq!(self.active_launch_id(), Some(self.next_launch_id));
+        self.next_launch_id
+    }
+
+    pub(crate) fn active_launch_id(&self) -> Option<u64> {
+        self.active_launch_id
+    }
+
+    /// Purely snapshots and parses a startable request for later validation.
+    pub fn pending_validation(&self) -> Result<Option<PendingRunValidation>, String> {
         if !self.can_start() {
             return Ok(None);
         }
@@ -216,28 +284,43 @@ impl App {
             match parse_target(target, None).map_err(|error| error.to_string())? {
                 ArchiveTarget::Journal { journal } | ArchiveTarget::Post { journal, .. } => journal,
             };
-        std::fs::read_dir(&folder).map_err(|error| {
+        Ok(Some(PendingRunValidation {
+            target: target.to_string(),
+            folder,
+            requested_journal,
+            include_comments: self.config.include_comments,
+            download_media: self.config.download_media,
+            generate_book: self.config.generate_book,
+        }))
+    }
+
+    /// Performs blocking archive inspection away from the iced event thread.
+    pub fn validate_pending(request: PendingRunValidation) -> Result<ValidatedRun, String> {
+        std::fs::read_dir(&request.folder).map_err(|error| {
             format!(
                 "selected folder failed archive validation: could not read selected directory {}: {error}",
-                folder.display()
+                request.folder.display()
             )
         })?;
-        let existing = Archive::new(&folder, requested_journal)
+        let existing = Archive::new(&request.folder, request.requested_journal)
             .inspect_existing()
             .map_err(|error| format!("selected folder failed archive validation: {error}"))?;
         let resume = existing.is_some_and(|archive| !archive.posts.is_empty());
         let options = RunOptions {
-            output_dir: Some(folder),
-            include_comments: self.config.include_comments,
-            download_media: self.config.download_media,
+            output_dir: Some(request.folder),
+            include_comments: request.include_comments,
+            download_media: request.download_media,
             concurrency: 4,
             resume,
-            generate_book: self.config.generate_book,
+            generate_book: request.generate_book,
             journal_context: None,
             user_agent: None,
             base_url: Url::parse("https://livejournal.com").expect("static url is valid"),
         };
-        Ok(Some((target.to_string(), options)))
+        Ok(ValidatedRun {
+            target: request.target,
+            options,
+        })
     }
 }
 
@@ -267,6 +350,12 @@ mod tests {
         app.update_state(&Message::TargetChanged(target.to_string()));
         app.update_state(&Message::FolderChosen(Some(folder.to_path_buf())));
         app
+    }
+
+    fn validate_app(app: &App) -> Result<Option<ValidatedRun>, String> {
+        app.pending_validation()?
+            .map(App::validate_pending)
+            .transpose()
     }
 
     fn write_valid_index(root: &Path, journal: &str) {
@@ -337,9 +426,272 @@ mod tests {
         }
     }
 
+    fn validated_run(target: &str) -> ValidatedRun {
+        ValidatedRun {
+            target: target.to_string(),
+            options: RunOptions {
+                output_dir: Some(PathBuf::from("/tmp/out")),
+                include_comments: true,
+                download_media: true,
+                concurrency: 4,
+                resume: false,
+                generate_book: false,
+                journal_context: None,
+                user_agent: None,
+                base_url: Url::parse("https://livejournal.com").unwrap(),
+            },
+        }
+    }
+
     fn start_run(app: &mut App) -> u64 {
         app.update_state(&Message::Start);
         app.active_run_id().expect("Start should activate a run")
+    }
+
+    #[test]
+    fn start_enters_visible_validating_phase_and_allocates_generation() {
+        let mut app = App::default();
+
+        app.update_state(&Message::Start);
+
+        assert_eq!(app.active_run_id(), Some(1));
+        assert!(matches!(app.state, State::Running(Phase::Validating)));
+    }
+
+    #[test]
+    fn matching_validation_success_advances_to_fetching_or_discovery_without_retiring_generation() {
+        let mut post_app = App::default();
+        let post_run_id = start_run(&mut post_app);
+        post_app.update_state(&Message::ValidationFinished {
+            run_id: post_run_id,
+            result: Ok(validated_run("news/1")),
+        });
+        assert_eq!(post_app.active_run_id(), Some(post_run_id));
+        assert!(matches!(
+            post_app.state,
+            State::Running(Phase::FetchingPost)
+        ));
+
+        let mut journal_app = App::default();
+        let journal_run_id = start_run(&mut journal_app);
+        journal_app.update_state(&Message::ValidationFinished {
+            run_id: journal_run_id,
+            result: Ok(validated_run("news")),
+        });
+        assert_eq!(journal_app.active_run_id(), Some(journal_run_id));
+        assert!(matches!(
+            journal_app.state,
+            State::Running(Phase::Discovering { found: 0 })
+        ));
+    }
+
+    #[test]
+    fn matching_validation_error_retires_generation_and_enters_error() {
+        let mut app = App::default();
+        let run_id = start_run(&mut app);
+
+        app.update_state(&Message::ValidationFinished {
+            run_id,
+            result: Err("invalid archive".to_string()),
+        });
+
+        assert_eq!(app.active_run_id(), None);
+        assert!(matches!(
+            app.state,
+            State::Error { ref message } if message == "invalid archive"
+        ));
+    }
+
+    #[test]
+    fn stale_validation_completion_is_inert() {
+        let mut app = App::default();
+        app.update_state(&Message::Start);
+        let active = app.active_run_id().unwrap();
+        let before = format!("{:?}", app.state);
+        app.update_state(&Message::ValidationFinished {
+            run_id: active.wrapping_add(1),
+            result: Ok(validated_run("news/1")),
+        });
+        assert_eq!(format!("{:?}", app.state), before);
+        assert_eq!(app.active_run_id(), Some(active));
+    }
+
+    #[test]
+    fn start_while_validating_schedules_no_new_generation() {
+        let mut app = App::default();
+        let run_id = start_run(&mut app);
+        let before = format!("{app:?}");
+
+        app.update_state(&Message::Start);
+
+        assert_eq!(app.active_run_id(), Some(run_id));
+        assert_eq!(format!("{app:?}"), before);
+    }
+
+    #[test]
+    fn validation_generation_wraps_to_one() {
+        let mut app = App {
+            next_run_id: u64::MAX,
+            ..App::default()
+        };
+
+        app.update_state(&Message::Start);
+
+        assert_eq!(app.active_run_id(), Some(1));
+        assert!(matches!(app.state, State::Running(Phase::Validating)));
+    }
+
+    #[test]
+    fn pending_validation_does_not_touch_the_filesystem() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let app = app_for_folder("news", &missing);
+
+        let pending = app.pending_validation().unwrap().unwrap();
+
+        assert_eq!(pending.target, "news");
+        let error = App::validate_pending(pending).unwrap_err();
+        assert!(error.starts_with(ARCHIVE_VALIDATION_PREFIX));
+        assert!(error.contains("could not read selected directory"));
+    }
+
+    #[test]
+    fn validate_pending_ignores_invalid_utf8_after_a_bounded_post_title_line() {
+        let dir = tempdir().unwrap();
+        write_valid_index(dir.path(), "news");
+        let posts = dir.path().join("posts");
+        std::fs::create_dir_all(&posts).unwrap();
+        let mut body = b"= Valid title\n".to_vec();
+        body.extend(std::iter::repeat_n(b'x', 256 * 1024));
+        body.push(0xff);
+        std::fs::write(posts.join("1.adoc"), body).unwrap();
+        let app = app_for_folder("news", dir.path());
+
+        let pending = app.pending_validation().unwrap().unwrap();
+        let validated = App::validate_pending(pending).unwrap();
+
+        assert!(validated.options.resume);
+    }
+
+    #[test]
+    fn matching_failed_launch_sets_notice_without_replacing_done_details() {
+        let mut app = App::default();
+        let run_id = start_run(&mut app);
+        let failure = PostFailure {
+            id: 9,
+            url: Url::parse("https://news.livejournal.com/9.html").unwrap(),
+            message: "post failed".to_string(),
+        };
+        let warning = RunWarning::RetainedPostPreserved {
+            post_id: 7,
+            message: "metadata warning".to_string(),
+        };
+        let mut completed = outcome(PathBuf::from("/tmp/out"), 1, vec![failure]);
+        completed.warnings.push(warning);
+        app.update_state(&Message::Finished {
+            run_id,
+            result: Ok(completed),
+        });
+        let done_before = format!("{:?}", app.state);
+        let launch_id = app.begin_launch();
+
+        app.update_state(&Message::LaunchFinished {
+            launch_id,
+            result: Err("Open folder failed: permission denied".to_string()),
+        });
+
+        assert_eq!(format!("{:?}", app.state), done_before);
+        assert_eq!(
+            app.launch_notice.as_deref(),
+            Some("Open folder failed: permission denied")
+        );
+        assert_eq!(app.active_launch_id(), None);
+    }
+
+    #[test]
+    fn matching_successful_launch_clears_notice() {
+        let mut app = App {
+            launch_notice: Some("earlier failure".to_string()),
+            ..App::default()
+        };
+        let launch_id = app.begin_launch();
+
+        app.update_state(&Message::LaunchFinished {
+            launch_id,
+            result: Ok(()),
+        });
+
+        assert_eq!(app.launch_notice, None);
+        assert_eq!(app.active_launch_id(), None);
+    }
+
+    #[test]
+    fn stale_launch_completion_is_inert() {
+        let mut app = App {
+            launch_notice: Some("existing notice".to_string()),
+            ..App::default()
+        };
+        let launch_id = app.begin_launch();
+        let before = format!("{app:?}");
+
+        app.update_state(&Message::LaunchFinished {
+            launch_id: launch_id.wrapping_add(1),
+            result: Err("stale failure".to_string()),
+        });
+
+        assert_eq!(format!("{app:?}"), before);
+    }
+
+    #[test]
+    fn second_launch_supersedes_first_launch_completion() {
+        let mut app = App::default();
+        let first = app.begin_launch();
+        let second = app.begin_launch();
+        assert_ne!(first, second);
+
+        app.update_state(&Message::LaunchFinished {
+            launch_id: first,
+            result: Err("first failed".to_string()),
+        });
+
+        assert_eq!(app.active_launch_id(), Some(second));
+        assert_eq!(app.launch_notice, None);
+
+        app.update_state(&Message::LaunchFinished {
+            launch_id: second,
+            result: Err("Open link failed: unavailable".to_string()),
+        });
+        assert_eq!(
+            app.launch_notice.as_deref(),
+            Some("Open link failed: unavailable")
+        );
+        assert_eq!(app.active_launch_id(), None);
+    }
+
+    #[test]
+    fn start_clears_prior_launch_notice() {
+        let mut app = App {
+            launch_notice: Some("Open folder failed: unavailable".to_string()),
+            ..App::default()
+        };
+
+        app.update_state(&Message::Start);
+
+        assert_eq!(app.launch_notice, None);
+        assert!(matches!(app.state, State::Running(Phase::Validating)));
+    }
+
+    #[test]
+    fn launch_generation_wraps_to_one() {
+        let mut app = App {
+            next_launch_id: u64::MAX,
+            ..App::default()
+        };
+
+        let launch_id = app.begin_launch();
+
+        assert_eq!(launch_id, 1);
+        assert_eq!(app.active_launch_id(), Some(1));
     }
 
     #[test]
@@ -373,12 +725,16 @@ mod tests {
     }
 
     #[test]
-    fn start_enters_discovering_and_progress_advances_bar() {
+    fn validated_journal_run_enters_discovering_and_progress_advances_bar() {
         let mut app = App::default();
         app.update_state(&Message::TargetChanged("news".to_string()));
         app.update_state(&Message::FolderChosen(Some(PathBuf::from("/tmp/out"))));
         let run_id = start_run(&mut app);
         assert_eq!(run_id, 1);
+        app.update_state(&Message::ValidationFinished {
+            run_id,
+            result: Ok(validated_run("news")),
+        });
         assert!(matches!(
             app.state,
             State::Running(Phase::Discovering { found: 0 })
@@ -423,11 +779,15 @@ mod tests {
     }
 
     #[test]
-    fn single_post_start_and_progress_use_fetching_phase() {
+    fn validated_single_post_and_progress_use_fetching_phase() {
         let mut app = App::default();
         app.update_state(&Message::TargetChanged("news/1".to_string()));
         app.update_state(&Message::FolderChosen(Some(PathBuf::from("/tmp/out"))));
         let run_id = start_run(&mut app);
+        app.update_state(&Message::ValidationFinished {
+            run_id,
+            result: Ok(validated_run("news/1")),
+        });
 
         assert!(matches!(app.state, State::Running(Phase::FetchingPost)));
         app.update_state(&Message::Progress {
@@ -833,7 +1193,7 @@ mod tests {
             }
 
             let before = snapshot_tree(&root);
-            match app_for_folder("news", &root).run_request() {
+            match validate_app(&app_for_folder("news", &root)) {
                 Ok(Some(_)) => accepted.push(name),
                 Ok(None) => panic!("{name}: configured request unexpectedly was not startable"),
                 Err(error) => {
@@ -888,10 +1248,10 @@ mod tests {
             }
 
             let before = snapshot_tree(&root);
-            let (_, options) = app_for_folder(target, &root)
-                .run_request()
+            let validated = validate_app(&app_for_folder(target, &root))
                 .unwrap()
                 .unwrap();
+            let options = validated.options;
             assert_eq!(
                 options.output_dir.as_deref(),
                 Some(root.as_path()),
@@ -907,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn run_request_builds_options_with_autoresume() {
+    fn split_validation_builds_options_with_autoresume() {
         let dir = tempdir().unwrap();
         let posts = dir.path().join("posts");
         std::fs::create_dir_all(&posts).unwrap();
@@ -920,8 +1280,10 @@ mod tests {
         app.update_state(&Message::ToggleMedia(false));
         app.update_state(&Message::ToggleBook(true));
 
-        let (target, options) = app.run_request().unwrap().unwrap();
-        assert_eq!(target, "news");
+        let pending = app.pending_validation().unwrap().unwrap();
+        assert_eq!(pending.target, "news");
+        let validated = App::validate_pending(pending).unwrap();
+        let options = validated.options;
         assert_eq!(options.output_dir.as_deref(), Some(dir.path()));
         assert!(options.resume); // posts/ already has a .adoc
         assert!(!options.download_media);
@@ -942,9 +1304,9 @@ mod tests {
         app.update_state(&Message::TargetChanged("evo_lutio".to_string()));
         app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
 
-        let (target, options) = app.run_request().unwrap().unwrap();
-        assert_eq!(target, "evo_lutio");
-        assert!(options.resume);
+        let validated = validate_app(&app).unwrap().unwrap();
+        assert_eq!(validated.target, "evo_lutio");
+        assert!(validated.options.resume);
     }
 
     #[test]
@@ -959,7 +1321,7 @@ mod tests {
         app.update_state(&Message::TargetChanged("other".to_string()));
         app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
 
-        let error = app.run_request().unwrap_err();
+        let error = validate_app(&app).unwrap_err();
         assert!(error.contains("news"));
         assert!(error.contains("other"));
     }
@@ -975,7 +1337,7 @@ mod tests {
         app.update_state(&Message::TargetChanged("news".to_string()));
         app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
 
-        let error = app.run_request().unwrap_err();
+        let error = validate_app(&app).unwrap_err();
         assert!(error.starts_with(ARCHIVE_VALIDATION_PREFIX));
         assert!(error.contains("missing controlled index"));
     }
@@ -988,8 +1350,8 @@ mod tests {
         app.update_state(&Message::TargetChanged("news".to_string()));
         app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
 
-        let (_, options) = app.run_request().unwrap().unwrap();
-        assert!(!options.resume);
+        let validated = validate_app(&app).unwrap().unwrap();
+        assert!(!validated.options.resume);
     }
 
     #[test]
@@ -1002,7 +1364,7 @@ mod tests {
         app.update_state(&Message::TargetChanged("news".to_string()));
         app.update_state(&Message::FolderChosen(Some(output)));
 
-        let error = app.run_request().unwrap_err();
+        let error = validate_app(&app).unwrap_err();
         assert!(error.starts_with(ARCHIVE_VALIDATION_PREFIX));
         assert!(error.contains("could not read selected directory"));
     }
@@ -1017,7 +1379,7 @@ mod tests {
         app.update_state(&Message::TargetChanged("news".to_string()));
         app.update_state(&Message::FolderChosen(Some(dir.path().to_path_buf())));
 
-        let error = app.run_request().unwrap_err();
+        let error = validate_app(&app).unwrap_err();
         assert!(error.starts_with(ARCHIVE_VALIDATION_PREFIX));
         assert!(error.contains("posts path is not a directory"));
     }

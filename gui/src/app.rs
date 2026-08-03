@@ -1,4 +1,4 @@
-use crate::state::{App, Message, Phase, State};
+use crate::state::{App, Message, PendingRunValidation, Phase, State, ValidatedRun};
 use iced::{
     Element, Task,
     widget::{
@@ -12,6 +12,7 @@ use lj_archiver::{
 
 fn running_status_text(phase: &Phase) -> String {
     match phase {
+        Phase::Validating => "Validating archive folder…".to_string(),
         Phase::Discovering { found } => format!("Discovering posts… ({found} found)"),
         Phase::FetchingPost => "Fetching post…".to_string(),
         Phase::Archiving { done, total } => format!("Archiving {done}/{total}…"),
@@ -30,6 +31,41 @@ fn finished_message(run_id: u64, result: Result<RunOutcome, String>) -> Message 
     Message::Finished { run_id, result }
 }
 
+fn validation_message(run_id: u64, result: Result<ValidatedRun, String>) -> Message {
+    Message::ValidationFinished { run_id, result }
+}
+
+fn launch_message(launch_id: u64, action: &'static str, result: Result<(), String>) -> Message {
+    Message::LaunchFinished {
+        launch_id,
+        result: result.map_err(|error| format!("{action} failed: {error}")),
+    }
+}
+
+fn launch_task<T>(launch_id: u64, action: &'static str, target: T) -> Task<Message>
+where
+    T: AsRef<std::ffi::OsStr> + Send + 'static,
+{
+    Task::perform(
+        async move { open::that(target).map_err(|error| error.to_string()) },
+        move |result| launch_message(launch_id, action, result),
+    )
+}
+
+fn validation_task(run_id: u64, pending: PendingRunValidation) -> Task<Message> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(App::validate_pending(pending));
+    });
+    Task::perform(
+        async move {
+            rx.await
+                .map_err(|_| "archive validation worker stopped unexpectedly".to_string())?
+        },
+        move |result| validation_message(run_id, result),
+    )
+}
+
 impl App {
     pub fn boot() -> (App, Task<Message>) {
         (App::default(), Task::none())
@@ -43,15 +79,22 @@ impl App {
                 })
             }
             Message::Start => self.start_archive(),
+            Message::ValidationFinished { run_id, result } => {
+                self.finish_validation(run_id, result)
+            }
             Message::OpenFolder => {
-                if let State::Done { root, .. } = &self.state {
-                    let _ = open::that(root);
-                }
-                Task::none()
+                let Some(root) = (match &self.state {
+                    State::Done { root, .. } => Some(root.clone()),
+                    _ => None,
+                }) else {
+                    return Task::none();
+                };
+                let launch_id = self.begin_launch();
+                launch_task(launch_id, "Open folder", root)
             }
             Message::OpenUrl(url) => {
-                let _ = open::that(url);
-                Task::none()
+                let launch_id = self.begin_launch();
+                launch_task(launch_id, "Open link", url)
             }
             other => {
                 self.update_state(&other);
@@ -61,7 +104,7 @@ impl App {
     }
 
     fn start_archive(&mut self) -> Task<Message> {
-        let (target, options) = match self.run_request() {
+        let pending = match self.pending_validation() {
             Ok(Some(request)) => request,
             Ok(None) => return Task::none(),
             Err(message) => {
@@ -72,12 +115,33 @@ impl App {
         self.update_state(&Message::Start);
         let run_id = self
             .active_run_id()
-            .expect("validated Start should activate a run generation");
+            .expect("startable Start should activate a run generation");
+
+        validation_task(run_id, pending)
+    }
+
+    fn finish_validation(
+        &mut self,
+        run_id: u64,
+        result: Result<ValidatedRun, String>,
+    ) -> Task<Message> {
+        let accepts_validation = self.active_run_id() == Some(run_id)
+            && matches!(self.state, State::Running(Phase::Validating));
+        self.update_state(&Message::ValidationFinished {
+            run_id,
+            result: result.clone(),
+        });
+        if !accepts_validation {
+            return Task::none();
+        }
+        let Ok(validated) = result else {
+            return Task::none();
+        };
 
         let (tx, rx) = futures::channel::mpsc::channel::<ProgressEvent>(128);
         let progress = Progress::channel(tx);
         let job = async move {
-            run_archive(&target, &options, &progress)
+            run_archive(&validated.target, &validated.options, &progress)
                 .await
                 .map_err(|error| error.to_string())
         };
@@ -112,6 +176,7 @@ impl App {
                 .on_toggle(Message::ToggleBook),
             self.start_button(),
             self.status_view(),
+            self.launch_notice_view(),
         ]
         .spacing(12);
 
@@ -129,9 +194,9 @@ impl App {
     fn status_view(&self) -> Element<'_, Message> {
         match &self.state {
             State::Idle => text("").into(),
-            State::Running(phase @ (Phase::Discovering { .. } | Phase::FetchingPost)) => {
-                text(running_status_text(phase)).into()
-            }
+            State::Running(
+                phase @ (Phase::Validating | Phase::Discovering { .. } | Phase::FetchingPost),
+            ) => text(running_status_text(phase)).into(),
             State::Running(phase @ Phase::Archiving { done, total }) => column![
                 text(running_status_text(phase)),
                 progress_bar(0.0..=(*total as f32).max(1.0), *done as f32),
@@ -183,15 +248,42 @@ impl App {
             State::Error { message } => text!("Error: {message}").into(),
         }
     }
+
+    fn launch_notice_view(&self) -> Element<'_, Message> {
+        match &self.launch_notice {
+            Some(message) => text(message).into(),
+            None => text("").into(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lj_archiver::models::RunOptions;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+    use url::Url;
+
+    fn validated_run(target: &str, output_dir: PathBuf) -> ValidatedRun {
+        ValidatedRun {
+            target: target.to_string(),
+            options: RunOptions {
+                output_dir: Some(output_dir),
+                include_comments: true,
+                download_media: false,
+                concurrency: 4,
+                resume: false,
+                generate_book: false,
+                journal_context: None,
+                user_agent: None,
+                base_url: Url::parse("https://livejournal.com").unwrap(),
+            },
+        }
+    }
 
     #[test]
-    fn callback_constructors_tag_messages_with_captured_active_generation() {
+    fn callback_constructors_tag_messages_with_captured_generations() {
         let mut app = App::default();
         app.update_state(&Message::Start);
         let run_id = app.active_run_id().unwrap();
@@ -219,6 +311,30 @@ mod tests {
                 result: Err(message),
             } if tagged_id == run_id && message == "terminal"
         ));
+
+        let validation =
+            validation_message(run_id, Ok(validated_run("news", PathBuf::from("/tmp/out"))));
+        assert!(matches!(
+            validation,
+            Message::ValidationFinished {
+                run_id: tagged_id,
+                result: Ok(ValidatedRun { target, .. }),
+            } if tagged_id == run_id && target == "news"
+        ));
+
+        let launch_id = app.begin_launch();
+        let launch = launch_message(
+            launch_id,
+            "Open folder",
+            Err("permission denied".to_string()),
+        );
+        assert!(matches!(
+            launch,
+            Message::LaunchFinished {
+                launch_id: tagged_id,
+                result: Err(message),
+            } if tagged_id == launch_id && message == "Open folder failed: permission denied"
+        ));
     }
 
     #[test]
@@ -231,14 +347,64 @@ mod tests {
         let task = app.update(Message::Start);
 
         assert_eq!(app.active_run_id(), Some(1));
-        assert!(matches!(app.state, State::Running(_)));
-        assert_eq!(task.units(), 2);
+        assert!(matches!(app.state, State::Running(Phase::Validating)));
+        assert_eq!(task.units(), 1);
         drop(task);
+    }
+
+    #[test]
+    fn matching_successful_validation_schedules_archive_work_only_once() {
+        let mut app = App::default();
+        app.update_state(&Message::Start);
+        let run_id = app.active_run_id().unwrap();
+        let result = Ok(validated_run("news", PathBuf::from("/tmp/out")));
+
+        let first = app.update(Message::ValidationFinished {
+            run_id,
+            result: result.clone(),
+        });
+        assert_eq!(first.units(), 2);
+        drop(first);
+        assert_eq!(app.active_run_id(), Some(run_id));
+        assert!(matches!(
+            app.state,
+            State::Running(Phase::Discovering { found: 0 })
+        ));
+
+        let duplicate = app.update(Message::ValidationFinished { run_id, result });
+        assert_eq!(duplicate.units(), 0);
+        drop(duplicate);
+        assert_eq!(app.active_run_id(), Some(run_id));
+    }
+
+    #[test]
+    fn stale_validation_completion_schedules_no_archive_work() {
+        let mut app = App::default();
+        app.update_state(&Message::Start);
+        let run_id = app.active_run_id().unwrap();
+        let before = format!("{app:?}");
+
+        let task = app.update(Message::ValidationFinished {
+            run_id: run_id.wrapping_add(1),
+            result: Ok(validated_run("news", PathBuf::from("/tmp/out"))),
+        });
+
+        assert_eq!(task.units(), 0);
+        drop(task);
+        assert_eq!(format!("{app:?}"), before);
     }
 
     #[test]
     fn fetching_phase_has_a_distinct_rendered_status() {
         assert_eq!(running_status_text(&Phase::FetchingPost), "Fetching post…");
+    }
+
+    #[test]
+    fn validating_phase_has_a_distinct_rendered_status() {
+        assert_eq!(
+            running_status_text(&Phase::Validating),
+            "Validating archive folder…"
+        );
     }
 
     #[test]
@@ -255,20 +421,22 @@ mod tests {
     }
 
     #[test]
-    fn start_routes_invalid_folder_to_error_without_launch() {
-        let dir = tempdir().unwrap();
-        let output = dir.path().join("output");
-        std::fs::write(&output, "not a directory\n").unwrap();
-
+    fn matching_validation_error_schedules_no_archive_work() {
         let mut app = App::default();
-        app.update_state(&Message::TargetChanged("news".to_string()));
-        app.update_state(&Message::FolderChosen(Some(output)));
+        app.update_state(&Message::Start);
+        let run_id = app.active_run_id().unwrap();
 
-        let task = app.update(Message::Start);
+        let task = app.update(Message::ValidationFinished {
+            run_id,
+            result: Err(
+                "selected folder failed archive validation: could not read selected directory"
+                    .to_string(),
+            ),
+        });
         assert_eq!(
             task.units(),
             0,
-            "invalid GUI starts must not schedule archive work"
+            "invalid GUI validation must not schedule archive work"
         );
         drop(task);
 
@@ -278,13 +446,30 @@ mod tests {
         };
         assert!(message.starts_with("selected folder failed archive validation: "));
         assert!(message.contains("could not read selected directory"));
-        assert!(
-            !message.contains("posts folder"),
-            "selected-path errors must not claim that a posts folder was inspected: {message}"
-        );
         assert_eq!(app.active_run_id(), None);
         app.update_state(&Message::Start);
-        assert_eq!(app.active_run_id(), Some(1));
+        assert_eq!(app.active_run_id(), Some(2));
+    }
+
+    #[test]
+    fn open_folder_allocates_launch_generation_and_schedules_result() {
+        let mut app = App::default();
+        app.state = State::Done {
+            root: PathBuf::from("/tmp/out"),
+            archived: 1,
+            skipped: 0,
+            failed: 0,
+            failed_pages: 0,
+            failures: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let task = app.update(Message::OpenFolder);
+
+        assert_eq!(task.units(), 1);
+        drop(task);
+        assert_eq!(app.active_launch_id(), Some(1));
+        assert_eq!(app.active_run_id(), None);
     }
 
     #[test]

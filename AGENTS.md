@@ -65,6 +65,12 @@ Reuse seam (in the core, additive, CLI behavior unchanged):
 
 GUI structure: `gui/src/state.rs` is a pure reducer (`App::update_state`) with
 full unit tests; `gui/src/app.rs` is the iced glue (`boot`/`update`/`view`).
+Start snapshots and parses `pending_validation` on the iced event thread, then
+immediately enters the visible generation-tagged `Phase::Validating`. Blocking
+directory reads and `Archive::inspect_existing` run on a standard worker thread
+and return through a `futures` oneshot. Only the matching validation generation
+may start the progress stream and archive task; stale or duplicate completions
+are inert, and the core `run_archive` preflight remains authoritative.
 Progress is driven by one capacity-128 channel in
 `Task::batch([Task::run(rx, Message::Progress),
 Task::perform(run_archive(...), Message::Finished)])`. Both callbacks carry
@@ -72,6 +78,11 @@ the active run generation. Progress may be dropped, so the separately delivered
 generation-tagged `Finished` result is authoritative for terminal state and
 exact counters, failures, and integrity warnings. The iced view is manual-verify only (no headless harness) — smoke-test with
 `cargo run -p lj-archiver-gui` against a small real post.
+
+Folder and failed-post link launches carry an independent monotonic generation
+and return `open::that` results through iced tasks. A matching launch failure is
+a non-terminal notice beneath the normal status; it never replaces completion
+counts, failures, or warnings, and stale launch results are inert.
 
 The reducer uses `Phase::FetchingPost` for a direct post target and for
 `ProgressEvent::SingleStarted`; journal targets alone display discovery.
