@@ -1,7 +1,8 @@
 use crate::{
     adoc,
     error::{LjError, Result},
-    links::POST_LINK_PREFIX_ATTRIBUTE,
+    link_metadata::serialize_link_metadata,
+    links::{POST_LINK_PREFIX_ATTRIBUTE, ResolvedLinks},
     models::ArchivedPost,
     storage,
     target::{is_valid_journal_name, journals_alias},
@@ -24,6 +25,12 @@ pub struct ExistingArchive {
     pub journal: String,
     pub posts: Vec<ArchivedPost>,
     pub has_book: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct PostPublication {
+    pub path: PathBuf,
+    pub metadata_warning: Option<LjError>,
 }
 
 #[derive(Debug)]
@@ -129,24 +136,62 @@ impl Archive {
     }
 
     pub(crate) fn write_post_at(&self, path: &Path, contents: &str) -> Result<PathBuf> {
-        let posts = self.root.join("posts");
-        let relative = path
-            .strip_prefix(&self.root)
-            .map_err(|_| invalid_archive(path, "post destination is outside the archive root"))?;
-        let numeric_adoc = path.parent() == Some(posts.as_path())
-            && path.extension() == Some(OsStr::new("adoc"))
-            && path
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .is_some_and(|stem| stem.parse::<u64>().is_ok());
-        if !numeric_adoc {
-            return Err(invalid_archive(
-                path,
-                "post destination must be a numeric .adoc file under posts",
-            ));
-        }
-        storage::write_atomic_controlled(&self.root, relative, contents.as_bytes())?;
+        let (relative, _) = self.controlled_post_paths(path)?;
+        storage::write_atomic_controlled(&self.root, &relative, contents.as_bytes())?;
         Ok(path.to_path_buf())
+    }
+
+    pub(crate) fn publish_post(
+        &self,
+        destination: &Path,
+        resolved: &ResolvedLinks,
+    ) -> Result<PostPublication> {
+        self.publish_post_with_metadata_writer(destination, resolved, |relative, contents| {
+            storage::write_atomic_controlled(&self.root, relative, contents)
+        })
+    }
+
+    fn publish_post_with_metadata_writer<F>(
+        &self,
+        destination: &Path,
+        resolved: &ResolvedLinks,
+        metadata_writer: F,
+    ) -> Result<PostPublication>
+    where
+        F: FnOnce(&Path, &[u8]) -> Result<()>,
+    {
+        let (post_relative, metadata_relative) = self.controlled_post_paths(destination)?;
+        let metadata =
+            serialize_link_metadata(&resolved.contents, &resolved.links).map_err(|error| {
+                invalid_archive(
+                    destination,
+                    format!("could not serialize trusted link metadata: {error}"),
+                )
+            })?;
+
+        storage::prepare_controlled_file(&self.root, &post_relative)?;
+        storage::prepare_controlled_file(&self.root, &metadata_relative)?;
+        storage::write_atomic_controlled(&self.root, &post_relative, resolved.contents.as_bytes())?;
+        let metadata_warning = metadata_writer(&metadata_relative, &metadata).err();
+
+        Ok(PostPublication {
+            path: destination.to_path_buf(),
+            metadata_warning,
+        })
+    }
+
+    pub(crate) fn read_link_metadata(&self, post_path: &Path) -> Result<Option<Vec<u8>>> {
+        let (_, metadata_relative) = self.controlled_post_paths(post_path)?;
+        if !storage::controlled_file_exists(&self.root, &metadata_relative)? {
+            return Ok(None);
+        }
+        let metadata_path = self.root.join(metadata_relative);
+        fs::read(&metadata_path)
+            .map(Some)
+            .map_err(|source| LjError::Read {
+                path: metadata_path,
+                source,
+            })
     }
 
     pub fn write_pending_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
@@ -219,6 +264,27 @@ impl Archive {
     fn index_path(&self, path: &Path) -> PathBuf {
         path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
     }
+
+    fn controlled_post_paths(&self, path: &Path) -> Result<(PathBuf, PathBuf)> {
+        let posts = self.root.join("posts");
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| invalid_archive(path, "post destination is outside the archive root"))?;
+        let filename = path.file_name().and_then(OsStr::to_str);
+        let numeric_adoc = path.parent() == Some(posts.as_path())
+            && filename.and_then(numeric_post_filename_id).is_some();
+        if !numeric_adoc {
+            return Err(invalid_archive(
+                path,
+                "post destination must be a numeric .adoc file under posts",
+            ));
+        }
+        let metadata_relative = PathBuf::from(".lj-archiver/links").join(format!(
+            "{}.json",
+            filename.expect("numeric filename is valid UTF-8")
+        ));
+        Ok((relative.to_path_buf(), metadata_relative))
+    }
 }
 
 fn inspect_entries(entries: fs::ReadDir, directory: &Path) -> Result<Vec<ExistingEntry>> {
@@ -271,20 +337,13 @@ fn inspect_posts(posts_entry: &ExistingEntry) -> Result<Vec<ArchivedPost>> {
                 "public post candidate is not a regular file",
             ));
         }
-        let stem = entry
+        let filename = entry
             .path
-            .file_stem()
+            .file_name()
             .and_then(OsStr::to_str)
             .ok_or_else(|| invalid_archive(&entry.path, "post id is not valid UTF-8"))?;
-        let id = stem
-            .parse::<u64>()
-            .map_err(|_| invalid_archive(&entry.path, "post id must be a positive integer"))?;
-        if id == 0 {
-            return Err(invalid_archive(
-                &entry.path,
-                "post id must be a positive integer",
-            ));
-        }
+        let id = numeric_post_filename_id(filename)
+            .ok_or_else(|| invalid_archive(&entry.path, "post id must be a positive integer"))?;
         let contents = read_existing_file(&entry.path)?;
         let title = contents
             .lines()
@@ -323,10 +382,23 @@ fn invalid_archive(path: &Path, reason: impl Into<String>) -> LjError {
     }
 }
 
+pub(crate) fn numeric_post_filename_id(filename: &str) -> Option<u64> {
+    let digits = filename.strip_suffix(".adoc")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let id = digits.parse::<u64>().ok()?;
+    (id > 0).then_some(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ArchivedPost;
+    use crate::{
+        links::{ActiveLink, ActiveLinkContext, ResolvedLinks},
+        models::ArchivedPost,
+    };
+    use sha2::{Digest, Sha256};
     use std::{fs, path::PathBuf};
     use tempfile::tempdir;
 
@@ -349,6 +421,171 @@ mod tests {
             }
             other => panic!("expected InvalidArchive, got {other:?}"),
         }
+    }
+
+    fn resolved_post(contents: &str, expression: &str) -> ResolvedLinks {
+        let start = contents.find(expression).unwrap();
+        ResolvedLinks {
+            contents: contents.to_string(),
+            links: vec![ActiveLink {
+                start,
+                end: start + expression.len(),
+                target_id: 2,
+                context: ActiveLinkContext::Xref,
+            }],
+        }
+    }
+
+    #[test]
+    fn publication_maps_numeric_post_to_hidden_link_metadata_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let destination = archive.post_path(166511);
+        let resolved = ResolvedLinks {
+            contents: "= Title\n".to_string(),
+            links: Vec::new(),
+        };
+
+        let publication = archive.publish_post(&destination, &resolved).unwrap();
+
+        assert_eq!(publication.path, root.join("posts/166511.adoc"));
+        assert!(root.join(".lj-archiver/links/166511.adoc.json").is_file());
+    }
+
+    #[test]
+    fn publication_writes_exact_post_and_digest_matching_metadata() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let destination = archive.post_path(166511);
+        let contents = "= Title\n\nxref:2.adoc[Two]\n";
+        let resolved = resolved_post(contents, "xref:2.adoc");
+
+        let publication = archive.publish_post(&destination, &resolved).unwrap();
+
+        assert!(publication.metadata_warning.is_none());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), contents);
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join(".lj-archiver/links/166511.adoc.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata["post_sha256"],
+            hex::encode(Sha256::digest(contents.as_bytes()))
+        );
+        assert_eq!(
+            metadata["links"][0]["start"],
+            contents.find("xref:").unwrap()
+        );
+        assert_eq!(
+            metadata["links"][0]["end"],
+            contents.find("xref:").unwrap() + "xref:2.adoc".len()
+        );
+    }
+
+    #[test]
+    fn publication_with_no_links_still_writes_sidecar() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let destination = archive.post_path(9);
+        let resolved = ResolvedLinks {
+            contents: "= No links\n".to_string(),
+            links: Vec::new(),
+        };
+
+        archive.publish_post(&destination, &resolved).unwrap();
+
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(".lj-archiver/links/9.adoc.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["links"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn publication_preflights_unsafe_metadata_parent_before_post_write() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        fs::create_dir_all(root.join(".lj-archiver")).unwrap();
+        fs::write(root.join(".lj-archiver/links"), "not a directory").unwrap();
+        let destination = archive.post_path(9);
+        let resolved = ResolvedLinks {
+            contents: "= Must not publish\n".to_string(),
+            links: Vec::new(),
+        };
+
+        assert!(matches!(
+            archive.publish_post(&destination, &resolved),
+            Err(LjError::InvalidArchive { .. })
+        ));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn publication_metadata_write_failure_keeps_post_and_returns_warning() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let destination = archive.post_path(9);
+        let resolved = ResolvedLinks {
+            contents: "= Published post\n".to_string(),
+            links: Vec::new(),
+        };
+
+        let publication = archive
+            .publish_post_with_metadata_writer(&destination, &resolved, |relative, _| {
+                Err(LjError::Write {
+                    path: root.join(relative),
+                    source: std::io::Error::other("injected metadata failure"),
+                })
+            })
+            .unwrap();
+
+        assert_eq!(publication.path, destination);
+        assert!(publication.metadata_warning.is_some());
+        assert_eq!(
+            fs::read_to_string(root.join("posts/9.adoc")).unwrap(),
+            "= Published post\n"
+        );
+        assert!(!root.join(".lj-archiver/links/9.adoc.json").exists());
+    }
+
+    #[test]
+    fn link_metadata_read_returns_none_for_missing_and_rejects_nonregular_sidecar() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let post_path = archive.post_path(9);
+
+        assert_eq!(archive.read_link_metadata(&post_path).unwrap(), None);
+
+        fs::create_dir_all(root.join(".lj-archiver/links/9.adoc.json")).unwrap();
+        assert!(matches!(
+            archive.read_link_metadata(&post_path),
+            Err(LjError::InvalidArchive { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_metadata_read_rejects_symlinked_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let post_path = archive.post_path(9);
+        let outside = dir.path().join("outside.json");
+        fs::write(&outside, "{}\n").unwrap();
+        fs::create_dir_all(root.join(".lj-archiver/links")).unwrap();
+        symlink(&outside, root.join(".lj-archiver/links/9.adoc.json")).unwrap();
+
+        assert!(matches!(
+            archive.read_link_metadata(&post_path),
+            Err(LjError::InvalidArchive { .. })
+        ));
     }
 
     #[test]
@@ -567,6 +804,7 @@ mod tests {
         for (name, filename, reason) in [
             ("zero", "0.adoc", "positive"),
             ("nonnumeric", "draft.adoc", "positive"),
+            ("signed", "+1.adoc", "positive"),
         ] {
             let root = dir.path().join(name);
             write_valid_index(&root, "news");

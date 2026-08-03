@@ -1,13 +1,15 @@
 use crate::{
     Result,
     adoc::render_post,
-    archive::{Archive, ExistingArchive},
+    archive::{Archive, ExistingArchive, PostPublication, numeric_post_filename_id},
     cli::Cli,
     client::LjClient,
     discover::discover_post_ids,
     error::LjError,
+    link_metadata::repair_retained_links,
     links::{
-        LinkRewriter, PendingLink, PendingLinkError, resolve_pending_links, validate_pending_links,
+        LinkRewriter, PendingLink, PendingLinkError, ResolvedLinks, resolve_pending_links,
+        validate_pending_links,
     },
     media::rewrite_inline_media,
     models::{ArchiveTarget, ArchivedPost, Post, PostFailure, RunOptions},
@@ -195,26 +197,36 @@ async fn archive_journal(
 }
 
 trait FinalPostWriter {
-    fn write_post(
+    fn publish_post(
         &self,
         archive: &Archive,
         id: u64,
         destination: &Path,
-        contents: &str,
-    ) -> Result<PathBuf>;
+        resolved: &ResolvedLinks,
+    ) -> Result<PostPublication>;
 }
 
 struct AtomicFinalPostWriter;
 
 impl FinalPostWriter for AtomicFinalPostWriter {
-    fn write_post(
+    fn publish_post(
         &self,
         archive: &Archive,
         _id: u64,
         destination: &Path,
-        contents: &str,
-    ) -> Result<PathBuf> {
-        archive.write_post_at(destination, contents)
+        resolved: &ResolvedLinks,
+    ) -> Result<PostPublication> {
+        archive.publish_post(destination, resolved)
+    }
+}
+
+fn warn_metadata_failure(post_id: u64, publication: &PostPublication) {
+    if let Some(error) = &publication.metadata_warning {
+        tracing::warn!(
+            post_id,
+            error = %error,
+            "post was published but trusted link metadata could not be written"
+        );
     }
 }
 
@@ -267,6 +279,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     futures::pin_mut!(outcomes);
 
     let mut finalized = Vec::new();
+    let mut retained = Vec::new();
     let mut failures = Vec::new();
     let mut skipped = 0usize;
     let mut archived = 0usize;
@@ -284,17 +297,18 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                                         url: post.delivered_url.to_string(),
                                         reason: error.to_string(),
                                     })?;
-                            writer.write_post(
+                            writer.publish_post(
                                 &archive,
                                 post.archived.id,
                                 &post.archived.path,
-                                &external.contents,
+                                &external,
                             )
                         });
 
                 match first_stage {
-                    Ok(path) => {
-                        post.archived.path = path;
+                    Ok(publication) => {
+                        warn_metadata_failure(post.archived.id, &publication);
+                        post.archived.path = publication.path;
                         posts.insert(post.archived.id, post.archived.clone());
                         archived += 1;
                         progress.post_done(post.archived.id, &post.archived.title);
@@ -312,7 +326,8 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                 }
             }
             JournalPostOutcome::Skipped(post) => {
-                posts.insert(post.id, post);
+                posts.insert(post.id, post.clone());
+                retained.push(post);
                 skipped += 1;
             }
             JournalPostOutcome::Failed(failure) => failures.push(failure),
@@ -325,20 +340,29 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         match archive.read_pending_post(&post.pending_path) {
             Ok(pending) => match resolve_pending_links(&pending, &post.links, &final_ids) {
                 Ok(local) => {
-                    if let Err(error) = writer.write_post(
+                    match writer.publish_post(
                         &archive,
                         post.archived.id,
                         &post.archived.path,
-                        &local.contents,
+                        &local,
                     ) {
-                        tracing::warn!(
-                            post_id = post.archived.id,
-                            error = %error,
-                            "could not upgrade finalized post links; retaining external links"
-                        );
+                        Ok(publication) => {
+                            warn_metadata_failure(post.archived.id, &publication);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                post_id = post.archived.id,
+                                error = %error,
+                                "could not upgrade finalized post links; retaining external links"
+                            );
+                        }
                     }
                 }
                 Err(error) => {
+                    let error = LjError::LinkIntegrity {
+                        url: post.delivered_url.to_string(),
+                        reason: error.to_string(),
+                    };
                     tracing::warn!(
                         post_id = post.archived.id,
                         error = %error,
@@ -355,6 +379,11 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
             }
         }
         cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
+    }
+
+    let final_targets = trusted_target_filenames(&posts)?;
+    for post in &retained {
+        repair_retained_post(&archive, writer, &journal, &final_targets, post);
     }
 
     progress.archiving_finished();
@@ -473,6 +502,73 @@ fn cleanup_pending_post(archive: &Archive, id: u64, path: &std::path::Path) {
     }
 }
 
+fn repair_retained_post<W: FinalPostWriter>(
+    archive: &Archive,
+    writer: &W,
+    journal: &str,
+    final_targets: &HashMap<u64, String>,
+    post: &ArchivedPost,
+) {
+    let contents = match std::fs::read_to_string(&post.path) {
+        Ok(contents) => contents,
+        Err(source) => {
+            let error = LjError::Read {
+                path: post.path.clone(),
+                source,
+            };
+            tracing::warn!(
+                post_id = post.id,
+                error = %error,
+                "could not read retained post for trusted link repair; preserving existing bytes"
+            );
+            return;
+        }
+    };
+    let metadata = match archive.read_link_metadata(&post.path) {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
+            tracing::warn!(
+                post_id = post.id,
+                "retained post has no trusted link metadata; preserving existing bytes"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                post_id = post.id,
+                error = %error,
+                "could not read trusted link metadata; preserving retained post bytes"
+            );
+            return;
+        }
+    };
+    let resolved = match repair_retained_links(&contents, &metadata, journal, final_targets) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tracing::warn!(
+                post_id = post.id,
+                error = %error,
+                "trusted link metadata could not be validated; preserving retained post bytes"
+            );
+            return;
+        }
+    };
+    if resolved.contents == contents {
+        return;
+    }
+
+    match writer.publish_post(archive, post.id, &post.path, &resolved) {
+        Ok(publication) => warn_metadata_failure(post.id, &publication),
+        Err(error) => {
+            tracing::warn!(
+                post_id = post.id,
+                error = %error,
+                "could not publish trusted retained-link repair; retaining existing post"
+            );
+        }
+    }
+}
+
 fn posts_by_id(existing: Option<&ExistingArchive>) -> BTreeMap<u64, ArchivedPost> {
     existing
         .into_iter()
@@ -494,13 +590,7 @@ fn trusted_target_filename(post: &ArchivedPost) -> Result<String> {
         .file_name()
         .and_then(OsStr::to_str)
         .ok_or_else(|| invalid_trusted_post_path(post, "filename is not valid UTF-8"))?;
-    let stem = filename
-        .strip_suffix(".adoc")
-        .ok_or_else(|| invalid_trusted_post_path(post, "filename is not numeric .adoc"))?;
-    let parsed_id = stem
-        .parse::<u64>()
-        .ok()
-        .filter(|id| *id > 0)
+    let parsed_id = numeric_post_filename_id(filename)
         .ok_or_else(|| invalid_trusted_post_path(post, "filename is not positive numeric .adoc"))?;
     if parsed_id != post.id {
         return Err(invalid_trusted_post_path(
@@ -543,18 +633,34 @@ async fn fetch_and_write_post(
     let mut post =
         fetch_requested_post(client, requested_journal, requested_id, requested_url).await?;
     rewrite_post_media(&mut post, options, archive).await?;
-    let rewriter = LinkRewriter::with_targets(
+    let final_ids = write_policy
+        .target_filenames
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    let namespace_url = post.url.clone();
+    let pending = render_pending_post_with(
+        &post,
+        options.include_comments,
         requested_journal,
         write_policy.target_filenames,
-        post.url.clone(),
+        || random_link_namespace(&namespace_url),
     );
-    let rendered = render_post(&post, options.include_comments, Some(&rewriter));
-    let path = archive.write_post_at(&write_policy.destination, &rendered)?;
+    let pending = pending?;
+    let resolved =
+        resolve_pending_links(&pending.contents, &pending.links, &final_ids).map_err(|error| {
+            LjError::LinkIntegrity {
+                url: post.url.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+    let publication = archive.publish_post(&write_policy.destination, &resolved)?;
+    warn_metadata_failure(requested_id, &publication);
 
     Ok(ArchivedPost {
         id: requested_id,
         title: post.title.clone(),
-        path,
+        path: publication.path,
     })
 }
 
@@ -771,6 +877,7 @@ async fn rewrite_post_media(
 mod tests {
     use super::*;
     use crate::{archive::Archive, cli::Cli, progress::ProgressEvent};
+    use sha2::{Digest, Sha256};
     use std::{
         collections::{HashMap, HashSet},
         sync::{Condvar, Mutex},
@@ -1348,7 +1455,10 @@ mod tests {
                     r#"<p><a href="next.html">next</a> "#,
                     r#"<a href="/profile">profile</a> "#,
                     r#"<a href="javascript:alert(1)">unsafe</a> "#,
-                    r#"<img src="picture.jpg" alt="picture"></p>"#,
+                    r#"<img src="picture.jpg" alt="picture"> "#,
+                    r#"<a href="https://news.livejournal.com/1.html">self</a> "#,
+                    r#"<a href="https://news.livejournal.com/1.html">"#,
+                    r#"<img src="linked.jpg" alt="linked"></a></p>"#,
                 ),
                 "",
             )))
@@ -1385,6 +1495,20 @@ mod tests {
             )),
             "got: {post}"
         );
+        assert!(post.contains("xref:1.adoc[self]"), "got: {post}");
+        assert!(
+            post.contains("link={lj-archiver-post-link-prefix}1.adoc"),
+            "got: {post}"
+        );
+        let post_path = dir.path().join("out/posts/1.adoc");
+        let metadata = read_matching_link_metadata(&post_path);
+        assert_eq!(metadata["links"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            metadata_expressions(&post, &metadata),
+            ["xref:1.adoc", "{lj-archiver-post-link-prefix}1.adoc"]
+        );
+        assert_eq!(metadata["links"][0]["context"], "xref");
+        assert_eq!(metadata["links"][1]["context"], "image_link");
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
@@ -2251,13 +2375,18 @@ mod tests {
         let post_path = dir.path().join("out/posts/1.adoc");
         assert!(post_path.exists());
         assert!(!dir.path().join("out/posts/2.adoc").exists());
-        let post = std::fs::read_to_string(post_path).unwrap();
+        let post = std::fs::read_to_string(&post_path).unwrap();
         assert!(
             post.contains("https://news.livejournal.com/2.html[Post two]"),
             "got: {post}"
         );
         assert!(!post.contains("xref:2.adoc"), "got: {post}");
         assert!(!post.contains("lj-archiver-link"), "got: {post:?}");
+        let metadata = read_matching_link_metadata(&post_path);
+        assert_eq!(
+            metadata_expressions(&post, &metadata),
+            ["https://news.livejournal.com/2.html"]
+        );
 
         let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
         assert!(index.contains("xref:posts/1.adoc"), "got: {index}");
@@ -2359,6 +2488,12 @@ mod tests {
         assert!(!external.contains("xref:2.adoc"), "got: {external}");
         assert!(!external.contains("\u{1f}"), "got: {external:?}");
         assert!(!external.contains("lj-archiver-link"), "got: {external:?}");
+        let external_metadata = read_matching_link_metadata(&post_one_path);
+        assert_eq!(
+            metadata_expressions(&external, &external_metadata),
+            ["https://news.livejournal.com/2.html"]
+        );
+        let external_digest = external_metadata["post_sha256"].clone();
 
         peer_gate.release();
         let outcome =
@@ -2382,8 +2517,14 @@ mod tests {
                 .count(),
             1
         );
-        let local = std::fs::read_to_string(post_one_path).unwrap();
+        let local = std::fs::read_to_string(&post_one_path).unwrap();
         assert!(local.contains("xref:2.adoc[Post two]"), "got: {local}");
+        let local_metadata = read_matching_link_metadata(&post_one_path);
+        assert_eq!(
+            metadata_expressions(&local, &local_metadata),
+            ["xref:2.adoc"]
+        );
+        assert_ne!(local_metadata["post_sha256"], external_digest);
         assert!(pending_post_paths(dir.path().join("out/posts")).is_empty());
     }
 
@@ -2975,13 +3116,19 @@ mod tests {
         assert_eq!(outcome.archived, 2);
         assert_eq!(outcome.failed, 0);
         assert!(outcome.failures.is_empty());
-        let post = std::fs::read_to_string(dir.path().join("out/posts/1.adoc")).unwrap();
+        let post_path = dir.path().join("out/posts/1.adoc");
+        let post = std::fs::read_to_string(&post_path).unwrap();
         assert!(
             post.contains("https://news.livejournal.com/2.html[Post two]"),
             "got: {post}"
         );
         assert!(!post.contains("xref:2.adoc"), "got: {post}");
         assert!(!post.contains("lj-archiver-link"), "got: {post:?}");
+        let metadata = read_matching_link_metadata(&post_path);
+        assert_eq!(
+            metadata_expressions(&post, &metadata),
+            ["https://news.livejournal.com/2.html"]
+        );
         let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
         assert!(index.contains("xref:posts/1.adoc"), "got: {index}");
         assert!(index.contains("xref:posts/2.adoc"), "got: {index}");
@@ -2989,7 +3136,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_without_metadata_preserves_retained_post_bytes() {
+    async fn metadata_warning_keeps_successful_journal_publication_counts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">One</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/news/1.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(post_html(
+                "1",
+                "<p>Published despite metadata warning.</p>",
+                "",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let options = journal_cli(&server, dir.path(), false).options();
+        let writer = InjectedFinalPostWriter::warning_on([(1, 1)]);
+
+        let outcome =
+            archive_journal_with_writer(&options, &Progress::hidden(), "news".to_string(), &writer)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(writer.calls_for(1), 2);
+        read_matching_link_metadata(&dir.path().join("out/posts/1.adoc"));
+    }
+
+    #[tokio::test]
+    async fn resume_valid_metadata_externalizes_link_to_failed_post() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/news/calendar"))
@@ -3014,12 +3205,14 @@ mod tests {
             .await;
 
         let dir = tempdir().unwrap();
-        seed_existing_archive(
-            dir.path(),
-            &[(1, "Existing", "= Existing\n\nxref:2.adoc[Post two]\n")],
-            false,
-        );
+        let baseline = "= Existing\n\nxref:2.adoc[Post two]\n";
+        seed_existing_archive(dir.path(), &[(1, "Existing", baseline)], false);
         let existing = dir.path().join("out/posts/1.adoc");
+        write_link_metadata_fixture(
+            &existing,
+            baseline,
+            vec![stored_link(baseline, "xref:2.adoc", 2, "xref")],
+        );
         let options = journal_cli(&server, dir.path(), true).options();
 
         let outcome = run_archive("news", &options, &Progress::hidden())
@@ -3029,9 +3222,16 @@ mod tests {
         assert_eq!(outcome.archived, 0);
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.failed, 1);
+        let repaired = std::fs::read_to_string(&existing).unwrap();
+        assert!(
+            repaired.contains("https://news.livejournal.com/2.html[Post two]"),
+            "got: {repaired}"
+        );
+        assert!(!repaired.contains("xref:2.adoc"), "got: {repaired}");
+        let metadata = read_matching_link_metadata(&existing);
         assert_eq!(
-            std::fs::read_to_string(existing).unwrap(),
-            "= Existing\n\nxref:2.adoc[Post two]\n"
+            metadata_expressions(&repaired, &metadata),
+            ["https://news.livejournal.com/2.html"]
         );
         let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
         assert!(
@@ -3039,6 +3239,91 @@ mod tests {
             "got: {index}"
         );
         assert!(!index.contains("xref:posts/2.adoc"), "got: {index}");
+    }
+
+    #[tokio::test]
+    async fn resume_valid_metadata_retargets_exact_aliases_and_refreshes_shifted_ranges() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/news/1.html">One</a><a href="/news/3.html">Three</a>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let baseline = concat!(
+            "= Existing Alias\n\n",
+            "xref:3.adoc[Peer]\n",
+            "image:../assets/p.jpg[,link={lj-archiver-post-link-prefix}3.adoc]\n",
+            "xref:1.adoc[Self]\n",
+        );
+        seed_existing_archive_at(
+            dir.path(),
+            &[
+                (1, "01.adoc", "Existing Alias", baseline),
+                (3, "03.adoc", "Peer Alias", "= Peer Alias\n\nBody.\n"),
+            ],
+            false,
+        );
+        let post_path = dir.path().join("out/posts/01.adoc");
+        write_link_metadata_fixture(
+            &post_path,
+            baseline,
+            vec![
+                stored_link(baseline, "xref:3.adoc", 3, "xref"),
+                stored_link(
+                    baseline,
+                    "{lj-archiver-post-link-prefix}3.adoc",
+                    3,
+                    "image_link",
+                ),
+                stored_link(baseline, "xref:1.adoc", 1, "xref"),
+            ],
+        );
+        let options = journal_cli(&server, dir.path(), true).options();
+
+        let outcome = run_archive("news", &options, &Progress::hidden())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(outcome.skipped, 2);
+        assert_eq!(outcome.failed, 0);
+        let expected = concat!(
+            "= Existing Alias\n\n",
+            "xref:03.adoc[Peer]\n",
+            "image:../assets/p.jpg[,link={lj-archiver-post-link-prefix}03.adoc]\n",
+            "xref:01.adoc[Self]\n",
+        );
+        assert_eq!(std::fs::read_to_string(&post_path).unwrap(), expected);
+        let metadata = read_matching_link_metadata(&post_path);
+        assert_eq!(
+            metadata_expressions(expected, &metadata),
+            [
+                "xref:03.adoc",
+                "{lj-archiver-post-link-prefix}03.adoc",
+                "xref:01.adoc"
+            ]
+        );
+        assert_eq!(
+            metadata["links"][1]["start"],
+            expected
+                .find("{lj-archiver-post-link-prefix}03.adoc")
+                .unwrap()
+        );
+        assert_eq!(
+            metadata["links"][2]["start"],
+            expected.find("xref:01.adoc").unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3071,6 +3356,13 @@ mod tests {
             "xref:1.adoc[Self] xref:2.adoc[Failed peer]\n",
             "image:../assets/p.jpg[,link={lj-archiver-post-link-prefix}1.adoc]\n",
             "image:../assets/q.jpg[,link={lj-archiver-post-link-prefix}2.adoc]\n",
+            "`xref:2.adoc[Inline code evidence]`\n",
+            "....\n",
+            "xref:2.adoc[Listing evidence]\n",
+            "....\n",
+            "++++\n",
+            "<unsupported>xref:2.adoc[Passthrough evidence]</unsupported>\n",
+            "++++\n",
         );
         seed_existing_archive_at(
             dir.path(),
@@ -3121,6 +3413,81 @@ mod tests {
                 "\ninclude::posts/01.adoc[leveloffset=+1]\n",
             )
         );
+    }
+
+    #[tokio::test]
+    async fn resume_invalid_metadata_variants_preserve_exact_post_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">One</a>"#),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        for name in ["malformed", "stale", "invalid-range", "invalid-syntax"] {
+            let case_dir = dir.path().join(name);
+            std::fs::create_dir(&case_dir).unwrap();
+            let contents = match name {
+                "stale" => "= Existing\n\nxref:1.adoc[Self]\nDeliberate user edit.\n",
+                "invalid-syntax" => "= Existing\n\nxref:99.adoc[Wrong target syntax]\n",
+                _ => "= Existing\n\nxref:1.adoc[Self]\n",
+            };
+            seed_existing_archive(&case_dir, &[(1, "Existing", contents)], false);
+            let post_path = case_dir.join("out/posts/1.adoc");
+
+            match name {
+                "malformed" => {
+                    let metadata_path = link_metadata_path(&post_path);
+                    std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+                    std::fs::write(metadata_path, b"{not-json\n").unwrap();
+                }
+                "stale" => write_link_metadata_fixture(
+                    &post_path,
+                    "= Existing\n\nxref:1.adoc[Self]\n",
+                    vec![stored_link(contents, "xref:1.adoc", 1, "xref")],
+                ),
+                "invalid-range" => write_link_metadata_fixture(
+                    &post_path,
+                    contents,
+                    vec![serde_json::json!({
+                        "start": 0,
+                        "end": contents.len() + 1,
+                        "target_id": 1,
+                        "context": "xref",
+                    })],
+                ),
+                "invalid-syntax" => write_link_metadata_fixture(
+                    &post_path,
+                    contents,
+                    vec![stored_link(contents, "xref:99.adoc", 1, "xref")],
+                ),
+                _ => unreachable!(),
+            }
+            let options = journal_cli(&server, &case_dir, true).options();
+
+            let outcome = run_archive("news", &options, &Progress::hidden())
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.archived, 0, "case {name}");
+            assert_eq!(outcome.skipped, 1, "case {name}");
+            assert_eq!(outcome.failed, 0, "case {name}");
+            assert_eq!(
+                std::fs::read_to_string(post_path).unwrap(),
+                contents,
+                "case {name}"
+            );
+        }
     }
 
     fn test_cli(
@@ -3266,6 +3633,73 @@ mod tests {
         archive
     }
 
+    fn link_metadata_path(post_path: &Path) -> PathBuf {
+        let root = post_path.parent().unwrap().parent().unwrap();
+        let filename = post_path.file_name().unwrap().to_str().unwrap();
+        root.join(".lj-archiver/links")
+            .join(format!("{filename}.json"))
+    }
+
+    fn stored_link(
+        contents: &str,
+        expression: &str,
+        target_id: u64,
+        context: &str,
+    ) -> serde_json::Value {
+        let start = contents.find(expression).unwrap();
+        serde_json::json!({
+            "start": start,
+            "end": start + expression.len(),
+            "target_id": target_id,
+            "context": context,
+        })
+    }
+
+    fn write_link_metadata_fixture(
+        post_path: &Path,
+        digest_contents: &str,
+        links: Vec<serde_json::Value>,
+    ) {
+        let path = link_metadata_path(post_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut encoded = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "post_sha256": hex::encode(Sha256::digest(digest_contents.as_bytes())),
+            "links": links,
+        }))
+        .unwrap();
+        encoded.push(b'\n');
+        std::fs::write(path, encoded).unwrap();
+    }
+
+    fn read_matching_link_metadata(post_path: &Path) -> serde_json::Value {
+        let contents = std::fs::read_to_string(post_path).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(link_metadata_path(post_path)).unwrap()).unwrap();
+        assert_eq!(metadata["version"], 1);
+        assert_eq!(
+            metadata["post_sha256"],
+            hex::encode(Sha256::digest(contents.as_bytes()))
+        );
+        metadata
+    }
+
+    fn metadata_expressions<'a>(
+        contents: &'a str,
+        metadata: &'a serde_json::Value,
+    ) -> Vec<&'a str> {
+        metadata["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|link| {
+                let start = link["start"].as_u64().unwrap() as usize;
+                let end = link["end"].as_u64().unwrap() as usize;
+                &contents[start..end]
+            })
+            .collect()
+    }
+
     fn asset_dir_entries(path: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
         std::fs::read_dir(path)
             .unwrap()
@@ -3335,13 +3769,26 @@ mod tests {
     #[derive(Clone)]
     struct InjectedFinalPostWriter {
         failing_calls: HashSet<(u64, usize)>,
+        metadata_warning_calls: HashSet<(u64, usize)>,
         calls: Arc<Mutex<HashMap<u64, usize>>>,
     }
 
     impl InjectedFinalPostWriter {
         fn failing_on(calls: impl IntoIterator<Item = (u64, usize)>) -> Self {
+            Self::with_injections(calls, [])
+        }
+
+        fn warning_on(calls: impl IntoIterator<Item = (u64, usize)>) -> Self {
+            Self::with_injections([], calls)
+        }
+
+        fn with_injections(
+            failing_calls: impl IntoIterator<Item = (u64, usize)>,
+            metadata_warning_calls: impl IntoIterator<Item = (u64, usize)>,
+        ) -> Self {
             Self {
-                failing_calls: calls.into_iter().collect(),
+                failing_calls: failing_calls.into_iter().collect(),
+                metadata_warning_calls: metadata_warning_calls.into_iter().collect(),
                 calls: Arc::new(Mutex::new(HashMap::new())),
             }
         }
@@ -3352,13 +3799,13 @@ mod tests {
     }
 
     impl FinalPostWriter for InjectedFinalPostWriter {
-        fn write_post(
+        fn publish_post(
             &self,
             archive: &Archive,
             id: u64,
             destination: &Path,
-            contents: &str,
-        ) -> Result<PathBuf> {
+            resolved: &ResolvedLinks,
+        ) -> Result<PostPublication> {
             let call = {
                 let mut calls = self.calls.lock().unwrap();
                 let call = calls.entry(id).or_default();
@@ -3374,7 +3821,16 @@ mod tests {
                 });
             }
 
-            archive.write_post_at(destination, contents)
+            let mut publication = archive.publish_post(destination, resolved)?;
+            if self.metadata_warning_calls.contains(&(id, call)) {
+                publication.metadata_warning = Some(LjError::Write {
+                    path: link_metadata_path(destination),
+                    source: std::io::Error::other(format!(
+                        "injected metadata warning for {id}, call {call}"
+                    )),
+                });
+            }
+            Ok(publication)
         }
     }
 
