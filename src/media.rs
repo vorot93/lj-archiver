@@ -180,15 +180,30 @@ fn is_public_unicast_ipv4(address: Ipv4Addr) -> bool {
 }
 
 fn is_public_unicast_ipv6(address: Ipv6Addr) -> bool {
-    let [first, second, third, ..] = address.segments();
+    let [first, second, third, fourth, fifth, sixth, seventh, eighth] = address.segments();
     let is_documentation =
         (first == 0x2001 && second == 0x0db8) || (first == 0x3fff && second <= 0x0fff);
     let is_benchmarking = first == 0x2001 && second == 2 && third == 0;
     let is_site_local = (first & 0xffc0) == 0xfec0;
+    let is_local_use_translation = first == 0x0064 && second == 0xff9b && third == 1;
+    let is_discard_only = first == 0x0100 && second == 0 && third == 0 && fourth == 0;
+    let is_ietf_assignment = first == 0x2001
+        && second < 0x0200
+        && !matches!(
+            [first, second, third, fourth, fifth, sixth, seventh, eighth],
+            // Port Control Protocol and TURN anycast addresses.
+            [0x2001, 1, 0, 0, 0, 0, 0, 1 | 2]
+                // AMT and AS112-v6.
+                | [0x2001, 3, _, _, _, _, _, _]
+                | [0x2001, 4, 0x112, _, _, _, _, _]
+                // ORCHIDv2 and Drone Remote ID Protocol Entity Tags.
+                | [0x2001, 0x20..=0x3f, _, _, _, _, _, _]
+        );
+    let is_segment_routing = first == 0x5f00;
 
-    // Rust 1.97's `Ipv6Addr::is_unicast_global` remains unstable. Its current
-    // classification is reproduced with stable predicates; site-local IPv6 is
-    // additionally excluded because media destinations must be public-routable.
+    // Rust 1.97's `Ipv6Addr::is_global` remains unstable. Mirror its current
+    // IANA-based classification with stable predicates, then exclude IPv6
+    // site-local addresses to require a public-routable unicast destination.
     !address.is_multicast()
         && !address.is_loopback()
         && !address.is_unicast_link_local()
@@ -197,6 +212,10 @@ fn is_public_unicast_ipv6(address: Ipv6Addr) -> bool {
         && !is_documentation
         && !is_benchmarking
         && !is_site_local
+        && !is_local_use_translation
+        && !is_discard_only
+        && !is_ietf_assignment
+        && !is_segment_routing
 }
 
 /// Extracts an embedded IPv4 address from IPv6 forms that carry one:
@@ -835,6 +854,7 @@ mod tests {
             "http://[fec0::1]/pic.jpg",
             "http://[ff02::1]/pic.jpg",
             "http://[2001:2::1]/pic.jpg",
+            "http://[2001:2:1::1]/pic.jpg",
             "http://[2001:db8::1]/pic.jpg",
             "http://[3fff::1]/pic.jpg",
         ] {
@@ -852,7 +872,6 @@ mod tests {
             "http://192.0.0.10/pic.jpg",
             "http://198.20.0.1/pic.jpg",
             "http://[2606:4700:4700::1111]/pic.jpg",
-            "http://[2001:2:1::1]/pic.jpg",
             "http://[3fff:1000::1]/pic.jpg",
             "http://[::ffff:8.8.8.8]/pic.jpg",
             "http://[64:ff9b::808:808]/pic.jpg",
@@ -864,6 +883,132 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn pins_public_unicast_literal_classifier_boundaries() {
+        for value in [
+            // IPv4 this-network, shared/CGNAT, special-use, benchmarking,
+            // multicast, reserved, and broadcast boundaries.
+            "http://0.0.0.0/pic.jpg",
+            "http://0.255.255.255/pic.jpg",
+            "http://100.64.0.0/pic.jpg",
+            "http://100.127.255.255/pic.jpg",
+            "http://192.0.0.0/pic.jpg",
+            "http://192.0.0.8/pic.jpg",
+            "http://192.0.0.11/pic.jpg",
+            "http://192.0.0.255/pic.jpg",
+            "http://198.18.0.0/pic.jpg",
+            "http://198.19.255.255/pic.jpg",
+            "http://224.0.0.0/pic.jpg",
+            "http://239.255.255.255/pic.jpg",
+            "http://240.0.0.0/pic.jpg",
+            "http://255.255.255.254/pic.jpg",
+            "http://255.255.255.255/pic.jpg",
+            // IPv6 documentation, benchmarking, and site-local boundaries.
+            "http://[2001:db8::]/pic.jpg",
+            "http://[2001:db8:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[3fff::]/pic.jpg",
+            "http://[3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:2::]/pic.jpg",
+            "http://[2001:2:0:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[fec0::]/pic.jpg",
+            "http://[feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            // IPv6 special-purpose ranges from the installed std source.
+            "http://[64:ff9b:1::]/pic.jpg",
+            "http://[64:ff9b:1:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[100::]/pic.jpg",
+            "http://[100:0:0:0:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001::]/pic.jpg",
+            "http://[2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:1::]/pic.jpg",
+            "http://[2001:1::3]/pic.jpg",
+            "http://[2001:2:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:4::]/pic.jpg",
+            "http://[2001:4:111:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:4:113::]/pic.jpg",
+            "http://[2001:1f:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:40::]/pic.jpg",
+            "http://[5f00::]/pic.jpg",
+            "http://[5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+        ] {
+            assert!(
+                is_restricted_media_url(&Url::parse(value).unwrap()),
+                "{value}"
+            );
+        }
+
+        for value in [
+            // Adjacent public IPv4 controls and the 192.0.0.0/24 exceptions.
+            "http://1.0.0.0/pic.jpg",
+            "http://100.63.255.255/pic.jpg",
+            "http://100.128.0.0/pic.jpg",
+            "http://192.0.0.9/pic.jpg",
+            "http://192.0.0.10/pic.jpg",
+            "http://192.0.1.0/pic.jpg",
+            "http://198.17.255.255/pic.jpg",
+            "http://198.20.0.0/pic.jpg",
+            "http://223.255.255.255/pic.jpg",
+            // Adjacent public IPv6 controls and IANA assignment exceptions.
+            "http://[2001:db7:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:db9::]/pic.jpg",
+            "http://[3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[3fff:1000::]/pic.jpg",
+            "http://[64:ff9b::808:808]/pic.jpg",
+            "http://[64:ff9b:2::]/pic.jpg",
+            "http://[ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[101::]/pic.jpg",
+            "http://[2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:200::]/pic.jpg",
+            "http://[2001:1::1]/pic.jpg",
+            "http://[2001:1::2]/pic.jpg",
+            "http://[2001:3::]/pic.jpg",
+            "http://[2001:3:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:4:112::]/pic.jpg",
+            "http://[2001:4:112:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:20::]/pic.jpg",
+            "http://[2001:3f:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[5eff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[5f01::]/pic.jpg",
+        ] {
+            assert!(
+                !is_restricted_media_url(&Url::parse(value).unwrap()),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn pins_embedded_ipv4_classifier_boundaries() {
+        assert_eq!(
+            embedded_ipv4("64:ff9b::".parse().unwrap()),
+            Some(Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(
+            embedded_ipv4("64:ff9b::ffff:ffff".parse().unwrap()),
+            Some(Ipv4Addr::BROADCAST)
+        );
+        assert_eq!(embedded_ipv4("64:ff9a:ffff::".parse().unwrap()), None);
+        assert_eq!(embedded_ipv4("64:ff9b:0:1::".parse().unwrap()), None);
+
+        assert_eq!(
+            embedded_ipv4("2002::".parse().unwrap()),
+            Some(Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(
+            embedded_ipv4("2002:ffff:ffff::".parse().unwrap()),
+            Some(Ipv4Addr::BROADCAST)
+        );
+        assert_eq!(embedded_ipv4("2001:ffff::".parse().unwrap()), None);
+        assert_eq!(embedded_ipv4("2003::".parse().unwrap()), None);
+
+        assert_eq!(embedded_ipv4("::".parse().unwrap()), None);
+        assert_eq!(embedded_ipv4("::1".parse().unwrap()), None);
+        assert_eq!(
+            embedded_ipv4("::8.8.8.8".parse().unwrap()),
+            Some(Ipv4Addr::new(8, 8, 8, 8))
+        );
+        assert_eq!(embedded_ipv4("::1:0:0".parse().unwrap()), None);
     }
 
     #[tokio::test]
