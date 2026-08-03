@@ -1,9 +1,8 @@
-use url::Url;
-
 use crate::{
     error::{LjError, Result},
     models::ArchiveTarget,
 };
+use url::Url;
 
 /// LiveJournal serves an underscore username `a_b` at the hyphen subdomain
 /// `a-b.livejournal.com`, so the two spellings denote the same journal. Compare
@@ -128,7 +127,7 @@ pub fn post_ref_from_url(url: &Url) -> Option<(String, u64)> {
 }
 
 fn parse_url_target(input: &str) -> Result<ArchiveTarget> {
-    let url = Url::parse(input).map_err(|error| LjError::InvalidTarget {
+    let mut url = Url::parse(input).map_err(|error| LjError::InvalidTarget {
         input: input.to_string(),
         reason: error.to_string(),
     })?;
@@ -138,9 +137,12 @@ fn parse_url_target(input: &str) -> Result<ArchiveTarget> {
             reason: "URL has no host".to_string(),
         });
     }
-    let host = crate::net::normalized_domain_host(&url);
+    let host = crate::net::normalized_domain_host(&url).map(str::to_owned);
 
-    if host.is_some_and(|host| host.eq_ignore_ascii_case("users.livejournal.com")) {
+    if host
+        .as_deref()
+        .is_some_and(|host| host.eq_ignore_ascii_case("users.livejournal.com"))
+    {
         let segments: Vec<_> = url
             .path_segments()
             .map(|segments| segments.collect())
@@ -151,11 +153,9 @@ fn parse_url_target(input: &str) -> Result<ArchiveTarget> {
             let journal = segments[0];
             validate_journal(input, journal)?;
             let id = parse_html_id(input, segments[1])?;
-            return Ok(ArchiveTarget::Post {
-                journal: journal.to_string(),
-                id,
-                url,
-            });
+            let journal = journal.to_string();
+            crate::net::canonicalize_domain_root_dot(&mut url)?;
+            return Ok(ArchiveTarget::Post { journal, id, url });
         }
 
         // Journal home: /<journal> or /<journal>/
@@ -177,7 +177,10 @@ fn parse_url_target(input: &str) -> Result<ArchiveTarget> {
         );
     }
 
-    if let Some(journal) = host.and_then(|host| host.strip_suffix(".livejournal.com")) {
+    if let Some(journal) = host
+        .as_deref()
+        .and_then(|host| host.strip_suffix(".livejournal.com"))
+    {
         if journal.is_empty() || journal.eq_ignore_ascii_case("www") {
             return invalid(input, "expected a livejournal.com post URL");
         }
@@ -189,11 +192,9 @@ fn parse_url_target(input: &str) -> Result<ArchiveTarget> {
             });
         }
         let id = id_from_path(input, path)?;
-        return Ok(ArchiveTarget::Post {
-            journal: journal.to_string(),
-            id,
-            url,
-        });
+        let journal = journal.to_string();
+        crate::net::canonicalize_domain_root_dot(&mut url)?;
+        return Ok(ArchiveTarget::Post { journal, id, url });
     }
 
     if crate::net::is_loopback_test_server(&url) {
@@ -388,7 +389,7 @@ mod tests {
             subdomain,
             "news",
             166511,
-            "https://news.livejournal.com./166511.html",
+            "https://news.livejournal.com/166511.html",
         );
 
         let users = parse_target(
@@ -400,7 +401,7 @@ mod tests {
             users,
             "example_user",
             166512,
-            "https://users.livejournal.com./example_user/166512.html",
+            "https://users.livejournal.com/example_user/166512.html",
         );
 
         let bare = parse_target("evo-lutio.livejournal.com./1753760.html", None).unwrap();
@@ -408,7 +409,7 @@ mod tests {
             bare,
             "evo-lutio",
             1753760,
-            "https://evo-lutio.livejournal.com./1753760.html",
+            "https://evo-lutio.livejournal.com/1753760.html",
         );
     }
 

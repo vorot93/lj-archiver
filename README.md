@@ -127,6 +127,9 @@ To run the GUI from source: `cargo run -p lj-archiver-gui`.
 Journal names that differ only by underscores and hyphens refer to the same
 public journal.
 
+LiveJournal domain targets may include one trailing DNS root-label dot; it is
+removed before requests so the age-affirmation cookies match the canonical host.
+
 ## Options
 
 | Option | Description |

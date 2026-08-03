@@ -354,7 +354,10 @@ DNS hosts may carry the equivalent trailing root dot. Target parsing,
 discovery calendar/year/month/post filtering and same-origin checks, final-link
 identity, and `localhost` recognition strip one such dot consistently; IP
 literals continue to use their parsed `Host` variants and are not normalized
-as domains.
+as domains. After strict acceptance of a production LiveJournal post target,
+its returned client URL removes one terminal root-label dot before requests so
+the domain-scoped age-affirmation cookie jar matches the canonical hostname;
+loopback `localhost.` test-server aliases are not rewritten.
 
 Every archive render constructs a per-post `LinkRewriter` only after identity
 validation and uses that post's delivered `Post.url` as the sole resolution

@@ -1,6 +1,6 @@
-use std::sync::Arc;
-
+use crate::error::LjError;
 use reqwest::cookie::Jar;
+use std::sync::Arc;
 use url::{Host, Url};
 
 /// Returns a DNS host without its optional root-label dot. IP literals remain
@@ -10,6 +10,22 @@ pub(crate) fn normalized_domain_host(url: &Url) -> Option<&str> {
         Host::Domain(host) => Some(host.strip_suffix('.').unwrap_or(host)),
         Host::Ipv4(_) | Host::Ipv6(_) => None,
     }
+}
+
+/// Removes one terminal DNS root-label dot from a domain host. IP literals are
+/// retained through their parsed `Host` variants and are deliberately unchanged.
+pub(crate) fn canonicalize_domain_root_dot(url: &mut Url) -> crate::Result<()> {
+    let Some(Host::Domain(host)) = url.host() else {
+        return Ok(());
+    };
+    let Some(canonical) = host.strip_suffix('.').map(str::to_owned) else {
+        return Ok(());
+    };
+    url.set_host(Some(&canonical))
+        .map_err(|_| LjError::InvalidTarget {
+            input: url.to_string(),
+            reason: "could not canonicalize DNS root-label dot".to_string(),
+        })
 }
 
 /// A loopback HTTP test server: `http` scheme, an explicit port, and a
@@ -106,6 +122,23 @@ mod tests {
     }
 
     #[test]
+    fn canonicalizes_one_domain_root_dot_without_changing_url_components() {
+        let mut dotted =
+            Url::parse("https://news.livejournal.com.:8443/1.html?q=age#post").unwrap();
+        canonicalize_domain_root_dot(&mut dotted).unwrap();
+        assert_eq!(
+            dotted.as_str(),
+            "https://news.livejournal.com:8443/1.html?q=age#post"
+        );
+
+        for input in ["http://127.0.0.1:8080/1.html", "http://[::1]:8080/1.html"] {
+            let mut url = Url::parse(input).unwrap();
+            canonicalize_domain_root_dot(&mut url).unwrap();
+            assert_eq!(url.as_str(), input);
+        }
+    }
+
+    #[test]
     fn rejects_production_and_portless_and_https() {
         for u in [
             "https://news.livejournal.com/", // production
@@ -148,6 +181,28 @@ mod tests {
         ] {
             let parsed = Url::parse(url).unwrap();
             assert!(jar.cookies(&parsed).is_none(), "cookie leaked to {url}");
+        }
+    }
+
+    #[test]
+    fn canonicalized_dotted_livejournal_targets_receive_affirmation_cookies() {
+        use reqwest::cookie::CookieStore;
+
+        for input in [
+            "https://news.livejournal.com./1.html",
+            "https://users.livejournal.com./example_user/1.html",
+        ] {
+            let crate::models::ArchiveTarget::Post { url, .. } =
+                crate::target::parse_target(input, None).unwrap()
+            else {
+                panic!("expected post target");
+            };
+            let cookies = affirmation_cookie_jar()
+                .cookies(&url)
+                .unwrap_or_else(|| panic!("no cookies for {url}"));
+            let cookies = cookies.to_str().unwrap();
+            assert!(cookies.contains("adult_explicit=1"), "{cookies}");
+            assert!(cookies.contains("adult_concepts=1"), "{cookies}");
         }
     }
 }
