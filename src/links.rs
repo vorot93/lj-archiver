@@ -233,8 +233,10 @@ pub(crate) fn validate_pending_links(
         let end = terminator_search_start + relative_end + PENDING_LINK_SEPARATOR.len_utf8();
         if let Some(actual) = occurrences.get_mut(&text[start..end]) {
             *actual += 1;
+            cursor = end;
+        } else {
+            cursor = terminator_search_start;
         }
-        cursor = end;
     }
 
     for link in links {
@@ -325,13 +327,16 @@ fn resolve_pending_links_with_scan_stats(
                 target_id: *target_id,
                 context: *context,
             });
+            stats.account_input_range(start, end, true);
+            stats.cursor_advanced_bytes += end - cursor;
+            cursor = end;
         } else {
-            resolved.push_str(candidate);
+            resolved.push(PENDING_LINK_SEPARATOR);
+            stats.account_input_range(start, terminator_search_start, false);
+            stats.cursor_advanced_bytes += terminator_search_start - cursor;
+            cursor = terminator_search_start;
         }
-        stats.account_input_range(start, end, true);
         stats.candidates += 1;
-        stats.cursor_advanced_bytes += end - cursor;
-        cursor = end;
     }
 
     if cursor < text.len() {
@@ -843,6 +848,41 @@ mod tests {
             PendingLinkError::OccurrenceCount {
                 expected: 1,
                 actual: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_validation_recognizes_token_after_odd_ordinary_separator() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+        let token = rewriter
+            .xref_target("https://news.livejournal.com/7.html")
+            .unwrap();
+        let text = format!("authored \u{1f} text {token}[seven]");
+
+        validate_pending_links(&text, &rewriter.pending_links()).unwrap();
+    }
+
+    #[test]
+    fn pending_resolution_preserves_malformed_separator_fragment_before_token() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+        let token = rewriter
+            .xref_target("https://news.livejournal.com/7.html")
+            .unwrap();
+        let prefix = "before \u{1f}lj-archiver-link:malformed ";
+        let text = format!("{prefix}{token}[seven]");
+        let contents = format!("{prefix}xref:7.adoc[seven]");
+
+        assert_eq!(
+            resolve_pending_links(&text, &rewriter.pending_links(), &HashSet::from([7])).unwrap(),
+            ResolvedLinks {
+                contents,
+                links: vec![ActiveLink {
+                    start: prefix.len(),
+                    end: prefix.len() + "xref:7.adoc".len(),
+                    target_id: 7,
+                    context: ActiveLinkContext::Xref,
+                }],
             }
         );
     }
