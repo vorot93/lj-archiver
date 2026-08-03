@@ -181,7 +181,12 @@ remain exact listings even in inline positions and nested within reviewed
 inline wrappers; both root and child accumulators must flush surrounding text
 and append such output as a block so listing delimiters stay at line boundaries.
 Plain-text collectors must reject unreviewed names rather than flattening away
-their tags or attributes. Never guess source ranges or serialize a safety DOM.
+their tags or attributes. The direct raw-text renderers for `code` and `pre`
+must likewise detect any unreviewed element descendant and route the complete
+source-preserved containing element through passthrough classification; do not
+splice guessed descendant source into literal text. (`script` and `style`
+bodies parse as raw text nodes, so they cannot contain parsed element
+descendants.) Never guess source ranges or serialize a safety DOM.
 
 Every generated block delimiter is chosen with one pass over `content.lines()`:
 inspect each line once, remember the longest line made only of the delimiter

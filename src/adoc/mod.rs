@@ -284,6 +284,9 @@ fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
         "img" => render_image(element, ctx),
         "strong" | "b" => render_inline_wrapper(&render_inline_children(element, ctx), "*", "*"),
         "em" | "i" => render_inline_wrapper(&render_inline_children(element, ctx), "_", "_"),
+        "code" | "pre" if has_unreviewed_element_descendant(element) => {
+            render_passthrough(element, ctx)
+        }
         "code" => render_inline_code(element),
         "pre" => render_listing(element),
         "script" | "style" => render_safe_listing(element),
@@ -299,6 +302,13 @@ fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
         }
         _ => render_inline_children(element, ctx),
     }
+}
+
+fn has_unreviewed_element_descendant(element: ElementRef<'_>) -> bool {
+    element.descendants().skip(1).any(|descendant| {
+        ElementRef::wrap(descendant)
+            .is_some_and(|descendant| !passthrough_element_name_is_safe(descendant.value().name()))
+    })
 }
 
 fn render_paragraph(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
@@ -1190,6 +1200,20 @@ mod tests {
         let adoc = html_to_adoc("<p><code>a`b</code></p>");
 
         assert_eq!(adoc, "+a`b+\n\n");
+    }
+
+    #[test]
+    fn code_with_custom_descendant_preserves_exact_containing_source_listing() {
+        let source = "<code>before<foo onclick='x'>inside</foo>after</code>";
+
+        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+    }
+
+    #[test]
+    fn pre_with_custom_descendant_preserves_exact_containing_source_listing() {
+        let source = "<pre>before<foo onclick='x'>inside</foo>after</pre>";
+
+        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
     }
 
     #[test]
@@ -3384,6 +3408,34 @@ mod tests {
         for text in ["before", "lj-embed", "onclick", "inside", "after"] {
             assert!(visible.contains(text), "missing {text:?} in: {html}");
         }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn raw_text_containers_with_custom_descendants_convert_inert_visible_and_separate() {
+        let code_source = "<code>before<foo onclick='code-action'>inside</foo>after</code>";
+        let pre_source = "<pre>before<foo onclick='pre-action'>inside</foo>after</pre>";
+        let adoc = format!("{}{}", html_to_adoc(code_source), html_to_adoc(pre_source));
+
+        assert_eq!(
+            adoc,
+            format!("----\n{code_source}\n----\n\n----\n{pre_source}\n----\n\n")
+        );
+
+        let html = convert_with_asciidoctor(&adoc);
+        let document = Html::parse_document(&html);
+        assert!(
+            document
+                .select(&Selector::parse("[onclick], foo").unwrap())
+                .next()
+                .is_none(),
+            "got: {html}"
+        );
+        let listings = document
+            .select(&Selector::parse("div.listingblock pre").unwrap())
+            .map(|element| element.text().collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(listings, [code_source, pre_source]);
     }
 
     #[test]
