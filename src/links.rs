@@ -11,6 +11,35 @@ use url::Url;
 
 pub(crate) const POST_LINK_PREFIX_ATTRIBUTE: &str = "lj-archiver-post-link-prefix";
 pub(crate) const POST_LINK_PREFIX_REFERENCE: &str = "{lj-archiver-post-link-prefix}";
+const PENDING_LINK_SEPARATOR: char = '\u{1f}';
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveLinkContext {
+    Xref,
+    ImageLink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveLink {
+    pub start: usize,
+    pub end: usize,
+    pub target_id: u64,
+    pub context: ActiveLinkContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedLinks {
+    pub contents: String,
+    pub links: Vec<ActiveLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PendingLinkError {
+    #[error("pending token was recorded more than once")]
+    DuplicateRecordedToken,
+    #[error("pending token occurrence count was {actual}, expected {expected}")]
+    OccurrenceCount { expected: usize, actual: usize },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingLink {
@@ -18,6 +47,7 @@ pub(crate) struct PendingLink {
     pub target_id: u64,
     pub local_target: String,
     pub external_target: String,
+    pub context: ActiveLinkContext,
 }
 
 #[derive(Clone, Copy)]
@@ -28,7 +58,7 @@ enum LocalTargetContext {
 
 enum RewriteMode {
     Direct,
-    Pending,
+    Pending { namespace: String },
 }
 
 pub struct LinkRewriter {
@@ -58,20 +88,28 @@ impl LinkRewriter {
         }
     }
 
-    pub fn pending(journal: impl Into<String>, ids: HashSet<u64>, base_url: Url) -> Self {
-        Self::pending_with_targets(journal, canonical_targets(ids), base_url)
+    pub fn pending(
+        journal: impl Into<String>,
+        ids: HashSet<u64>,
+        base_url: Url,
+        namespace: impl Into<String>,
+    ) -> Self {
+        Self::pending_with_targets(journal, canonical_targets(ids), base_url, namespace)
     }
 
     pub(crate) fn pending_with_targets(
         journal: impl Into<String>,
         targets: Arc<HashMap<u64, String>>,
         base_url: Url,
+        namespace: impl Into<String>,
     ) -> Self {
         Self {
             journal: journal.into(),
             targets,
             base_url,
-            mode: RewriteMode::Pending,
+            mode: RewriteMode::Pending {
+                namespace: namespace.into(),
+            },
             pending_links: Mutex::new(Vec::new()),
         }
     }
@@ -103,19 +141,26 @@ impl LinkRewriter {
             }
         };
 
-        match self.mode {
+        match &self.mode {
             RewriteMode::Direct => Some(local_target),
-            RewriteMode::Pending => {
+            RewriteMode::Pending { namespace } => {
                 let mut links = self
                     .pending_links
                     .lock()
                     .expect("pending link recorder mutex poisoned");
-                let token = format!("\u{1f}lj-archiver-link:{id}:{}\u{1f}", links.len());
+                let token = format!(
+                    "{PENDING_LINK_SEPARATOR}lj-archiver-link:{namespace}:{id}:{}{PENDING_LINK_SEPARATOR}",
+                    links.len()
+                );
                 links.push(PendingLink {
                     token: token.clone(),
                     target_id: id,
                     local_target,
                     external_target: pending_external_target(&url, context),
+                    context: match context {
+                        LocalTargetContext::XrefMacro => ActiveLinkContext::Xref,
+                        LocalTargetContext::ImageLinkAttribute => ActiveLinkContext::ImageLink,
+                    },
                 });
                 Some(token)
             }
@@ -162,8 +207,46 @@ pub(crate) fn resolve_pending_links(
     text: &str,
     links: &[PendingLink],
     local_ids: &HashSet<u64>,
-) -> String {
-    resolve_pending_links_with_scan_stats(text, links, local_ids).0
+) -> std::result::Result<ResolvedLinks, PendingLinkError> {
+    resolve_pending_links_with_scan_stats(text, links, local_ids).map(|(resolved, _)| resolved)
+}
+
+pub(crate) fn validate_pending_links(
+    text: &str,
+    links: &[PendingLink],
+) -> std::result::Result<(), PendingLinkError> {
+    let mut occurrences = HashMap::with_capacity(links.len());
+    for link in links {
+        if occurrences.insert(link.token.as_str(), 0_usize).is_some() {
+            return Err(PendingLinkError::DuplicateRecordedToken);
+        }
+    }
+
+    let mut cursor = 0;
+    while let Some(relative_start) = text[cursor..].find(PENDING_LINK_SEPARATOR) {
+        let start = cursor + relative_start;
+        let terminator_search_start = start + PENDING_LINK_SEPARATOR.len_utf8();
+        let Some(relative_end) = text[terminator_search_start..].find(PENDING_LINK_SEPARATOR)
+        else {
+            break;
+        };
+        let end = terminator_search_start + relative_end + PENDING_LINK_SEPARATOR.len_utf8();
+        if let Some(actual) = occurrences.get_mut(&text[start..end]) {
+            *actual += 1;
+        }
+        cursor = end;
+    }
+
+    for link in links {
+        let actual = occurrences[link.token.as_str()];
+        if actual != 1 {
+            return Err(PendingLinkError::OccurrenceCount {
+                expected: 1,
+                actual,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -201,9 +284,8 @@ fn resolve_pending_links_with_scan_stats(
     text: &str,
     links: &[PendingLink],
     local_ids: &HashSet<u64>,
-) -> (String, PendingLinkScanStats) {
-    const SEPARATOR: char = '\u{1f}';
-
+) -> std::result::Result<(ResolvedLinks, PendingLinkScanStats), PendingLinkError> {
+    validate_pending_links(text, links)?;
     let mut replacements = HashMap::with_capacity(links.len());
     for link in links {
         let target = if local_ids.contains(&link.target_id) {
@@ -211,29 +293,38 @@ fn resolve_pending_links_with_scan_stats(
         } else {
             link.external_target.as_str()
         };
-        replacements.entry(link.token.as_str()).or_insert(target);
+        replacements.insert(link.token.as_str(), (target, link.target_id, link.context));
     }
     let mut resolved = String::with_capacity(text.len());
+    let mut active_links = Vec::with_capacity(links.len());
     let mut stats = PendingLinkScanStats::default();
     let mut cursor = 0;
 
-    while let Some(relative_start) = text[cursor..].find(SEPARATOR) {
+    while let Some(relative_start) = text[cursor..].find(PENDING_LINK_SEPARATOR) {
         let start = cursor + relative_start;
         resolved.push_str(&text[cursor..start]);
         stats.account_input_range(cursor, start, false);
 
-        let terminator_search_start = start + SEPARATOR.len_utf8();
-        let Some(relative_end) = text[terminator_search_start..].find(SEPARATOR) else {
+        let terminator_search_start = start + PENDING_LINK_SEPARATOR.len_utf8();
+        let Some(relative_end) = text[terminator_search_start..].find(PENDING_LINK_SEPARATOR)
+        else {
             resolved.push_str(&text[start..]);
             stats.account_input_range(start, text.len(), false);
             stats.cursor_advanced_bytes += text.len() - cursor;
             cursor = text.len();
             break;
         };
-        let end = terminator_search_start + relative_end + SEPARATOR.len_utf8();
+        let end = terminator_search_start + relative_end + PENDING_LINK_SEPARATOR.len_utf8();
         let candidate = &text[start..end];
-        if let Some(target) = replacements.get(candidate) {
+        if let Some((target, target_id, context)) = replacements.get(candidate) {
+            let output_start = resolved.len();
             resolved.push_str(target);
+            active_links.push(ActiveLink {
+                start: output_start,
+                end: resolved.len(),
+                target_id: *target_id,
+                context: *context,
+            });
         } else {
             resolved.push_str(candidate);
         }
@@ -249,7 +340,14 @@ fn resolve_pending_links_with_scan_stats(
         stats.cursor_advanced_bytes += text.len() - cursor;
     }
 
-    (resolved, stats)
+    active_links.sort_by_key(|link| link.start);
+    Ok((
+        ResolvedLinks {
+            contents: resolved,
+            links: active_links,
+        },
+        stats,
+    ))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -401,12 +499,23 @@ fn repair_retained_links_with_scan_stats(
 mod tests {
     use super::*;
 
+    const TEST_NAMESPACE: &str = "00112233445566778899aabbccddeeff";
+
     fn direct_rewriter_with_targets(targets: HashMap<u64, String>, base_url: Url) -> LinkRewriter {
         LinkRewriter::with_targets("news", Arc::new(targets), base_url)
     }
 
     fn pending_rewriter_with_targets(targets: HashMap<u64, String>, base_url: Url) -> LinkRewriter {
-        LinkRewriter::pending_with_targets("news", Arc::new(targets), base_url)
+        LinkRewriter::pending_with_targets("news", Arc::new(targets), base_url, TEST_NAMESPACE)
+    }
+
+    fn pending_rewriter_with_namespace(namespace: &str) -> LinkRewriter {
+        LinkRewriter::pending(
+            "news",
+            HashSet::from([7]),
+            Url::parse("https://news.livejournal.com/").unwrap(),
+            namespace,
+        )
     }
 
     fn pending_link(
@@ -420,6 +529,7 @@ mod tests {
             target_id,
             local_target: local_target.into(),
             external_target: external_target.into(),
+            context: ActiveLinkContext::Xref,
         }
     }
 
@@ -514,7 +624,9 @@ mod tests {
                 &format!("{text_token}[One] {image_token}"),
                 &links,
                 &HashSet::from([1]),
-            ),
+            )
+            .unwrap()
+            .contents,
             "xref:01.adoc[One] {lj-archiver-post-link-prefix}01.adoc"
         );
     }
@@ -632,6 +744,7 @@ mod tests {
             "news",
             HashSet::from([2u64]),
             Url::parse("https://news.livejournal.com/").unwrap(),
+            TEST_NAMESPACE,
         );
 
         let target = r
@@ -651,11 +764,144 @@ mod tests {
     }
 
     #[test]
+    fn pending_tokens_include_namespace_ordinal_and_context() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+
+        let xref = rewriter
+            .xref_target("https://news.livejournal.com/7.html")
+            .unwrap();
+        let image = rewriter
+            .image_link_target("https://news.livejournal.com/7.html")
+            .unwrap();
+
+        assert_eq!(
+            xref,
+            "\u{1f}lj-archiver-link:00112233445566778899aabbccddeeff:7:0\u{1f}"
+        );
+        assert_eq!(
+            image,
+            "\u{1f}lj-archiver-link:00112233445566778899aabbccddeeff:7:1\u{1f}"
+        );
+        let links = rewriter.pending_links();
+        assert_eq!(links[0].context, ActiveLinkContext::Xref);
+        assert_eq!(links[1].context, ActiveLinkContext::ImageLink);
+    }
+
+    #[test]
+    fn pending_validation_rejects_duplicate_recorded_token() {
+        let token = format!("\u{1f}lj-archiver-link:{TEST_NAMESPACE}:7:0\u{1f}");
+        let links = [
+            PendingLink {
+                token: token.clone(),
+                target_id: 7,
+                local_target: "xref:7.adoc".to_string(),
+                external_target: "https://news.livejournal.com/7.html".to_string(),
+                context: ActiveLinkContext::Xref,
+            },
+            PendingLink {
+                token: token.clone(),
+                target_id: 7,
+                local_target: "xref:7.adoc".to_string(),
+                external_target: "https://news.livejournal.com/7.html".to_string(),
+                context: ActiveLinkContext::Xref,
+            },
+        ];
+
+        assert_eq!(
+            validate_pending_links(&token, &links).unwrap_err(),
+            PendingLinkError::DuplicateRecordedToken
+        );
+    }
+
+    #[test]
+    fn pending_resolution_rejects_duplicate_recorded_token_occurrence() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+        let token = rewriter
+            .xref_target("https://news.livejournal.com/7.html")
+            .unwrap();
+        let links = rewriter.pending_links();
+        let text = format!("{token}[one] and {token}[two]");
+
+        assert_eq!(
+            resolve_pending_links(&text, &links, &HashSet::from([7])).unwrap_err(),
+            PendingLinkError::OccurrenceCount {
+                expected: 1,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_validation_rejects_recorded_token_missing_from_text() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+        rewriter
+            .xref_target("https://news.livejournal.com/7.html")
+            .unwrap();
+
+        assert_eq!(
+            validate_pending_links("authored text only", &rewriter.pending_links()).unwrap_err(),
+            PendingLinkError::OccurrenceCount {
+                expected: 1,
+                actual: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_resolution_preserves_unrecorded_token_and_returns_exact_xref_span() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+        let token = rewriter
+            .xref_target("https://news.livejournal.com/7.html")
+            .unwrap();
+        let unknown = "\u{1f}lj-archiver-link:ffeeddccbbaa99887766554433221100:7:0\u{1f}";
+        let text = format!("before {token}[seven] {unknown} after");
+        let contents = format!("before xref:7.adoc[seven] {unknown} after");
+
+        assert_eq!(
+            resolve_pending_links(&text, &rewriter.pending_links(), &HashSet::from([7])).unwrap(),
+            ResolvedLinks {
+                contents,
+                links: vec![ActiveLink {
+                    start: 7,
+                    end: 18,
+                    target_id: 7,
+                    context: ActiveLinkContext::Xref,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn pending_resolution_returns_exact_image_link_span_and_context() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+        let token = rewriter
+            .image_link_target("https://news.livejournal.com/7.html")
+            .unwrap();
+        let text = format!("image:photo.jpg[photo,link={token}]");
+        let target = "{lj-archiver-post-link-prefix}7.adoc";
+        let contents = format!("image:photo.jpg[photo,link={target}]");
+
+        assert_eq!(
+            resolve_pending_links(&text, &rewriter.pending_links(), &HashSet::from([7])).unwrap(),
+            ResolvedLinks {
+                contents,
+                links: vec![ActiveLink {
+                    start: 27,
+                    end: 63,
+                    target_id: 7,
+                    context: ActiveLinkContext::ImageLink,
+                }],
+            }
+        );
+    }
+
+    #[test]
     fn preserves_pending_query_and_fragment_target() {
         let r = LinkRewriter::pending(
             "news",
             HashSet::from([2u64]),
             Url::parse("https://news.livejournal.com/").unwrap(),
+            TEST_NAMESPACE,
         );
 
         r.xref_target("https://news.livejournal.com/2.html?thread=5#c1")
@@ -673,6 +919,7 @@ mod tests {
             "news",
             HashSet::from([2u64]),
             Url::parse("https://news.livejournal.com/").unwrap(),
+            TEST_NAMESPACE,
         );
         subdomain
             .xref_target("https://users.livejournal.com/news/2.html")
@@ -686,6 +933,7 @@ mod tests {
             "example_user",
             HashSet::from([2u64]),
             Url::parse("https://users.livejournal.com/example_user/").unwrap(),
+            TEST_NAMESPACE,
         );
         users
             .xref_target("https://example-user.livejournal.com/2.html")
@@ -702,6 +950,7 @@ mod tests {
             "news",
             HashSet::from([2u64]),
             Url::parse("http://127.0.0.1:1234/").unwrap(),
+            TEST_NAMESPACE,
         );
 
         r.xref_target("https://news.livejournal.com/2.html?thread=5#c1")
@@ -719,6 +968,7 @@ mod tests {
             "news",
             HashSet::from([2u64]),
             Url::parse("https://news.livejournal.com/").unwrap(),
+            TEST_NAMESPACE,
         );
         let token = r
             .xref_target("https://news.livejournal.com/2.html")
@@ -727,11 +977,15 @@ mod tests {
         let links = r.pending_links();
 
         assert_eq!(
-            resolve_pending_links(&rendered, &links, &HashSet::from([2u64])),
+            resolve_pending_links(&rendered, &links, &HashSet::from([2u64]))
+                .unwrap()
+                .contents,
             "xref:2.adoc[Two]"
         );
         assert_eq!(
-            resolve_pending_links(&rendered, &links, &HashSet::new()),
+            resolve_pending_links(&rendered, &links, &HashSet::new())
+                .unwrap()
+                .contents,
             "https://news.livejournal.com/2.html[Two]"
         );
     }
@@ -760,13 +1014,15 @@ mod tests {
                 &format!("before {local}{external} after"),
                 &links,
                 &HashSet::from([1]),
-            ),
+            )
+            .unwrap()
+            .contents,
             "before xref:1.adochttps://news.livejournal.com/2.html after"
         );
     }
 
     #[test]
-    fn resolves_every_repeated_occurrence_of_one_recorded_token() {
+    fn rejects_repeated_occurrences_of_one_recorded_token() {
         let token = "\u{1f}lj-archiver-link:7:0\u{1f}";
         let links = [pending_link(
             token,
@@ -780,20 +1036,18 @@ mod tests {
                 &format!("{token}|{token}|{token}"),
                 &links,
                 &HashSet::from([7]),
-            ),
-            "xref:7.adoc|xref:7.adoc|xref:7.adoc"
+            )
+            .unwrap_err(),
+            PendingLinkError::OccurrenceCount {
+                expected: 1,
+                actual: 3,
+            }
         );
     }
 
     #[test]
     fn preserves_token_prefix_suffix_and_unknown_complete_lookalikes() {
-        let token = "\u{1f}lj-archiver-link:7:0\u{1f}";
-        let links = [pending_link(
-            token,
-            7,
-            "xref:7.adoc",
-            "https://news.livejournal.com/7.html",
-        )];
+        let links = [];
         let text = concat!(
             "\u{1f}prefix-lj-archiver-link:7:0\u{1f}",
             "|\u{1f}lj-archiver-link:7:0-suffix\u{1f}",
@@ -801,41 +1055,35 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_pending_links(text, &links, &HashSet::from([7])),
+            resolve_pending_links(text, &links, &HashSet::from([7]))
+                .unwrap()
+                .contents,
             text
         );
     }
 
     #[test]
     fn preserves_malformed_candidate_and_all_remaining_text() {
-        let token = "\u{1f}lj-archiver-link:7:0\u{1f}";
-        let links = [pending_link(
-            token,
-            7,
-            "xref:7.adoc",
-            "https://news.livejournal.com/7.html",
-        )];
+        let links = [];
         let text = "before \u{1f}lj-archiver-link:7:0 and trailing bytes";
 
         assert_eq!(
-            resolve_pending_links(text, &links, &HashSet::from([7])),
+            resolve_pending_links(text, &links, &HashSet::from([7]))
+                .unwrap()
+                .contents,
             text
         );
     }
 
     #[test]
     fn preserves_ordinary_unit_separator_delimited_text() {
-        let token = "\u{1f}lj-archiver-link:7:0\u{1f}";
-        let links = [pending_link(
-            token,
-            7,
-            "xref:7.adoc",
-            "https://news.livejournal.com/7.html",
-        )];
+        let links = [];
         let text = "before \u{1f}ordinary text\u{1f} and \u{1f}\u{1f} after";
 
         assert_eq!(
-            resolve_pending_links(text, &links, &HashSet::from([7])),
+            resolve_pending_links(text, &links, &HashSet::from([7]))
+                .unwrap()
+                .contents,
             text
         );
     }
@@ -855,13 +1103,15 @@ mod tests {
         ];
 
         assert_eq!(
-            resolve_pending_links(first, &links, &HashSet::new()),
-            second
+            resolve_pending_links(&format!("{first}|{second}"), &links, &HashSet::from([2]),)
+                .unwrap()
+                .contents,
+            format!("{second}|xref:2.adoc")
         );
     }
 
     #[test]
-    fn keeps_first_selected_target_for_duplicate_recorded_tokens() {
+    fn rejects_duplicate_recorded_tokens_during_resolution() {
         let token = "\u{1f}lj-archiver-link:1:0\u{1f}";
         let links = [
             pending_link(token, 1, "xref:first.adoc", "https://example.test/first"),
@@ -869,8 +1119,8 @@ mod tests {
         ];
 
         assert_eq!(
-            resolve_pending_links(token, &links, &HashSet::from([1])),
-            "xref:first.adoc"
+            resolve_pending_links(token, &links, &HashSet::from([1])).unwrap_err(),
+            PendingLinkError::DuplicateRecordedToken
         );
     }
 
@@ -905,10 +1155,11 @@ mod tests {
         text.push_str(":end");
         expected.push_str(":end");
 
-        let (resolved, stats) = resolve_pending_links_with_scan_stats(&text, &links, &local_ids);
+        let (resolved, stats) =
+            resolve_pending_links_with_scan_stats(&text, &links, &local_ids).unwrap();
 
-        assert_eq!(resolved, expected);
-        assert_eq!(resolved.len(), EXPECTED_OUTPUT_LEN);
+        assert_eq!(resolved.contents, expected);
+        assert_eq!(resolved.contents.len(), EXPECTED_OUTPUT_LEN);
         assert_eq!(stats.candidates, LINK_COUNT as usize);
         assert_eq!(stats.cursor_advanced_bytes, text.len());
         assert_eq!(stats.accounted_input_bytes, text.len());

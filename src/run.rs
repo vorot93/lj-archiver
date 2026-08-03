@@ -6,7 +6,10 @@ use crate::{
     client::LjClient,
     discover::discover_post_ids,
     error::LjError,
-    links::{LinkRewriter, PendingLink, repair_retained_links, resolve_pending_links},
+    links::{
+        LinkRewriter, PendingLink, PendingLinkError, repair_retained_links, resolve_pending_links,
+        validate_pending_links,
+    },
     media::rewrite_inline_media,
     models::{ArchiveTarget, ArchivedPost, Post, PostFailure, RunOptions},
     parser::parse_post_page,
@@ -21,6 +24,70 @@ use std::{
     sync::Arc,
 };
 use url::Url;
+
+const MAX_PENDING_RENDER_ATTEMPTS: usize = 4;
+
+#[derive(Debug)]
+struct PendingRenderedPost {
+    contents: String,
+    links: Vec<PendingLink>,
+}
+
+fn random_link_namespace(url: &Url) -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| LjError::LinkIntegrity {
+        url: url.to_string(),
+        reason: format!("could not obtain pending-link namespace: {error}"),
+    })?;
+    Ok(hex::encode(bytes))
+}
+
+fn render_pending_post_with<F>(
+    post: &Post,
+    include_comments: bool,
+    journal: &str,
+    targets: Arc<HashMap<u64, String>>,
+    mut next_namespace: F,
+) -> Result<PendingRenderedPost>
+where
+    F: FnMut() -> Result<String>,
+{
+    for attempt in 1..=MAX_PENDING_RENDER_ATTEMPTS {
+        let namespace = next_namespace()?;
+        let rewriter = LinkRewriter::pending_with_targets(
+            journal,
+            Arc::clone(&targets),
+            post.url.clone(),
+            namespace,
+        );
+        let contents = render_post(post, include_comments, Some(&rewriter));
+        let links = rewriter.pending_links();
+
+        match validate_pending_links(&contents, &links) {
+            Ok(()) => return Ok(PendingRenderedPost { contents, links }),
+            Err(error @ PendingLinkError::OccurrenceCount { .. })
+                if attempt == MAX_PENDING_RENDER_ATTEMPTS =>
+            {
+                return Err(LjError::LinkIntegrity {
+                    url: post.url.to_string(),
+                    reason: format!(
+                        "could not produce collision-free pending links after \
+                         {MAX_PENDING_RENDER_ATTEMPTS} attempts: {error}"
+                    ),
+                });
+            }
+            Err(PendingLinkError::OccurrenceCount { .. }) => {}
+            Err(error) => {
+                return Err(LjError::LinkIntegrity {
+                    url: post.url.to_string(),
+                    reason: error.to_string(),
+                });
+            }
+        }
+    }
+
+    unreachable!("pending render loop either succeeds or returns on its final attempt")
+}
 
 /// The result of a completed archive run. `Ok(RunOutcome)` means the run wrote
 /// what it could; a journal run with some failed posts/pages still returns
@@ -213,12 +280,16 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                         .read_pending_post(&post.pending_path)
                         .and_then(|pending| {
                             let external =
-                                resolve_pending_links(&pending, &post.links, &no_local_ids);
+                                resolve_pending_links(&pending, &post.links, &no_local_ids)
+                                    .map_err(|error| LjError::LinkIntegrity {
+                                        url: post.delivered_url.to_string(),
+                                        reason: error.to_string(),
+                                    })?;
                             writer.write_post(
                                 &archive,
                                 post.archived.id,
                                 &post.archived.path,
-                                &external,
+                                &external.contents,
                             )
                         });
 
@@ -258,18 +329,29 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
 
     for post in &finalized {
         match archive.read_pending_post(&post.pending_path) {
-            Ok(pending) => {
-                let local = resolve_pending_links(&pending, &post.links, &final_ids);
-                if let Err(error) =
-                    writer.write_post(&archive, post.archived.id, &post.archived.path, &local)
-                {
+            Ok(pending) => match resolve_pending_links(&pending, &post.links, &final_ids) {
+                Ok(local) => {
+                    if let Err(error) = writer.write_post(
+                        &archive,
+                        post.archived.id,
+                        &post.archived.path,
+                        &local.contents,
+                    ) {
+                        tracing::warn!(
+                            post_id = post.archived.id,
+                            error = %error,
+                            "could not upgrade finalized post links; retaining external links"
+                        );
+                    }
+                }
+                Err(error) => {
                     tracing::warn!(
                         post_id = post.archived.id,
                         error = %error,
-                        "could not upgrade finalized post links; retaining external links"
+                        "could not resolve finalized post links; retaining external links"
                     );
                 }
-            }
+            },
             Err(error) => {
                 tracing::warn!(
                     post_id = post.archived.id,
@@ -377,13 +459,16 @@ async fn archive_journal_post(
                     .get(&id)
                     .map(|post| post.path.clone())
                     .unwrap_or_else(|| archive.post_path(id));
-                let rewriter = LinkRewriter::pending_with_targets(
-                    journal_context.journal,
+                let namespace_url = post.url.clone();
+                let rendered = render_pending_post_with(
+                    &post,
+                    options.include_comments,
+                    &journal_context.journal,
                     journal_context.target_filenames,
-                    post.url.clone(),
+                    || random_link_namespace(&namespace_url),
                 );
-                let rendered = render_post(&post, options.include_comments, Some(&rewriter));
-                let pending_path = archive.write_pending_post(id, &rendered)?;
+                let rendered = rendered?;
+                let pending_path = archive.write_pending_post(id, &rendered.contents)?;
 
                 Result::Ok(PreparedPost {
                     archived: ArchivedPost {
@@ -393,7 +478,7 @@ async fn archive_journal_post(
                     },
                     delivered_url: delivered_url.clone(),
                     pending_path,
-                    links: rewriter.pending_links(),
+                    links: rendered.links,
                 })
             }
             .await
@@ -737,6 +822,9 @@ mod tests {
         matchers::{method, path},
     };
 
+    const COLLIDING_NAMESPACE: &str = "00112233445566778899aabbccddeeff";
+    const SAFE_NAMESPACE: &str = "ffeeddccbbaa99887766554433221100";
+
     #[test]
     fn failure_reason_reports_failed_archive_pages() {
         let reason = failure_reason(2, &[]);
@@ -744,6 +832,86 @@ mod tests {
             reason.contains("2 archive page(s) failed to fetch"),
             "unexpected reason: {reason}"
         );
+    }
+
+    #[test]
+    fn pending_render_retries_collision_then_succeeds() {
+        let namespaces = [COLLIDING_NAMESPACE, SAFE_NAMESPACE];
+        let mut calls = 0;
+        let rendered = render_pending_post_with(
+            &post_containing_collision(COLLIDING_NAMESPACE),
+            false,
+            "news",
+            Arc::new(HashMap::from([(7, "7.adoc".to_string())])),
+            || {
+                let value = namespaces[calls];
+                calls += 1;
+                Ok(value.to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        assert_eq!(rendered.links.len(), 1);
+        assert!(
+            rendered.contents.contains(SAFE_NAMESPACE),
+            "got: {:?}",
+            rendered.contents
+        );
+    }
+
+    #[test]
+    fn pending_render_exhausts_after_four_colliding_namespaces() {
+        let post = post_containing_collision(COLLIDING_NAMESPACE);
+        let mut calls = 0;
+        let error = render_pending_post_with(
+            &post,
+            false,
+            "news",
+            Arc::new(HashMap::from([(7, "7.adoc".to_string())])),
+            || {
+                calls += 1;
+                Ok(COLLIDING_NAMESPACE.to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(calls, 4);
+        match error {
+            LjError::LinkIntegrity { url, reason } => {
+                assert_eq!(url, post.url.as_str());
+                assert!(reason.contains("after 4 attempts"), "{reason}");
+                assert!(reason.contains("occurrence count was 2"), "{reason}");
+            }
+            other => panic!("expected link integrity error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_render_preserves_namespace_source_failure_url_context() {
+        let post = parsed_post("https://news.livejournal.com/9.html", "news", 9);
+        let mut calls = 0;
+        let error =
+            render_pending_post_with(&post, false, "news", Arc::new(HashMap::new()), || {
+                calls += 1;
+                Err(LjError::LinkIntegrity {
+                    url: post.url.to_string(),
+                    reason: "could not obtain pending-link namespace: unavailable".to_string(),
+                })
+            })
+            .unwrap_err();
+
+        assert_eq!(calls, 1);
+        match error {
+            LjError::LinkIntegrity { url, reason } => {
+                assert_eq!(url, post.url.as_str());
+                assert_eq!(
+                    reason,
+                    "could not obtain pending-link namespace: unavailable"
+                );
+            }
+            other => panic!("expected link integrity error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3038,6 +3206,18 @@ mod tests {
             body_html: "<p>Body.</p>".to_string(),
             comments: Vec::new(),
         }
+    }
+
+    fn post_containing_collision(namespace: &str) -> Post {
+        let mut post = parsed_post("https://news.livejournal.com/1.html", "news", 1);
+        post.body_html = format!(
+            concat!(
+                "<p>authored \u{1f}lj-archiver-link:{}:7:0\u{1f} ",
+                r#"<a href="https://news.livejournal.com/7.html">Seven</a></p>"#,
+            ),
+            namespace
+        );
+        post
     }
 
     fn seed_existing_archive(

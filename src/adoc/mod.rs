@@ -3341,13 +3341,16 @@ mod tests {
             "news",
             HashSet::from([2u64]),
             Url::parse("https://news.livejournal.com/1.html").unwrap(),
+            "00112233445566778899aabbccddeeff",
         );
         let pending = html_to_adoc_with_links(
             r#"<a href="https://news.livejournal.com/2.html"><img src="https://cdn.example.test/photo.jpg" alt="photo"></a>"#,
             Some(&r),
         );
 
-        let resolved = resolve_pending_links(&pending, &r.pending_links(), &HashSet::from([2u64]));
+        let resolved = resolve_pending_links(&pending, &r.pending_links(), &HashSet::from([2u64]))
+            .unwrap()
+            .contents;
 
         assert_eq!(
             resolved,
@@ -3364,6 +3367,7 @@ mod tests {
             "news",
             HashSet::from([2u64]),
             Url::parse("https://news.livejournal.com/1.html").unwrap(),
+            "00112233445566778899aabbccddeeff",
         );
         let pending = html_to_adoc_with_links(
             concat!(
@@ -3373,7 +3377,9 @@ mod tests {
             Some(&r),
         );
 
-        let resolved = resolve_pending_links(&pending, &r.pending_links(), &HashSet::new());
+        let resolved = resolve_pending_links(&pending, &r.pending_links(), &HashSet::new())
+            .unwrap()
+            .contents;
 
         assert_eq!(
             resolved,
@@ -3487,6 +3493,7 @@ mod tests {
             "news",
             HashSet::from([2u64]),
             Url::parse("https://news.livejournal.com/1.html").unwrap(),
+            "00112233445566778899aabbccddeeff",
         );
         let local_pending = html_to_adoc_with_links(
             r#"<a href="https://news.livejournal.com/2.html"><img src="https://cdn.example.test/local.jpg" alt="local"></a>"#,
@@ -3496,12 +3503,15 @@ mod tests {
             &local_pending,
             &local.pending_links(),
             &HashSet::from([2u64]),
-        );
+        )
+        .unwrap()
+        .contents;
 
         let failed = LinkRewriter::pending(
             "news",
             HashSet::from([2u64]),
             Url::parse("https://news.livejournal.com/1.html").unwrap(),
+            "00112233445566778899aabbccddeeff",
         );
         let failed_pending = html_to_adoc_with_links(
             concat!(
@@ -3511,7 +3521,9 @@ mod tests {
             Some(&failed),
         );
         let failed_adoc =
-            resolve_pending_links(&failed_pending, &failed.pending_links(), &HashSet::new());
+            resolve_pending_links(&failed_pending, &failed.pending_links(), &HashSet::new())
+                .unwrap()
+                .contents;
 
         let html = convert_with_asciidoctor(&format!(
             concat!(

@@ -25,6 +25,8 @@ pub enum LjError {
          (LiveJournal may have changed the mechanism): {url}"
     )]
     AgeGated { url: String },
+    #[error("link integrity failure for {url}: {reason}")]
+    LinkIntegrity { url: String, reason: String },
     #[error("could not discover journal `{journal}`: {reason}")]
     Discovery { journal: String, reason: String },
     #[error("invalid archive at {path}: {reason}")]
