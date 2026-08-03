@@ -984,6 +984,54 @@ mod tests {
     }
 
     #[test]
+    fn retained_repair_preserves_zero_overflow_and_wrong_ordinary_suffixes() {
+        let targets = HashMap::from([(1, "01.adoc".to_string())]);
+        let input = concat!(
+            "xref:0.adoc[Zero] ",
+            "xref:18446744073709551616.adoc[Overflow]xref:1.adoc[Adjacent] ",
+            "xref:1.adoc]Wrong delimiter] ",
+            "xref:1.adoc(Wrong delimiter) ",
+            "xref:1.adoc [Spaced suffix]",
+        );
+
+        assert_eq!(
+            repair_retained_links(input, "news", &targets).unwrap(),
+            concat!(
+                "xref:0.adoc[Zero] ",
+                "xref:18446744073709551616.adoc[Overflow]xref:01.adoc[Adjacent] ",
+                "xref:1.adoc]Wrong delimiter] ",
+                "xref:1.adoc(Wrong delimiter) ",
+                "xref:1.adoc [Spaced suffix]",
+            )
+        );
+    }
+
+    #[test]
+    fn retained_repair_preserves_malformed_contextual_link_targets() {
+        let targets = HashMap::from([(1, "01.adoc".to_string())]);
+        let input = concat!(
+            "image:a[,link={lj-archiver-post-link-prefix}0.adoc] ",
+            "link={lj-archiver-post-link-prefix}18446744073709551616.adoc]",
+            "link={lj-archiver-post-link-prefix}1.adoc] ",
+            "image:b[,link={lj-archiver-post-link-prefix}1.adoc[] ",
+            "image:c[,link={lj-archiver-post-link-prefix}1.adoc,role=x] ",
+            "image:d[,link={lj-archiver-post-link-prefix}1.adoc",
+        );
+
+        assert_eq!(
+            repair_retained_links(input, "news", &targets).unwrap(),
+            concat!(
+                "image:a[,link={lj-archiver-post-link-prefix}0.adoc] ",
+                "link={lj-archiver-post-link-prefix}18446744073709551616.adoc]",
+                "link={lj-archiver-post-link-prefix}01.adoc] ",
+                "image:b[,link={lj-archiver-post-link-prefix}1.adoc[] ",
+                "image:c[,link={lj-archiver-post-link-prefix}1.adoc,role=x] ",
+                "image:d[,link={lj-archiver-post-link-prefix}1.adoc",
+            )
+        );
+    }
+
+    #[test]
     fn retained_repair_accounts_for_fifty_thousand_candidates_monotonically() {
         const CANDIDATE_COUNT: u64 = 50_000;
 
