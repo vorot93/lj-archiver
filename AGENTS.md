@@ -103,9 +103,13 @@ the XDG portal by default (no GTK3 link), keeping Linux free of GTK system libs.
 The matrix uploads installer-only artifacts; one final fan-in job rejects a
 missing or unexpected five-installer set before publishing once. All Actions
 are full-SHA pinned, Dependabot owns weekly GitHub Actions update proposals,
-and only that final publisher receives `contents: write`. The installer
-version/filename comes from `workspace.package.version` in the root
-`Cargo.toml`, so bump it before pushing the matching version tag.
+and only that final publisher receives `contents: write`. Initial tag and
+ancestry validation is not sufficient: immediately before creation, the
+checkout-free sole publisher re-queries the live remote tag, bounded-peels at
+most eight annotated tag objects, and requires the resolved commit to equal
+`GITHUB_SHA`. The installer version/filename comes from
+`workspace.package.version` in the root `Cargo.toml`, so bump it before pushing
+the matching version tag.
 
 ## Development Commands
 

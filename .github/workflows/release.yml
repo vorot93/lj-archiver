@@ -162,6 +162,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          tag_object="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq '[.object.type, .object.sha] | @tsv')"
+          IFS=$'\t' read -r tag_type tag_sha <<< "$tag_object"
+          test -n "$tag_type"
+          test -n "$tag_sha"
+          seen_tag_shas=" "
+          for peel_depth in 1 2 3 4 5 6 7 8; do
+            if test "$tag_type" = commit; then
+              break
+            fi
+            test "$tag_type" = tag
+            case "$seen_tag_shas" in
+              *" $tag_sha "*) echo "release tag peel cycle" >&2; exit 1 ;;
+            esac
+            seen_tag_shas="$seen_tag_shas$tag_sha "
+            tag_object="$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq '[.object.type, .object.sha] | @tsv')"
+            IFS=$'\t' read -r tag_type tag_sha <<< "$tag_object"
+            test -n "$tag_type"
+            test -n "$tag_sha"
+          done
+          test "$tag_type" = commit
+          test "$tag_sha" = "$GITHUB_SHA"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "release already exists" >&2
             exit 1
