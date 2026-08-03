@@ -135,8 +135,8 @@ fn is_restricted_media_url(url: &Url) -> bool {
 
     match host {
         Host::Domain(host) => host.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
-        Host::Ipv4(address) => is_restricted_ip_literal(IpAddr::V4(address)),
-        Host::Ipv6(address) => is_restricted_ip_literal(IpAddr::V6(address)),
+        Host::Ipv4(address) => !is_public_unicast_ip_literal(IpAddr::V4(address)),
+        Host::Ipv6(address) => !is_public_unicast_ip_literal(IpAddr::V6(address)),
     }
 }
 
@@ -144,27 +144,59 @@ fn media_url_is_allowed(url: &Url, loopback_page_mode: bool) -> bool {
     !is_restricted_media_url(url) || loopback_page_mode && crate::net::is_loopback_test_server(url)
 }
 
-fn is_restricted_ip_literal(address: IpAddr) -> bool {
+fn is_public_unicast_ip_literal(address: IpAddr) -> bool {
     match address {
-        IpAddr::V4(address) => is_restricted_ipv4_literal(address),
+        IpAddr::V4(address) => is_public_unicast_ipv4(address),
         IpAddr::V6(address) => {
-            if let Some(v4) = embedded_ipv4(address) {
-                return is_restricted_ipv4_literal(v4);
+            if let Some(embedded) = embedded_ipv4(address) {
+                return is_public_unicast_ipv4(embedded);
             }
-            let first_segment = address.segments()[0];
-            address.is_loopback()
-                || address.is_unspecified()
-                || (first_segment & 0xfe00) == 0xfc00
-                || (first_segment & 0xffc0) == 0xfe80
+            is_public_unicast_ipv6(address)
         }
     }
 }
 
-fn is_restricted_ipv4_literal(address: Ipv4Addr) -> bool {
-    address.is_loopback()
-        || address.is_private()
-        || address.is_link_local()
-        || address.is_unspecified()
+fn is_public_unicast_ipv4(address: Ipv4Addr) -> bool {
+    let [first, second, third, fourth] = address.octets();
+    let is_shared = first == 100 && (second & 0xc0) == 0x40;
+    let is_special_use = first == 192 && second == 0 && third == 0 && fourth != 9 && fourth != 10;
+    let is_benchmarking = first == 198 && (second & 0xfe) == 18;
+    let is_reserved = (first & 0xf0) == 0xf0 && !address.is_broadcast();
+
+    // Rust 1.97's `Ipv4Addr::is_global` remains unstable. Mirror its current
+    // IANA-based classification with stable predicates, then exclude multicast
+    // and broadcast to require a routable unicast destination.
+    first != 0
+        && !address.is_private()
+        && !is_shared
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !is_special_use
+        && !address.is_documentation()
+        && !is_benchmarking
+        && !is_reserved
+        && !address.is_multicast()
+        && !address.is_broadcast()
+}
+
+fn is_public_unicast_ipv6(address: Ipv6Addr) -> bool {
+    let [first, second, third, ..] = address.segments();
+    let is_documentation =
+        (first == 0x2001 && second == 0x0db8) || (first == 0x3fff && second <= 0x0fff);
+    let is_benchmarking = first == 0x2001 && second == 2 && third == 0;
+    let is_site_local = (first & 0xffc0) == 0xfec0;
+
+    // Rust 1.97's `Ipv6Addr::is_unicast_global` remains unstable. Its current
+    // classification is reproduced with stable predicates; site-local IPv6 is
+    // additionally excluded because media destinations must be public-routable.
+    !address.is_multicast()
+        && !address.is_loopback()
+        && !address.is_unicast_link_local()
+        && !address.is_unique_local()
+        && !address.is_unspecified()
+        && !is_documentation
+        && !is_benchmarking
+        && !is_site_local
 }
 
 /// Extracts an embedded IPv4 address from IPv6 forms that carry one:
@@ -779,6 +811,77 @@ mod tests {
     }
 
     #[test]
+    fn rejects_all_representative_non_public_literal_classes() {
+        for value in [
+            "http://0.0.0.1/pic.jpg",
+            "http://10.0.0.1/pic.jpg",
+            "http://100.64.0.1/pic.jpg",
+            "http://127.0.0.1/pic.jpg",
+            "http://169.254.0.1/pic.jpg",
+            "http://172.16.0.1/pic.jpg",
+            "http://192.0.0.1/pic.jpg",
+            "http://192.0.2.1/pic.jpg",
+            "http://192.168.0.1/pic.jpg",
+            "http://198.18.0.1/pic.jpg",
+            "http://198.51.100.1/pic.jpg",
+            "http://203.0.113.1/pic.jpg",
+            "http://224.0.0.1/pic.jpg",
+            "http://240.0.0.1/pic.jpg",
+            "http://255.255.255.255/pic.jpg",
+            "http://[::]/pic.jpg",
+            "http://[::1]/pic.jpg",
+            "http://[fc00::1]/pic.jpg",
+            "http://[fe80::1]/pic.jpg",
+            "http://[fec0::1]/pic.jpg",
+            "http://[ff02::1]/pic.jpg",
+            "http://[2001:2::1]/pic.jpg",
+            "http://[2001:db8::1]/pic.jpg",
+            "http://[3fff::1]/pic.jpg",
+        ] {
+            assert!(
+                is_restricted_media_url(&Url::parse(value).unwrap()),
+                "{value}"
+            );
+        }
+
+        for value in [
+            "http://8.8.8.8/pic.jpg",
+            "http://1.1.1.1/pic.jpg",
+            "http://100.128.0.1/pic.jpg",
+            "http://192.0.0.9/pic.jpg",
+            "http://192.0.0.10/pic.jpg",
+            "http://198.20.0.1/pic.jpg",
+            "http://[2606:4700:4700::1111]/pic.jpg",
+            "http://[2001:2:1::1]/pic.jpg",
+            "http://[3fff:1000::1]/pic.jpg",
+            "http://[::ffff:8.8.8.8]/pic.jpg",
+            "http://[64:ff9b::808:808]/pic.jpg",
+            "http://[2002:808:808::]/pic.jpg",
+            "http://[::8.8.8.8]/pic.jpg",
+        ] {
+            assert!(
+                !is_restricted_media_url(&Url::parse(value).unwrap()),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_non_public_literal_before_initial_dispatch() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(250))
+            .redirect(reqwest::redirect::Policy::none())
+            .use_preconfigured_tls(crate::tls::rustls_config())
+            .build()
+            .unwrap();
+        let url = Url::parse("http://100.64.0.1/private.jpg").unwrap();
+
+        let fetched = fetch_media_bytes(&client, &url, false, MAX_MEDIA_BYTES).await;
+
+        assert!(matches!(fetched, Ok(None)));
+    }
+
+    #[test]
     fn loopback_page_mode_allows_only_individual_explicit_port_loopback_urls() {
         for allowed in [
             "http://127.0.0.1:8080/pic.jpg",
@@ -810,6 +913,31 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(302)
                     .insert_header("location", "http://127.0.0.1/private.jpg"),
+            )
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(250))
+            .redirect(reqwest::redirect::Policy::none())
+            .use_preconfigured_tls(crate::tls::rustls_config())
+            .build()
+            .unwrap();
+        let url = Url::parse(&format!("{}/redirect.jpg", server.uri())).unwrap();
+
+        let fetched = fetch_media_bytes(&client, &url, true, MAX_MEDIA_BYTES).await;
+
+        assert!(matches!(fetched, Ok(None)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_cgnat_redirect_before_second_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect.jpg"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "http://100.64.0.1/private.jpg"),
             )
             .mount(&server)
             .await;
