@@ -161,7 +161,12 @@ it cannot split the image attribute list.
 
 Unsupported HTML remains exact source-preserved raw passthrough only when the
 shared scanner classifies every tokenizer-decoded capability as reviewed and
-inert. The element allowlist is ordinary structural/phrasing HTML through
+inert. HTML-to-AsciiDoc conversion performs one authoritative scan before DOM
+rendering and reuses that successful scan for source-map construction. Any
+`ScanError` returns one visible listing of the complete unchanged input
+fragment; do not continue with an empty map, serialize an unmapped element, or
+rescan normalized fallback HTML as though it were trusted original source. The
+element allowlist is ordinary structural/phrasing HTML through
 tables; the only global attributes are `class`, `id`, `title`, `lang`, `dir`,
 `role`, and `aria-*`. Tag-specific attributes are limited to `a[href]`,
 `img[src,alt,width,height]`, `col`/`colgroup[span]`,
@@ -171,8 +176,12 @@ tables; the only global attributes are `class`, `id`, `title`, `lang`, `dir`,
 namespaced elements, and every unreviewed element or attribute fail closed to a
 visible listing. `href` and `src` decisions use the scanner's decoded value:
 hosted HTTP(S) absolute URLs and scheme-less references are safe; explicit
-non-HTTP(S) schemes and malformed absolute URLs are not. A `ScanError` also
-selects the untouched listing; never guess or serialize a safety DOM.
+non-HTTP(S) schemes and malformed absolute URLs are not. Unreviewed elements
+remain exact listings even in inline positions and nested within reviewed
+inline wrappers; both root and child accumulators must flush surrounding text
+and append such output as a block so listing delimiters stay at line boundaries.
+Plain-text collectors must reject unreviewed names rather than flattening away
+their tags or attributes. Never guess source ranges or serialize a safety DOM.
 
 Every generated block delimiter is chosen with one pass over `content.lines()`:
 inspect each line once, remember the longest line made only of the delimiter

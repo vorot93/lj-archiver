@@ -162,8 +162,12 @@ pub fn html_to_adoc(html: &str) -> String {
 }
 
 pub fn html_to_adoc_with_links(html: &str, link_rewriter: Option<&LinkRewriter>) -> String {
+    let scanned = match crate::html_scan::scan(html) {
+        Ok(scanned) => scanned,
+        Err(_) => return render_source_listing(html),
+    };
     let fragment = Html::parse_fragment(html);
-    let source_map = build_source_map(&fragment, html);
+    let source_map = build_source_map(&fragment, &scanned);
     let mut output = String::new();
     let mut inline_output = String::new();
     let mut plain_text = String::new();
@@ -203,13 +207,20 @@ pub fn html_to_adoc_with_links(html: &str, link_rewriter: Option<&LinkRewriter>)
                     );
 
                     let rendered = render_element(element, ctx);
-                    if is_top_level_inline(element) {
+                    if passthrough_element_name_is_safe(element.value().name())
+                        && is_top_level_inline(element)
+                    {
                         if let Some(text) = plain_text_inline_content(element) {
                             append_inline_fragment(&mut plain_text, &text);
                         } else {
                             flush_plain_text_run(&mut inline_output, &mut plain_text);
-                            neutralize_pending_plain_text_block_macro(&mut inline_output);
-                            append_inline_fragment(&mut inline_output, &rendered);
+                            if should_preserve_unwrapped_inline_output(&rendered) {
+                                flush_root_inline(&mut output, &mut inline_output, true);
+                                output.push_str(&rendered);
+                            } else {
+                                neutralize_pending_plain_text_block_macro(&mut inline_output);
+                                append_inline_fragment(&mut inline_output, &rendered);
+                            }
                         }
                     } else {
                         flush_plain_text_run(&mut inline_output, &mut plain_text);
@@ -282,6 +293,7 @@ fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => render_heading(element, name, ctx),
         "table" | "iframe" => render_passthrough(element, ctx),
         _ if is_block(name) => render_passthrough(element, ctx),
+        _ if !passthrough_element_name_is_safe(name) => render_passthrough(element, ctx),
         _ if !is_supported_inline(name) && has_block_or_passthrough_descendant(element) => {
             render_passthrough(element, ctx)
         }
@@ -341,7 +353,9 @@ fn render_inline_children_with_options(
                             &mut output,
                             &render_element(child_element, ctx.deeper()),
                         );
-                    } else if is_passthrough_block(child_element) {
+                    } else if !passthrough_element_name_is_safe(child_element.value().name())
+                        || is_passthrough_block(child_element)
+                    {
                         flush_plain_text_run(&mut output, &mut plain_text);
                         append_inline_block(&mut output, &render_passthrough(child_element, ctx));
                     } else if is_block_or_passthrough_boundary(child_element.value().name()) {
@@ -359,11 +373,13 @@ fn render_inline_children_with_options(
                         append_inline_fragment(&mut plain_text, &text);
                     } else {
                         flush_plain_text_run(&mut output, &mut plain_text);
-                        neutralize_pending_plain_text_block_macro(&mut output);
-                        append_inline_fragment(
-                            &mut output,
-                            &render_element(child_element, ctx.deeper()),
-                        );
+                        let rendered = render_element(child_element, ctx.deeper());
+                        if should_preserve_unwrapped_inline_output(&rendered) {
+                            append_inline_block(&mut output, &rendered);
+                        } else {
+                            neutralize_pending_plain_text_block_macro(&mut output);
+                            append_inline_fragment(&mut output, &rendered);
+                        }
                     }
                 }
             }
@@ -626,6 +642,7 @@ fn plain_text_inline_content_at(element: ElementRef<'_>, depth: usize) -> Option
     // instead of overflowing the stack on deeply nested inline wrappers.
     if depth >= MAX_RENDER_DEPTH
         || is_block_or_passthrough_boundary(element.value().name())
+        || !passthrough_element_name_is_safe(element.value().name())
         || !is_plain_text_inline_wrapper(element.value().name())
     {
         return None;
@@ -649,7 +666,9 @@ fn plain_text_inline_content_at(element: ElementRef<'_>, depth: usize) -> Option
 }
 
 fn is_plain_text_inline_wrapper(name: &str) -> bool {
-    is_known_inline(name) || (!is_supported_inline(name) && !is_block_or_passthrough_boundary(name))
+    passthrough_element_name_is_safe(name)
+        && (is_known_inline(name)
+            || (!is_supported_inline(name) && !is_block_or_passthrough_boundary(name)))
 }
 
 fn flush_root_inline(output: &mut String, inline_output: &mut String, before_block: bool) {
@@ -949,6 +968,19 @@ mod tests {
     }
 
     #[test]
+    fn original_scan_error_lists_complete_unchanged_source_once() {
+        let source = r#"<div CLASS='record' TITLE='original &amp; bytes'>x</div>"#;
+        crate::html_scan::force_next_scan_error();
+
+        let adoc = html_to_adoc(source);
+
+        assert_eq!(adoc, format!("----\n{source}\n----\n\n"));
+        assert_eq!(adoc.matches(source).count(), 1);
+        assert!(!adoc.contains("++++"));
+        assert!(!adoc.contains(r#"class="record""#));
+    }
+
+    #[test]
     fn comment_tags_do_not_shift_passthrough_source_spans() {
         let html = "<p><!-- <div>fake</div> -->intro</p><div>real</div>";
         assert_eq!(
@@ -981,7 +1013,10 @@ mod tests {
     fn tokenizer_valid_punctuation_in_tag_name_does_not_shift_real_div_source() {
         assert_eq!(
             html_to_adoc("<div!>fake</div!><div data-real='yes'>real</div>"),
-            "fake\n\n----\n<div data-real='yes'>real</div>\n----\n\n"
+            concat!(
+                "----\n<div!>fake</div!>\n----\n\n",
+                "----\n<div data-real='yes'>real</div>\n----\n\n",
+            )
         );
     }
 
@@ -1002,7 +1037,10 @@ mod tests {
     #[test]
     fn nul_in_tag_name_does_not_shift_following_real_div_source() {
         let input = "<div\0x>fake</div\0x><div data-real='yes'>real</div>";
-        let expected = "fake\n\n----\n<div data-real='yes'>real</div>\n----\n\n";
+        let expected = concat!(
+            "----\n<div\0x>fake</div\0x>\n----\n\n",
+            "----\n<div data-real='yes'>real</div>\n----\n\n",
+        );
         let adoc = html_to_adoc(input);
 
         assert_eq!(adoc, expected);
@@ -1141,11 +1179,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_top_level_font_html_as_text() {
-        let adoc = html_to_adoc(r#"<font color="red">text</font>"#);
+    fn renders_unreviewed_font_html_as_exact_listing() {
+        let source = r#"<font color="red">text</font>"#;
 
-        assert!(adoc.contains("text"));
-        assert!(!adoc.contains("++++"));
+        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
     }
 
     #[test]
@@ -1274,42 +1311,81 @@ mod tests {
     }
 
     #[test]
-    fn renders_top_level_plain_unknown_inline_html_as_text() {
-        let adoc = html_to_adoc("<foo>x</foo>");
+    fn renders_top_level_plain_unknown_inline_html_as_listing() {
+        let source = "<foo>x</foo>";
 
-        assert_eq!(adoc, "x");
-        assert!(!adoc.contains("++++"));
+        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
     }
 
     #[test]
-    fn renders_top_level_custom_embed_like_unknown_inline_as_text() {
-        let adoc = html_to_adoc("<lj-embed data-id='1'>x</lj-embed>");
+    fn renders_top_level_custom_embed_like_unknown_inline_as_listing() {
+        let source = "<lj-embed data-id='1'>x</lj-embed>";
 
-        assert_eq!(adoc, "x");
-        assert!(!adoc.contains("++++"));
+        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
     }
 
     #[test]
-    fn renders_attributed_unknown_inline_html_as_text() {
-        let adoc = html_to_adoc(r#"<foo data-x="1">x</foo>"#);
+    fn renders_attributed_unknown_inline_html_as_listing() {
+        let source = r#"<foo data-x="1">x</foo>"#;
 
-        assert_eq!(adoc, "x");
-        assert!(!adoc.contains("++++"));
+        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
     }
 
     #[test]
-    fn keeps_top_level_plain_unknown_inline_child_text_inline() {
-        assert_eq!(html_to_adoc("a<foo>b</foo>c"), "abc");
+    fn custom_inline_elements_are_exact_visible_listings_with_boundaries() {
+        for (source, expected) in [
+            ("<foo>x</foo>", "----\n<foo>x</foo>\n----\n\n"),
+            (
+                r#"before<foo data-x="1">inside</foo>after"#,
+                concat!(
+                    "before\n\n",
+                    "----\n<foo data-x=\"1\">inside</foo>\n----\n\n",
+                    "after\n\n",
+                ),
+            ),
+            (
+                r#"<p>before<lj-embed data-id="1">inside</lj-embed>after</p>"#,
+                concat!(
+                    "before\n\n",
+                    "----\n<lj-embed data-id=\"1\">inside</lj-embed>\n----\n\n",
+                    "after\n\n",
+                ),
+            ),
+            (
+                r#"before<span><foo data-x="1">inside</foo></span>after"#,
+                concat!(
+                    "before\n\n",
+                    "----\n<foo data-x=\"1\">inside</foo>\n----\n\n",
+                    "after\n\n",
+                ),
+            ),
+        ] {
+            assert_eq!(html_to_adoc(source), expected);
+        }
     }
 
     #[test]
-    fn keeps_top_level_attributed_unknown_inline_child_text_inline() {
-        assert_eq!(html_to_adoc("a<foo data-x='1'>b</foo>c"), "abc");
+    fn keeps_top_level_plain_unknown_inline_listing_block_separated() {
+        assert_eq!(
+            html_to_adoc("a<foo>b</foo>c"),
+            "a\n\n----\n<foo>b</foo>\n----\n\nc\n\n"
+        );
     }
 
     #[test]
-    fn keeps_top_level_custom_unknown_inline_child_text_inline() {
-        assert_eq!(html_to_adoc("a<lj-embed data-id='1'>b</lj-embed>c"), "abc");
+    fn keeps_top_level_attributed_unknown_inline_listing_block_separated() {
+        assert_eq!(
+            html_to_adoc("a<foo data-x='1'>b</foo>c"),
+            "a\n\n----\n<foo data-x='1'>b</foo>\n----\n\nc\n\n"
+        );
+    }
+
+    #[test]
+    fn keeps_top_level_custom_unknown_inline_listing_block_separated() {
+        assert_eq!(
+            html_to_adoc("a<lj-embed data-id='1'>b</lj-embed>c"),
+            "a\n\n----\n<lj-embed data-id='1'>b</lj-embed>\n----\n\nc\n\n"
+        );
     }
 
     #[test]
@@ -1349,15 +1425,14 @@ mod tests {
     }
 
     #[test]
-    fn keeps_unknown_inline_elements_as_text() {
+    fn keeps_unknown_inline_elements_as_exact_listings() {
         for html in [
             r#"<lj-embed data-id="1">x</lj-embed>"#,
             r#"<foo data-id="1">x</foo>"#,
         ] {
             let adoc = html_to_adoc(html);
 
-            assert_eq!(adoc, "x");
-            assert!(!adoc.contains("++++"));
+            assert_eq!(adoc, format!("----\n{html}\n----\n\n"));
         }
     }
 
@@ -1517,12 +1592,18 @@ mod tests {
     }
 
     #[test]
-    fn renders_custom_inline_embed_as_text_on_inline_boundaries() {
+    fn renders_custom_inline_embed_listing_on_block_boundaries() {
         let html = r#"<p>before<lj-embed data-id="1">x</lj-embed>after</p>"#;
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc, "beforexafter\n\n");
-        assert!(!adoc.contains("++++"));
+        assert_eq!(
+            adoc,
+            concat!(
+                "before\n\n",
+                "----\n<lj-embed data-id=\"1\">x</lj-embed>\n----\n\n",
+                "after\n\n",
+            )
+        );
     }
 
     #[test]
@@ -3267,6 +3348,42 @@ mod tests {
                 .next()
                 .is_some()
         );
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn custom_inline_capability_converts_inert_visible_and_block_separated() {
+        let source = concat!(
+            "before",
+            r#"<lj-embed data-id="1" onclick="alert(1)">inside</lj-embed>"#,
+            "after",
+        );
+        let adoc = html_to_adoc(source);
+
+        assert_eq!(
+            adoc,
+            concat!(
+                "before\n\n",
+                "----\n",
+                r#"<lj-embed data-id="1" onclick="alert(1)">inside</lj-embed>"#,
+                "\n----\n\n",
+                "after\n\n",
+            )
+        );
+
+        let html = convert_with_asciidoctor(&adoc);
+        let document = Html::parse_document(&html);
+        assert!(
+            document
+                .select(&Selector::parse("[onclick], lj-embed").unwrap())
+                .next()
+                .is_none(),
+            "got: {html}"
+        );
+        let visible = document.root_element().text().collect::<String>();
+        for text in ["before", "lj-embed", "onclick", "inside", "after"] {
+            assert!(visible.contains(text), "missing {text:?} in: {html}");
+        }
     }
 
     #[test]

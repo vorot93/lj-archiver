@@ -195,7 +195,22 @@ fn raw_data_result(name: &str) -> TokenSinkResult<()> {
 }
 
 pub(crate) fn scan(source: &str) -> Result<ScannedHtml, ScanError> {
+    #[cfg(test)]
+    if FORCE_NEXT_SCAN_ERROR.with(std::cell::Cell::take) {
+        return Err(alignment_error(0, "forced scanner failure for test"));
+    }
+
     scan_impl(source, None)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FORCE_NEXT_SCAN_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_next_scan_error() {
+    FORCE_NEXT_SCAN_ERROR.with(|forced| forced.set(true));
 }
 
 #[cfg(test)]

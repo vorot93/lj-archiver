@@ -113,7 +113,7 @@ fn passthrough_is_safe(source_html: &str) -> bool {
     })
 }
 
-fn render_source_listing(content: &str) -> String {
+pub(super) fn render_source_listing(content: &str) -> String {
     let delimiter = safe_block_delimiter(content, '-');
 
     format!("{delimiter}\n{content}\n{delimiter}\n\n")
@@ -141,6 +141,10 @@ fn passthrough_attribute_is_safe(tag: &str, attribute: &str, qualified: bool) ->
             "time" | "del" | "ins" => attribute == "datetime",
             _ => false,
         }
+}
+
+pub(super) fn passthrough_element_name_is_safe(name: &str) -> bool {
+    SAFE_ELEMENTS.contains(&name)
 }
 
 fn has_safe_passthrough_url(value: &str) -> bool {
@@ -235,8 +239,10 @@ fn source_preserving_html<'a>(element: ElementRef<'_>, ctx: RenderCtx<'a>) -> Co
 /// open, so it gets no entry and falls back to `source_preserving_html`'s
 /// `element.html()`, trading a raw `<div/>` for a normalized
 /// `<div>...</div>` rather than silently dropping the nested content.
-pub(crate) fn build_source_map(document: &Html, source_html: &str) -> SourceMap {
-    let scanned = crate::html_scan::scan(source_html).ok();
+pub(crate) fn build_source_map(
+    document: &Html,
+    scanned: &crate::html_scan::ScannedHtml,
+) -> SourceMap {
     let mut counters: HashMap<String, usize> = HashMap::new();
     let mut source_map = HashMap::new();
 
@@ -248,10 +254,7 @@ pub(crate) fn build_source_map(document: &Html, source_html: &str) -> SourceMap 
         let name = element.value().name().to_ascii_lowercase();
         let ordinal = *counters.get(&name).unwrap_or(&0);
 
-        if let Some(span) = scanned
-            .as_ref()
-            .and_then(|html| html.element_spans(&name).get(ordinal))
-        {
+        if let Some(span) = scanned.element_spans(&name).get(ordinal) {
             source_map.insert(element.id(), span.clone());
         }
 
