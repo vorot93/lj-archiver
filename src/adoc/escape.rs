@@ -36,16 +36,20 @@ pub(crate) fn neutralize_active_adoc_lines(text: &str) -> String {
     for line in text.split_inclusive('\n') {
         let line_without_newline = line.trim_end_matches('\n');
         let trimmed = line_without_newline.trim_start();
+        let neutralized_description_markers = neutralize_description_list_markers(trimmed);
 
-        if let Some(marker) = description_list_marker_position(trimmed) {
-            let leading_len = line_without_newline.len() - trimmed.len();
-            let marker = leading_len + marker;
-            output.push_str(&line[..marker + 1]);
-            output.push_str("pass:[:]");
-            output.push_str(&line[marker + 2..]);
-        } else if starts_with_active_adoc_syntax(line_without_newline) {
+        if starts_with_active_adoc_syntax(line_without_newline)
+            && (neutralized_description_markers.is_none()
+                || starts_with_non_description_active_adoc_syntax(line_without_newline))
+        {
             output.push('\\');
-            output.push_str(line);
+        }
+
+        if let Some(neutralized_description_markers) = neutralized_description_markers {
+            let leading_len = line_without_newline.len() - trimmed.len();
+            output.push_str(&line[..leading_len]);
+            output.push_str(&neutralized_description_markers);
+            output.push_str(&line[line_without_newline.len()..]);
         } else {
             output.push_str(line);
         }
@@ -321,6 +325,11 @@ fn neutralize_inline_passthrough_delimiters(text: &str) -> String {
 }
 
 fn starts_with_active_adoc_syntax(text: &str) -> bool {
+    starts_with_non_description_active_adoc_syntax(text)
+        || starts_with_description_list_marker(text.trim_start())
+}
+
+fn starts_with_non_description_active_adoc_syntax(text: &str) -> bool {
     let trimmed = text.trim_start();
 
     starts_with_block_macro(trimmed)
@@ -330,7 +339,6 @@ fn starts_with_active_adoc_syntax(text: &str) -> bool {
         || starts_with_admonition_label(trimmed)
         || starts_with_line_comment(trimmed)
         || starts_with_hyphen_list_marker(trimmed)
-        || starts_with_description_list_marker(trimmed)
         || is_active_delimiter_only(trimmed)
 }
 
@@ -410,10 +418,6 @@ fn starts_with_description_list_marker(text: &str) -> bool {
 }
 
 fn description_list_marker_position(text: &str) -> Option<usize> {
-    if text.starts_with('\\') {
-        return None;
-    }
-
     let bytes = text.as_bytes();
     let mut has_term = false;
     let mut cursor = 0;
@@ -430,6 +434,38 @@ fn description_list_marker_position(text: &str) -> Option<usize> {
     }
 
     None
+}
+
+fn neutralize_description_list_markers(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut output = String::new();
+    let mut has_term = false;
+    let mut cursor = 0;
+    let mut copied_until = 0;
+    let mut changed = false;
+
+    while cursor < bytes.len() {
+        if bytes.get(cursor..cursor + 2) == Some(b"::")
+            && has_term
+            && bytes.get(cursor + 2).is_none_or(u8::is_ascii_whitespace)
+        {
+            output.push_str(&text[copied_until..cursor + 1]);
+            output.push_str("pass:[:]");
+            copied_until = cursor + 2;
+            changed = true;
+            cursor += 2;
+            continue;
+        }
+        has_term |= !bytes[cursor].is_ascii_whitespace();
+        cursor += 1;
+    }
+
+    if changed {
+        output.push_str(&text[copied_until..]);
+        Some(output)
+    } else {
+        None
+    }
 }
 
 fn is_delimiter_only(text: &str, delimiter: char) -> bool {
@@ -570,7 +606,7 @@ fn is_adoc_macro_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
-pub(crate) fn neutralize_pending_plain_text_block_macro(output: &mut String) {
+pub(crate) fn neutralize_pending_plain_text_before_generated_inline(output: &mut String) {
     if output.is_empty() {
         return;
     }
@@ -581,6 +617,11 @@ pub(crate) fn neutralize_pending_plain_text_block_macro(output: &mut String) {
     if let Some(prefix) = line.strip_suffix(":pass:[:]") {
         let prefix = prefix.to_string();
         if is_block_macro_prefix(&prefix) {
+            // This call site is only reached immediately before appending a
+            // renderer-generated inline fragment. That fragment makes `::`
+            // ineligible as a description-list delimiter; preserve the
+            // existing escaped macro-prefix output without applying this to
+            // user text before a line break.
             output.truncate(line_start);
             output.push('\\');
             output.push_str(&prefix);

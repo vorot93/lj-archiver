@@ -218,7 +218,9 @@ pub fn html_to_adoc_with_links(html: &str, link_rewriter: Option<&LinkRewriter>)
                                 flush_root_inline(&mut output, &mut inline_output, true);
                                 output.push_str(&rendered);
                             } else {
-                                neutralize_pending_plain_text_block_macro(&mut inline_output);
+                                neutralize_pending_plain_text_before_generated_inline(
+                                    &mut inline_output,
+                                );
                                 append_inline_fragment(&mut inline_output, &rendered);
                             }
                         }
@@ -387,7 +389,7 @@ fn render_inline_children_with_options(
                         if should_preserve_unwrapped_inline_output(&rendered) {
                             append_inline_block(&mut output, &rendered);
                         } else {
-                            neutralize_pending_plain_text_block_macro(&mut output);
+                            neutralize_pending_plain_text_before_generated_inline(&mut output);
                             append_inline_fragment(&mut output, &rendered);
                         }
                     }
@@ -768,7 +770,6 @@ fn flush_pending_line_breaks(
         // content still lands at a line start, so block-macro neutralization
         // (which keys off the same line-start condition) is unaffected.
         if !output.is_empty() && !output.ends_with('\n') {
-            neutralize_pending_plain_text_block_macro(output);
             append_inline_fragment(output, " +\n");
         }
     } else {
@@ -2127,6 +2128,60 @@ mod tests {
     }
 
     #[test]
+    fn composes_line_start_neutralization_with_description_delimiter_encoding() {
+        for (html, expected) in [
+            (
+                "<p>// term:: definition</p>",
+                "\\// term:pass:[:] definition\n\n",
+            ),
+            (
+                "<p>- term:: definition</p>",
+                "\\- term:pass:[:] definition\n\n",
+            ),
+            (
+                "<p>include::[x] term:: definition</p>",
+                "\\include::[x] term:pass:[:] definition\n\n",
+            ),
+            (
+                r"<p>\term:: definition</p>",
+                "\\term:pass:[:] definition\n\n",
+            ),
+            (
+                "<p>term:: first :: definition</p>",
+                "term:pass:[:] first :pass:[:] definition\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html:?}");
+        }
+
+        assert_eq!(
+            neutralize_plain_adoc_fragment_at_line_start("ordinary term:: definition", false),
+            "ordinary term:: definition"
+        );
+    }
+
+    #[test]
+    fn keeps_pending_plain_text_description_delimiters_encoded_before_hard_breaks() {
+        assert_eq!(
+            html_to_adoc("<p>include::<br>later</p>"),
+            "include:pass:[:] +\nlater\n\n"
+        );
+    }
+
+    #[test]
+    fn description_delimiter_neutralization_is_idempotent() {
+        for input in [
+            "// term:: definition",
+            "- term:: definition",
+            r"\term:: definition",
+            "term:: first :: definition",
+        ] {
+            let escaped = neutralize_active_adoc_lines(input);
+            assert_eq!(neutralize_active_adoc_lines(&escaped), escaped, "{input:?}");
+        }
+    }
+
+    #[test]
     fn neutralizes_plain_text_admonition_label() {
         let adoc = html_to_adoc("<p>NOTE: text</p>");
 
@@ -3141,19 +3196,58 @@ mod tests {
 
         let html = convert_with_asciidoctor(&adoc);
         let document = Html::parse_document(&html);
-        let visible_text = document.root_element().text().collect::<String>();
+        let paragraphs = document
+            .select(&Selector::parse("div.paragraph > p").unwrap())
+            .map(|paragraph| paragraph.text().collect::<String>())
+            .collect::<Vec<_>>();
 
-        for visible in [
-            "// visible comment",
-            "- visible item",
-            "term:: visible definition",
-            "term::",
-        ] {
-            assert!(
-                visible_text.contains(visible),
-                "missing {visible:?} in: {html}"
-            );
-        }
+        assert_eq!(
+            paragraphs,
+            [
+                r"\// visible comment",
+                r"\- visible item",
+                "term:: visible definition",
+                "term::",
+            ],
+            "got: {html}"
+        );
+        assert!(
+            document
+                .select(&Selector::parse(".ulist, .dlist").unwrap())
+                .next()
+                .is_none(),
+            "unexpected list in: {html}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn composed_line_start_neutralization_converts_to_distinct_literal_paragraphs() {
+        let adoc = [
+            html_to_adoc("<p>// term:: definition</p>"),
+            html_to_adoc("<p>- term:: definition</p>"),
+            html_to_adoc(r"<p>\term:: definition</p>"),
+            html_to_adoc("<p>include::<br>later</p>"),
+        ]
+        .concat();
+
+        let html = convert_with_asciidoctor(&adoc);
+        let document = Html::parse_document(&html);
+        let paragraphs = document
+            .select(&Selector::parse("div.paragraph > p").unwrap())
+            .map(|paragraph| paragraph.text().collect::<String>())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paragraphs,
+            [
+                r"\// term:: definition",
+                r"\- term:: definition",
+                r"\term:: definition",
+                "include::\nlater",
+            ],
+            "got: {html}"
+        );
         assert!(
             document
                 .select(&Selector::parse(".ulist, .dlist").unwrap())
