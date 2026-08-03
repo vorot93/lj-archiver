@@ -252,9 +252,11 @@ summary counters describe current-run work only, so merely retained posts are
 not counted as archived or skipped. Current post and discovery-page failures
 remain explicit even when the validated snapshot keeps the manifests intact.
 
-After the final post set is known, retained and resume-skipped files may have
-recorded cross-references upgraded from their trusted metadata. Ordinary
-cross-references and linked-image click targets are retargeted to each
+After the final post set is known, discovered posts skipped by `--resume` may
+have recorded cross-references upgraded from their trusted metadata. Posts
+retained only because partial rediscovery omitted them or their current refetch
+failed are not visited for an upgrade during that run. For eligible skips,
+ordinary cross-references and linked-image click targets are retargeted to each
 surviving post's exact validated filename; targets absent from the final set
 revert to canonical external journal post URLs. Missing or invalid metadata,
 or a failed upgrade, preserves the existing post unchanged and prints a
@@ -296,11 +298,11 @@ response bodies a couple of times. Partial body bytes from a failed attempt are
 discarded before retrying. Unusable media responses are not turned into broken
 local paths; the post retains the resolved absolute remote target instead.
 
-With `--resume` during full journal archives, validated existing post files are
-not refetched. After the final post set is known, cross-references recorded in
-valid implementation metadata may be upgraded with a controlled rewrite; if no
-upgrade is needed, or the metadata cannot be trusted, their bytes stay
-unchanged.
+With `--resume` during full journal archives, discovered posts already present
+in the validated snapshot are not refetched. Those resume-skipped posts are
+eligible for recorded cross-references to be upgraded with a controlled rewrite
+after the final post set is known; if no upgrade is needed, or the metadata
+cannot be trusted, their bytes stay unchanged.
 
 ## Current Limits
 
