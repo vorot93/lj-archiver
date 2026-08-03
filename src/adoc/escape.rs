@@ -222,6 +222,47 @@ fn neutralize_inline_macros(text: &str) -> String {
     neutralize_inline_macros_scanned(text, &mut scan_steps)
 }
 
+pub(crate) fn strip_obsolete_rendered_macro_protection(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut scan_steps = MacroScanSteps::default();
+    let bracket_before_whitespace = bracket_before_whitespace(bytes, &mut scan_steps);
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            let macro_start = cursor + 1;
+
+            if bytes.get(macro_start).is_some_and(u8::is_ascii_alphabetic) {
+                let name_end = inline_macro_name_end(bytes, macro_start, &mut scan_steps);
+                let is_macro = is_inline_macro_token_boundary(bytes, cursor)
+                    && is_inline_macro_at(bytes, macro_start, name_end, &bracket_before_whitespace);
+                let is_passthrough = is_inline_passthrough_token_boundary(bytes, cursor)
+                    && text[macro_start..].starts_with("pass:")
+                    && starts_inline_passthrough_macro(text, macro_start);
+
+                if is_macro || is_passthrough {
+                    // Authored literal backslashes are rendered as `&#92;`.
+                    // A raw slash guarding a recognized rendered macro is
+                    // obsolete once xref-label normalization removes its
+                    // bracket delimiters and makes the macro inert.
+                    cursor += 1;
+                    continue;
+                }
+            }
+        }
+
+        let character = text[cursor..]
+            .chars()
+            .next()
+            .expect("cursor should remain on a character boundary");
+        output.push(character);
+        cursor += character.len_utf8();
+    }
+
+    output
+}
+
 #[cfg(test)]
 fn neutralize_inline_macros_with_scan_steps(text: &str) -> (String, usize) {
     let mut scan_steps = MacroScanSteps::default();
@@ -377,11 +418,8 @@ fn neutralize_inline_passthrough_macros(text: &str) -> String {
 fn starts_inline_passthrough_macro(text: &str, start: usize) -> bool {
     let bytes = text.as_bytes();
 
-    if start > 0 {
-        let previous = bytes[start - 1];
-        if previous.is_ascii_alphanumeric() || matches!(previous, b'_' | b'-') {
-            return false;
-        }
+    if !is_inline_passthrough_token_boundary(bytes, start) {
+        return false;
     }
 
     let mut cursor = start + "pass:".len();
@@ -396,6 +434,11 @@ fn starts_inline_passthrough_macro(text: &str, start: usize) -> bool {
     }
 
     cursor > qualifier_start && bytes.get(cursor) == Some(&b'[')
+}
+
+fn is_inline_passthrough_token_boundary(bytes: &[u8], start: usize) -> bool {
+    start == 0
+        || !bytes[start - 1].is_ascii_alphanumeric() && !matches!(bytes[start - 1], b'_' | b'-')
 }
 
 fn is_inline_passthrough_qualifier_byte(byte: u8) -> bool {

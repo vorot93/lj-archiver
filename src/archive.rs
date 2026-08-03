@@ -938,21 +938,58 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().join("archive");
         let archive = Archive::new(&root, "news");
-        let post_path = archive.write_post(1, "= \\{secret}\n\nBody\n").unwrap();
-        let authored = ArchivedPost {
-            id: 1,
-            title: ArchivedTitle::authored("{secret}"),
-            path: post_path.clone(),
-        };
-        archive.write_index(&[authored]).unwrap();
-        let first_index = fs::read(root.join("index.adoc")).unwrap();
-        let first_post = fs::read(&post_path).unwrap();
+        let authored = [
+            (1, "image:evil.png[]", "= \\image:evil.png[]\n\nBody\n"),
+            (
+                2,
+                "A | bracketed [title]",
+                "= A | bracketed [title]\n\nBody\n",
+            ),
+            (3, "One, two", "= One, two\n\nBody\n"),
+            (4, "{secret}", "= \\{secret}\n\nBody\n"),
+            (5, r"First\", "= First&#92;\n\nBody\n"),
+            (6, "Adjacent", "= Adjacent\n\nBody\n"),
+        ]
+        .map(|(id, title, contents)| ArchivedPost {
+            id,
+            title: ArchivedTitle::authored(title),
+            path: archive.write_post(id, contents).unwrap(),
+        });
+        let first_posts = authored
+            .iter()
+            .map(|post| fs::read(&post.path).unwrap())
+            .collect::<Vec<_>>();
+        archive.write_index(&authored).unwrap();
+        let first_index = fs::read_to_string(root.join("index.adoc")).unwrap();
+        assert_eq!(
+            first_index,
+            concat!(
+                "= news Archive\n\n|===\n|Post ID |Title\n\n",
+                "|1 |xref:posts/1.adoc[image:evil.png]\n",
+                "|2 |xref:posts/2.adoc[A bracketed title]\n",
+                "|3 |xref:posts/3.adoc[One&#44; two]\n",
+                "|4 |xref:posts/4.adoc[\\{secret}]\n",
+                "|5 |xref:posts/5.adoc[First&#92;]\n",
+                "|6 |xref:posts/6.adoc[Adjacent]\n",
+                "|===\n",
+            )
+        );
 
         let inspected = archive.inspect_existing().unwrap().unwrap();
         archive.write_index(&inspected.posts).unwrap();
 
-        assert_eq!(fs::read(root.join("index.adoc")).unwrap(), first_index);
-        assert_eq!(fs::read(post_path).unwrap(), first_post);
+        assert_eq!(
+            fs::read_to_string(root.join("index.adoc")).unwrap(),
+            first_index
+        );
+        assert_eq!(
+            inspected
+                .posts
+                .iter()
+                .map(|post| fs::read(&post.path).unwrap())
+                .collect::<Vec<_>>(),
+            first_posts
+        );
     }
 
     #[test]

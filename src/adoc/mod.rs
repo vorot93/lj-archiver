@@ -157,7 +157,8 @@ pub(crate) fn sanitize_authored_xref_label(value: &str) -> String {
 }
 
 pub(crate) fn sanitize_rendered_xref_label(value: &str) -> String {
-    sanitize_rendered_macro_label(&normalize_xref_label(value))
+    let value = strip_obsolete_rendered_macro_protection(value);
+    sanitize_rendered_macro_label(&normalize_xref_label(&value))
 }
 
 fn escape_attribute_value(value: &str) -> String {
@@ -3472,6 +3473,30 @@ mod tests {
     }
 
     #[test]
+    fn rendered_xref_labels_strip_only_guards_the_renderer_could_generate() {
+        assert_eq!(
+            sanitize_rendered_xref_label(r"\image:evil.png[] \pass:[safe]"),
+            "image:evil.png pass: safe"
+        );
+        assert_eq!(
+            sanitize_rendered_xref_label(r"\evil:[literal]"),
+            r"\evil: literal"
+        );
+        assert_eq!(
+            sanitize_rendered_xref_label(r"x\image:foo[]"),
+            r"x\image:foo"
+        );
+        assert_eq!(
+            sanitize_rendered_xref_label(r"x.\pass:[safe]"),
+            "x.pass: safe"
+        );
+        assert_eq!(
+            sanitize_rendered_xref_label(r"x-\pass:[safe]"),
+            r"x-\pass: safe"
+        );
+    }
+
+    #[test]
     fn encodes_terminal_backslashes_in_authored_heading_and_attribute_lines() {
         let mut post = test_post_with_comments(vec![]);
         post.title = "Post \\".to_string();
@@ -3852,28 +3877,24 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let archive = crate::archive::Archive::new(dir.path(), "news");
-        let secret_path = archive.write_post(1, "= \\{secret}\n\nBody\n").unwrap();
-        let first_path = archive.write_post(2, "= First&#92;\n").unwrap();
-        let second_path = archive.write_post(3, "= Second\n").unwrap();
-        archive
-            .write_index(&[
-                crate::models::ArchivedPost {
-                    id: 1,
-                    title: crate::models::ArchivedTitle::authored("{secret}"),
-                    path: secret_path,
-                },
-                crate::models::ArchivedPost {
-                    id: 2,
-                    title: crate::models::ArchivedTitle::authored(r"First\"),
-                    path: first_path,
-                },
-                crate::models::ArchivedPost {
-                    id: 3,
-                    title: crate::models::ArchivedTitle::authored("Second"),
-                    path: second_path,
-                },
-            ])
-            .unwrap();
+        let authored = [
+            (1, "image:evil.png[]", "= \\image:evil.png[]\n\nBody\n"),
+            (
+                2,
+                "A | bracketed [title]",
+                "= A | bracketed [title]\n\nBody\n",
+            ),
+            (3, "One, two", "= One, two\n\nBody\n"),
+            (4, "{secret}", "= \\{secret}\n\nBody\n"),
+            (5, r"First\", "= First&#92;\n\nBody\n"),
+            (6, "Adjacent", "= Adjacent\n\nBody\n"),
+        ]
+        .map(|(id, title, contents)| crate::models::ArchivedPost {
+            id,
+            title: crate::models::ArchivedTitle::authored(title),
+            path: archive.write_post(id, contents).unwrap(),
+        });
+        archive.write_index(&authored).unwrap();
         let first_index = fs::read_to_string(dir.path().join("index.adoc")).unwrap();
 
         let inspected = archive.inspect_existing().unwrap().unwrap();
@@ -3883,24 +3904,27 @@ mod tests {
         for index in [&first_index, &second_index] {
             let index_html = convert_with_asciidoctor(index);
             let index_document = Html::parse_document(&index_html);
-            let index_hrefs = index_document
+            let index_links = index_document
                 .select(&Selector::parse("a[href]").unwrap())
-                .filter_map(|anchor| anchor.attr("href"))
+                .map(|anchor| {
+                    format!(
+                        "{}|{}",
+                        anchor.attr("href").unwrap(),
+                        anchor.text().collect::<String>()
+                    )
+                })
                 .collect::<Vec<_>>();
             assert_eq!(
-                index_hrefs,
-                ["posts/1.html", "posts/2.html", "posts/3.html"],
+                index_links,
+                [
+                    "posts/1.html|image:evil.png",
+                    "posts/2.html|A bracketed title",
+                    "posts/3.html|One, two",
+                    "posts/4.html|{secret}",
+                    r"posts/5.html|First\",
+                    "posts/6.html|Adjacent",
+                ],
                 "one index label absorbed the next row: {index_html}"
-            );
-            let visible = index_document.root_element().text().collect::<String>();
-            assert!(visible.contains("{secret}"), "missing secret: {index_html}");
-            assert!(
-                !visible.contains(r"\{secret}"),
-                "retained index title exposed a protection slash: {index_html}"
-            );
-            assert!(
-                visible.contains(r"First\"),
-                "authored index backslash was not visible: {index_html}"
             );
         }
     }
