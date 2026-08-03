@@ -252,47 +252,149 @@ fn resolve_pending_links_with_scan_stats(
     (resolved, stats)
 }
 
-pub(crate) fn restore_missing_xrefs(
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RetainedLinkScanStats {
+    candidates: usize,
+    cursor_advanced_bytes: usize,
+    accounted_input_bytes: usize,
+    copied_input_bytes: usize,
+    candidate_input_bytes: usize,
+    revisited_input_bytes: usize,
+    skipped_input_bytes: usize,
+    accounted_through: usize,
+    work_units: usize,
+}
+
+impl RetainedLinkScanStats {
+    fn account_input_range(&mut self, start: usize, end: usize, candidate: bool) {
+        if start < self.accounted_through {
+            self.revisited_input_bytes += end.min(self.accounted_through) - start;
+        } else if start > self.accounted_through {
+            self.skipped_input_bytes += start - self.accounted_through;
+        }
+
+        let bytes = end - start;
+        self.accounted_input_bytes += bytes;
+        if candidate {
+            self.candidate_input_bytes += bytes;
+        } else {
+            self.copied_input_bytes += bytes;
+        }
+        self.accounted_through = self.accounted_through.max(end);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RetainedLinkContext {
+    XrefMacro,
+    ImageLinkAttribute,
+}
+
+pub(crate) fn repair_retained_links(
     text: &str,
     journal: &str,
-    final_ids: &HashSet<u64>,
+    final_targets: &HashMap<u64, String>,
 ) -> Result<String> {
-    const PREFIX: &str = "xref:";
-    const SUFFIX: &str = ".adoc[";
+    repair_retained_links_with_scan_stats(text, journal, final_targets).map(|(text, _)| text)
+}
 
+fn repair_retained_links_with_scan_stats(
+    text: &str,
+    journal: &str,
+    final_targets: &HashMap<u64, String>,
+) -> Result<(String, RetainedLinkScanStats)> {
+    const XREF_PREFIX: &str = "xref:";
+    const IMAGE_LINK_PREFIX: &str = "link={lj-archiver-post-link-prefix}";
+    const XREF_SUFFIX: &str = ".adoc[";
+    const IMAGE_LINK_SUFFIX: &str = ".adoc]";
+
+    let bytes = text.as_bytes();
     let mut output = String::with_capacity(text.len());
+    let mut stats = RetainedLinkScanStats::default();
+    let mut copied_through = 0;
     let mut cursor = 0;
 
-    while let Some(relative_start) = text[cursor..].find(PREFIX) {
-        let start = cursor + relative_start;
-        let id_start = start + PREFIX.len();
-        let id_end = text[id_start..]
-            .bytes()
-            .take_while(u8::is_ascii_digit)
-            .count()
-            + id_start;
-
-        let id = text[id_start..id_end].parse::<u64>().ok();
-        let is_active = start == 0 || text.as_bytes()[start - 1] != b'\\';
-        let is_post_xref = id_end > id_start && text[id_end..].starts_with(SUFFIX);
-
-        if is_active
-            && is_post_xref
-            && let Some(id) = id
-            && id > 0
-            && !final_ids.contains(&id)
-        {
-            output.push_str(&text[cursor..start]);
-            output.push_str(&sanitize_macro_target(post_url(journal, id)?.as_str()));
-            cursor = id_end + ".adoc".len();
+    while cursor < bytes.len() {
+        let candidate = if bytes[cursor..].starts_with(XREF_PREFIX.as_bytes()) {
+            Some((RetainedLinkContext::XrefMacro, XREF_PREFIX.len()))
+        } else if bytes[cursor..].starts_with(IMAGE_LINK_PREFIX.as_bytes()) {
+            Some((
+                RetainedLinkContext::ImageLinkAttribute,
+                IMAGE_LINK_PREFIX.len(),
+            ))
         } else {
-            output.push_str(&text[cursor..id_start]);
-            cursor = id_start;
+            None
+        };
+
+        let Some((context, prefix_len)) = candidate else {
+            cursor += 1;
+            stats.cursor_advanced_bytes += 1;
+            stats.work_units += 1;
+            continue;
+        };
+
+        if cursor > 0 && bytes[cursor - 1] == b'\\' {
+            cursor += prefix_len;
+            stats.cursor_advanced_bytes += prefix_len;
+            stats.work_units += prefix_len;
+            continue;
         }
+
+        let id_start = cursor + prefix_len;
+        let id_len = bytes[id_start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let id_end = id_start + id_len;
+        stats.work_units += id_len;
+
+        let suffix = match context {
+            RetainedLinkContext::XrefMacro => XREF_SUFFIX,
+            RetainedLinkContext::ImageLinkAttribute => IMAGE_LINK_SUFFIX,
+        };
+        let id = text[id_start..id_end]
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .filter(|_| bytes[id_end..].starts_with(suffix.as_bytes()));
+        let Some(id) = id else {
+            let advanced = id_end - cursor;
+            cursor = id_end;
+            stats.cursor_advanced_bytes += advanced;
+            stats.work_units += advanced;
+            continue;
+        };
+        let target_end = id_end + ".adoc".len();
+
+        output.push_str(&text[copied_through..cursor]);
+        stats.account_input_range(copied_through, cursor, false);
+        match context {
+            RetainedLinkContext::XrefMacro => match final_targets.get(&id) {
+                Some(filename) => output.push_str(&format!("xref:{filename}")),
+                None => output.push_str(&sanitize_macro_target(post_url(journal, id)?.as_str())),
+            },
+            RetainedLinkContext::ImageLinkAttribute => match final_targets.get(&id) {
+                Some(filename) => {
+                    output.push_str(&format!("link={POST_LINK_PREFIX_REFERENCE}{filename}"))
+                }
+                None => output.push_str(&format!(
+                    "link={}",
+                    sanitize_macro_target(post_url(journal, id)?.as_str())
+                )),
+            },
+        }
+        stats.account_input_range(cursor, target_end, true);
+        stats.candidates += 1;
+        let advanced = target_end - cursor;
+        cursor = target_end;
+        copied_through = target_end;
+        stats.cursor_advanced_bytes += advanced;
+        stats.work_units += advanced;
     }
 
-    output.push_str(&text[cursor..]);
-    Ok(output)
+    output.push_str(&text[copied_through..]);
+    stats.account_input_range(copied_through, text.len(), false);
+    Ok((output, stats))
 }
 
 #[cfg(test)]
@@ -819,29 +921,99 @@ mod tests {
     }
 
     #[test]
-    fn restores_missing_resume_xrefs() {
-        let final_ids = HashSet::from([3u64]);
+    fn retained_repair_externalizes_missing_xrefs() {
+        let final_targets = HashMap::from([(3u64, "3.adoc".to_string())]);
 
         assert_eq!(
-            restore_missing_xrefs(
+            repair_retained_links(
                 "xref:2.adoc[Two] and xref:3.adoc[Three]",
                 "news",
-                &final_ids,
+                &final_targets,
             )
             .unwrap(),
             "https://news.livejournal.com/2.html[Two] and xref:3.adoc[Three]"
         );
     }
+
     #[test]
-    fn restore_missing_xrefs_parses_numeric_aliases_by_id() {
+    fn retained_repair_parses_numeric_aliases_by_id() {
         assert_eq!(
-            restore_missing_xrefs(
+            repair_retained_links(
                 "xref:01.adoc[One] and xref:002.adoc[Two]",
                 "news",
-                &HashSet::from([1]),
+                &HashMap::from([(1, "01.adoc".to_string())]),
             )
             .unwrap(),
             "xref:01.adoc[One] and https://news.livejournal.com/2.html[Two]"
         );
+    }
+
+    #[test]
+    fn retained_repair_retargets_aliases_and_externalizes_absent_ids() {
+        let targets = HashMap::from([(1, "01.adoc".to_string())]);
+        let input = concat!(
+            "xref:1.adoc[One] xref:01.adoc[Alias] xref:2.adoc[Two] ",
+            "image:x.jpg[,link={lj-archiver-post-link-prefix}1.adoc] ",
+            "image:y.jpg[,link={lj-archiver-post-link-prefix}2.adoc]",
+        );
+
+        assert_eq!(
+            repair_retained_links(input, "news", &targets).unwrap(),
+            concat!(
+                "xref:01.adoc[One] xref:01.adoc[Alias] ",
+                "https://news.livejournal.com/2.html[Two] ",
+                "image:x.jpg[,link={lj-archiver-post-link-prefix}01.adoc] ",
+                "image:y.jpg[,link=https://news.livejournal.com/2.html]",
+            )
+        );
+    }
+
+    #[test]
+    fn retained_repair_ignores_escaped_and_malformed_lookalikes() {
+        let input = concat!(
+            r"\xref:1.adoc[escaped] xref:x.adoc[text] ",
+            r"\link={lj-archiver-post-link-prefix}1.adoc] ",
+            "{lj-archiver-post-link-prefix}1.adoc",
+        );
+        let targets = HashMap::from([(1, "01.adoc".to_string())]);
+
+        assert_eq!(
+            repair_retained_links(input, "news", &targets).unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn retained_repair_accounts_for_fifty_thousand_candidates_monotonically() {
+        const CANDIDATE_COUNT: u64 = 50_000;
+
+        let mut input = String::from("start:");
+        let mut targets = HashMap::with_capacity(CANDIDATE_COUNT as usize / 2);
+        for id in 1..=CANDIDATE_COUNT {
+            if id % 2 == 0 {
+                targets.insert(id, format!("{id:06}.adoc"));
+            }
+            if id % 4 < 2 {
+                input.push_str(&format!("xref:{id}.adoc[label]|"));
+            } else {
+                input.push_str(&format!(
+                    "image:x[,link={POST_LINK_PREFIX_REFERENCE}{id}.adoc]|"
+                ));
+            }
+        }
+        input.push_str(":end");
+
+        let (_, stats) = repair_retained_links_with_scan_stats(&input, "news", &targets).unwrap();
+
+        assert_eq!(stats.candidates, CANDIDATE_COUNT as usize);
+        assert_eq!(stats.cursor_advanced_bytes, input.len());
+        assert_eq!(stats.accounted_input_bytes, input.len());
+        assert_eq!(
+            stats.copied_input_bytes + stats.candidate_input_bytes,
+            input.len()
+        );
+        assert_eq!(stats.revisited_input_bytes, 0);
+        assert_eq!(stats.skipped_input_bytes, 0);
+        assert!(stats.work_units <= input.len() * 2, "stats: {stats:?}");
     }
 }

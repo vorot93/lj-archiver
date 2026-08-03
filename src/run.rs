@@ -6,7 +6,7 @@ use crate::{
     client::LjClient,
     discover::discover_post_ids,
     error::LjError,
-    links::{LinkRewriter, PendingLink, resolve_pending_links, restore_missing_xrefs},
+    links::{LinkRewriter, PendingLink, repair_retained_links, resolve_pending_links},
     media::rewrite_inline_media,
     models::{ArchiveTarget, ArchivedPost, Post, PostFailure, RunOptions},
     parser::parse_post_page,
@@ -250,6 +250,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     }
 
     let final_ids = posts.keys().copied().collect::<HashSet<_>>();
+    let final_targets = trusted_target_filenames(&posts)?;
     let finalized_ids = finalized
         .iter()
         .map(|post| post.archived.id)
@@ -285,13 +286,13 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         .filter(|post| !finalized_ids.contains(&post.id))
     {
         match std::fs::read_to_string(&post.path) {
-            Ok(existing) => match restore_missing_xrefs(&existing, &journal, &final_ids) {
+            Ok(existing) => match repair_retained_links(&existing, &journal, &final_targets) {
                 Ok(repaired) if repaired != existing => {
                     if let Err(error) = archive.write_post_at(&post.path, &repaired) {
                         tracing::warn!(
                             post_id = post.id,
                             error = %error,
-                            "could not repair skipped post links; retaining existing post"
+                            "could not repair retained post links; retaining existing post"
                         );
                     }
                 }
@@ -300,7 +301,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                     tracing::warn!(
                         post_id = post.id,
                         error = %error,
-                        "could not resolve skipped post links; retaining existing post"
+                        "could not resolve retained post links; retaining existing post"
                     );
                 }
             },
@@ -308,7 +309,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                 tracing::warn!(
                     post_id = post.id,
                     error = %error,
-                    "could not read skipped post for link repair; retaining existing post"
+                    "could not read retained post for link repair; retaining existing post"
                 );
             }
         }
@@ -2880,7 +2881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_repair_replaces_only_alias_bytes_without_canonical_duplicate() {
+    async fn resume_repair_uses_exact_alias_targets_for_text_images_and_manifests() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/news/calendar"))
@@ -2904,15 +2905,22 @@ mod tests {
             .mount(&server)
             .await;
         let dir = tempdir().unwrap();
+        let baseline = concat!(
+            "= Existing Alias\n\n",
+            "xref:1.adoc[Self] xref:2.adoc[Failed peer]\n",
+            "image:../assets/p.jpg[,link={lj-archiver-post-link-prefix}1.adoc]\n",
+            "image:../assets/q.jpg[,link={lj-archiver-post-link-prefix}2.adoc]\n",
+        );
+        let expected = concat!(
+            "= Existing Alias\n\n",
+            "xref:01.adoc[Self] https://news.livejournal.com/2.html[Failed peer]\n",
+            "image:../assets/p.jpg[,link={lj-archiver-post-link-prefix}01.adoc]\n",
+            "image:../assets/q.jpg[,link=https://news.livejournal.com/2.html]\n",
+        );
         seed_existing_archive_at(
             dir.path(),
-            &[(
-                1,
-                "01.adoc",
-                "Existing Alias",
-                "= Existing Alias\n\nxref:002.adoc[Post two]\n",
-            )],
-            false,
+            &[(1, "01.adoc", "Existing Alias", baseline)],
+            true,
         );
         let options = journal_cli(&server, dir.path(), true).options();
 
@@ -2925,7 +2933,7 @@ mod tests {
         assert_eq!(outcome.failed, 1);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("out/posts/01.adoc")).unwrap(),
-            "= Existing Alias\n\nhttps://news.livejournal.com/2.html[Post two]\n"
+            expected
         );
         assert!(!dir.path().join("out/posts/1.adoc").exists());
         let inspected = Archive::new(dir.path().join("out"), "news")
@@ -2937,11 +2945,26 @@ mod tests {
             inspected.posts[0].path,
             dir.path().join("out/posts/01.adoc")
         );
-        let index = std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap();
         assert_eq!(
-            index.matches("|1 |xref:posts/01.adoc").count(),
-            1,
-            "{index}"
+            std::fs::read_to_string(dir.path().join("out/index.adoc")).unwrap(),
+            concat!(
+                "= news Archive\n\n",
+                "|===\n|Post ID |Title\n\n",
+                "|1 |xref:posts/01.adoc[Existing Alias]\n",
+                "|===\n",
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap(),
+            concat!(
+                "= news Archive\n",
+                ":doctype: book\n",
+                ":toc:\n",
+                ":imagesdir: posts\n",
+                ":lj-archiver-post-link-prefix: posts/\n\n",
+                "include::index.adoc[leveloffset=+1]\n",
+                "\ninclude::posts/01.adoc[leveloffset=+1]\n",
+            )
         );
     }
 

@@ -244,10 +244,12 @@ not counted as archived or skipped. Current post and discovery-page failures
 remain explicit even when the validated snapshot keeps the manifests intact.
 
 Retained and resume-skipped files receive a best-effort stale local-link repair
-after the final post set is known. If that repair or a current post's second
-local-link pass fails, the already public file is retained; a successfully
-finalized current post always has complete external fallback targets rather
-than internal staging markers.
+after the final post set is known. Ordinary cross-references and linked-image
+click targets are retargeted to each surviving post's exact validated filename;
+targets absent from the final set revert to canonical external journal post
+URLs. If that repair or a current post's second local-link pass fails, the
+already public file is retained; a successfully finalized current post always
+has complete external fallback targets rather than internal staging markers.
 
 While archiving, `lj-archiver` prints progress to standard error. On an
 interactive terminal it shows a discovery spinner and then a progress bar with a
