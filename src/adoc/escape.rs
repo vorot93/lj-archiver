@@ -38,6 +38,14 @@ pub(crate) fn neutralize_active_adoc_lines(text: &str) -> String {
         let trimmed = line_without_newline.trim_start();
         let neutralized_description_markers = neutralize_description_list_markers(trimmed);
 
+        if is_complete_block_metadata_line(trimmed) {
+            let leading_len = line_without_newline.len() - trimmed.len();
+            output.push_str(&line[..leading_len]);
+            output.push('\\');
+            output.push_str(&line[leading_len..]);
+            continue;
+        }
+
         if starts_with_active_adoc_syntax(line_without_newline)
             && (neutralized_description_markers.is_none()
                 || starts_with_non_description_active_adoc_syntax(line_without_newline))
@@ -56,6 +64,12 @@ pub(crate) fn neutralize_active_adoc_lines(text: &str) -> String {
     }
 
     output
+}
+
+fn is_complete_block_metadata_line(text: &str) -> bool {
+    let trimmed = text.trim_end();
+
+    trimmed.starts_with('[') && trimmed.ends_with(']')
 }
 
 fn neutralize_inline_adoc_syntax(text: &str) -> String {

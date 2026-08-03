@@ -1,4 +1,4 @@
-use super::{RenderCtx, classify::is_stripped_chrome};
+use super::{RenderCtx, classify::is_stripped_chrome, render_specialcharacters_listing};
 use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
 use std::{borrow::Cow, collections::HashMap, ops::Range};
@@ -114,9 +114,7 @@ fn passthrough_is_safe(source_html: &str) -> bool {
 }
 
 pub(super) fn render_source_listing(content: &str) -> String {
-    let delimiter = safe_block_delimiter(content, '-');
-
-    format!("{delimiter}\n{content}\n{delimiter}\n\n")
+    render_specialcharacters_listing(content)
 }
 
 fn passthrough_attribute_is_safe(tag: &str, attribute: &str, qualified: bool) -> bool {
@@ -281,6 +279,21 @@ pub(crate) fn raw_text(element: ElementRef<'_>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::render_source_listing;
+
+    #[test]
+    fn source_listing_declares_specialcharacters_only_substitutions() {
+        assert_eq!(
+            render_source_listing("pass:[<img src=x onerror=alert(1)>]"),
+            concat!(
+                "[subs=specialcharacters]\n",
+                "----\n",
+                "pass:[<img src=x onerror=alert(1)>]\n",
+                "----\n\n",
+            )
+        );
+    }
+
     #[test]
     fn nested_source_index_stores_one_range_per_element() {
         let depth = 4_000;

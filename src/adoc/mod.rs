@@ -555,36 +555,65 @@ fn render_blockquote(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     format!("[quote]\n{delimiter}\n{content}\n{delimiter}\n\n")
 }
 
-fn render_listing(element: ElementRef<'_>) -> String {
-    let content = raw_text(element).trim_matches('\n').to_string();
-    let delimiter = safe_block_delimiter(&content, '-');
+pub(super) fn render_specialcharacters_listing(content: &str) -> String {
+    let delimiter = safe_block_delimiter(content, '-');
+    format!("[subs=specialcharacters]\n{delimiter}\n{content}\n{delimiter}\n\n")
+}
 
-    format!("{delimiter}\n{content}\n{delimiter}\n\n")
+fn render_listing(element: ElementRef<'_>) -> String {
+    let content = raw_text(element);
+
+    render_specialcharacters_listing(content.trim_matches('\n'))
 }
 
 fn render_safe_listing(element: ElementRef<'_>) -> String {
-    let content = neutralize_active_adoc_lines(raw_text(element).trim_matches('\n'));
-    let delimiter = safe_block_delimiter(&content, '-');
+    let content = raw_text(element);
 
-    format!("{delimiter}\n{content}\n{delimiter}\n\n")
+    render_specialcharacters_listing(content.trim_matches('\n'))
+}
+
+fn push_specialcharacters_segment(output: &mut String, text: &str) {
+    output.push_str("pass:c[");
+    for character in text.chars() {
+        if character == ']' {
+            output.push('\\');
+        }
+        output.push(character);
+    }
+    output.push(']');
+}
+
+fn encode_inline_code(content: &str) -> String {
+    let mut encoded = String::from("`");
+    let mut run_start = 0;
+    for (index, character) in content.char_indices() {
+        let fragment = match character {
+            '\\' => Some("pass:[&#92;]"),
+            '`' => Some("pass:[&#96;]"),
+            _ => None,
+        };
+        let Some(fragment) = fragment else {
+            continue;
+        };
+        if run_start < index {
+            push_specialcharacters_segment(&mut encoded, &content[run_start..index]);
+        }
+        encoded.push_str(fragment);
+        run_start = index + character.len_utf8();
+    }
+    if run_start < content.len() {
+        push_specialcharacters_segment(&mut encoded, &content[run_start..]);
+    } else if content.is_empty() {
+        push_specialcharacters_segment(&mut encoded, "");
+    }
+    encoded.push('`');
+    encoded
 }
 
 fn render_inline_code(element: ElementRef<'_>) -> String {
-    let content = raw_text(element).trim_matches('\n').to_string();
+    let content = raw_text(element);
 
-    if !content.contains('`') {
-        return format!("`{content}`");
-    }
-
-    if !content.contains('+') {
-        return format!("+{content}+");
-    }
-
-    if !content.contains(']') {
-        return format!("pass:q[{content}]");
-    }
-
-    format!("pass:q[{}]", content.replace(']', "\\]"))
+    encode_inline_code(content.trim_matches('\n'))
 }
 
 fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> String {
@@ -873,6 +902,52 @@ mod tests {
     }
 
     #[test]
+    fn every_listing_declares_specialcharacters_only_substitutions() {
+        for html in [
+            "<pre>pass:[&lt;img src=x onerror=alert(1)&gt;]</pre>",
+            "<script>pass:[<img src=x onerror=alert(1)>]</script>",
+            "<iframe srcdoc='<img src=x onerror=alert(1)>'></iframe>",
+        ] {
+            let adoc = html_to_adoc(html);
+            assert!(
+                adoc.contains("[subs=specialcharacters]\n----"),
+                "missing explicit substitutions in {adoc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authored_block_metadata_lines_are_visibly_escaped() {
+        for line in ["[subs=normal]", "[source,ruby]", "[#owned]", "[[owned]]"] {
+            let adoc = html_to_adoc(&format!("{line}<iframe></iframe>"));
+            assert!(adoc.contains(&format!("\\{line}")), "{adoc:?}");
+            assert!(adoc.contains("[subs=specialcharacters]\n----"));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by CI"]
+    fn authored_block_metadata_before_listings_converts_visible_and_inert() {
+        for line in ["[subs=normal]", "[source,ruby]", "[#owned]", "[[owned]]"] {
+            let source =
+                format!(r#"{line}<iframe srcdoc="pass:[<img onerror=alert(1)>]"></iframe>"#);
+            let adoc = html_to_adoc(&source);
+            let converted = convert_with_asciidoctor(&adoc);
+            let document = Html::parse_document(&converted);
+            let visible = document.root_element().text().collect::<String>();
+            assert!(visible.contains(line), "{line:?}: {converted}");
+            assert!(visible.contains("pass:[<img onerror=alert(1)>]"));
+            assert!(
+                document
+                    .select(&Selector::parse("img").unwrap())
+                    .next()
+                    .is_none(),
+                "{line:?}: {converted}"
+            );
+        }
+    }
+
+    #[test]
     fn preserves_nested_unordered_list_depth() {
         assert_eq!(
             html_to_adoc("<ul><li>outer<ul><li>inner</li></ul></li></ul>"),
@@ -909,7 +984,7 @@ mod tests {
         let adoc = html_to_adoc("<pre>before\n----\nafter</pre>");
 
         assert!(adoc.contains("before\n----\nafter"));
-        assert!(adoc.contains("-----\nbefore\n----\nafter\n-----"));
+        assert!(adoc.contains("[subs=specialcharacters]\n-----\nbefore\n----\nafter\n-----"));
         assert!(!adoc.starts_with("----\nbefore\n----\nafter\n----"));
     }
 
@@ -917,7 +992,9 @@ mod tests {
     fn uses_safe_quote_delimiter_when_blockquote_contains_default_delimiter() {
         let adoc = html_to_adoc("<blockquote><pre>____\ninclude::secret[]</pre></blockquote>");
 
-        assert!(adoc.starts_with("[quote]\n_____\n----\n____\ninclude::secret[]\n----"));
+        assert!(adoc.starts_with(
+            "[quote]\n_____\n[subs=specialcharacters]\n----\n____\ninclude::secret[]\n----"
+        ));
         assert!(adoc.ends_with("\n_____\n\n"));
 
         let lines = adoc.lines().collect::<Vec<_>>();
@@ -959,7 +1036,10 @@ mod tests {
             r#"<foo><p>custom</p></foo>"#,
             r#"<section><svg><a href="https://example.test">x</a></svg></section>"#,
         ] {
-            assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+            assert_eq!(
+                html_to_adoc(source),
+                format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+            );
         }
     }
 
@@ -975,7 +1055,10 @@ mod tests {
     #[test]
     fn encoded_executable_url_fails_closed() {
         let source = r#"<section><a href="java&#x73;cript:alert(1)">x</a></section>"#;
-        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            html_to_adoc(source),
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
     }
 
     #[test]
@@ -985,7 +1068,10 @@ mod tests {
 
         let adoc = html_to_adoc(source);
 
-        assert_eq!(adoc, format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            adoc,
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
         assert_eq!(adoc.matches(source).count(), 1);
         assert!(!adoc.contains("++++"));
         assert!(!adoc.contains(r#"class="record""#));
@@ -1016,7 +1102,11 @@ mod tests {
     fn malformed_space_after_tag_open_does_not_shift_real_div_source() {
         assert_eq!(
             html_to_adoc("< div>fake</div><div data-real='yes'>real</div>"),
-            "< div>fake\n\n----\n<div data-real='yes'>real</div>\n----\n\n"
+            concat!(
+                "< div>fake\n\n",
+                "[subs=specialcharacters]\n",
+                "----\n<div data-real='yes'>real</div>\n----\n\n",
+            )
         );
     }
 
@@ -1025,8 +1115,8 @@ mod tests {
         assert_eq!(
             html_to_adoc("<div!>fake</div!><div data-real='yes'>real</div>"),
             concat!(
-                "----\n<div!>fake</div!>\n----\n\n",
-                "----\n<div data-real='yes'>real</div>\n----\n\n",
+                "[subs=specialcharacters]\n----\n<div!>fake</div!>\n----\n\n",
+                "[subs=specialcharacters]\n----\n<div data-real='yes'>real</div>\n----\n\n",
             )
         );
     }
@@ -1035,8 +1125,8 @@ mod tests {
     fn quote_in_attribute_name_does_not_hide_tag_end_or_shift_real_div_source() {
         let input = "<div \">fake</div><div data-real='yes'>real</div>";
         let expected = concat!(
-            "----\n<div \">fake</div>\n----\n\n",
-            "----\n<div data-real='yes'>real</div>\n----\n\n"
+            "[subs=specialcharacters]\n----\n<div \">fake</div>\n----\n\n",
+            "[subs=specialcharacters]\n----\n<div data-real='yes'>real</div>\n----\n\n"
         );
         let adoc = html_to_adoc(input);
 
@@ -1049,8 +1139,8 @@ mod tests {
     fn nul_in_tag_name_does_not_shift_following_real_div_source() {
         let input = "<div\0x>fake</div\0x><div data-real='yes'>real</div>";
         let expected = concat!(
-            "----\n<div\0x>fake</div\0x>\n----\n\n",
-            "----\n<div data-real='yes'>real</div>\n----\n\n",
+            "[subs=specialcharacters]\n----\n<div\0x>fake</div\0x>\n----\n\n",
+            "[subs=specialcharacters]\n----\n<div data-real='yes'>real</div>\n----\n\n",
         );
         let adoc = html_to_adoc(input);
 
@@ -1068,7 +1158,11 @@ mod tests {
         let adoc = html_to_adoc(html);
         assert_eq!(
             adoc,
-            "----\nconst x = \"<table>fake</table>\";\n----\n\n++++\n<table><tr><td>real</td></tr></table>\n++++\n\n"
+            concat!(
+                "[subs=specialcharacters]\n",
+                "----\nconst x = \"<table>fake</table>\";\n----\n\n",
+                "++++\n<table><tr><td>real</td></tr></table>\n++++\n\n",
+            )
         );
     }
 
@@ -1081,6 +1175,7 @@ mod tests {
         assert_eq!(
             html_to_adoc(html),
             concat!(
+                "[subs=specialcharacters]\n",
                 "----\n",
                 "const x = \"</scripture><table>fake</table>\";\n",
                 "----\n\n",
@@ -1193,28 +1288,83 @@ mod tests {
     fn renders_unreviewed_font_html_as_exact_listing() {
         let source = r#"<font color="red">text</font>"#;
 
-        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            html_to_adoc(source),
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
     }
 
     #[test]
     fn preserves_backticks_inside_inline_code() {
         let adoc = html_to_adoc("<p><code>a`b</code></p>");
 
-        assert_eq!(adoc, "+a`b+\n\n");
+        assert_eq!(adoc, "`pass:c[a]pass:[&#96;]pass:c[b]`\n\n");
+    }
+
+    #[test]
+    fn inline_code_never_exposes_authored_passthrough_syntax() {
+        let adoc =
+            html_to_adoc(r"<code>pass:[&lt;img src=x onerror=alert(1)&gt;] ` ] slash\</code>");
+        assert!(adoc.starts_with("`pass:c["));
+        assert!(!adoc.contains("pass:q["));
+    }
+
+    #[test]
+    fn inline_code_encodes_each_delimiter_adversary() {
+        for (source, expected) in [
+            ("<code>]</code>", "`pass:c[\\]]`"),
+            ("<code>`</code>", "`pass:[&#96;]`"),
+            (r"<code>slash\</code>", "`pass:c[slash]pass:[&#92;]`"),
+            (r"<code>\\]</code>", "`pass:[&#92;]pass:[&#92;]pass:c[\\]]`"),
+        ] {
+            assert_eq!(html_to_adoc(source), expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by CI"]
+    fn inline_code_round_trips_delimiter_adversaries_inertly() {
+        for (source, expected) in [
+            ("<code>]</code>", "]"),
+            ("<code>`</code>", "`"),
+            (r"<code>slash\</code>", "slash\\"),
+            (r"<code>\\]</code>", r"\\]"),
+            (
+                r"<code>pass:[&lt;img src=x onerror=alert(1)&gt;] ` ] slash\</code>",
+                "pass:[<img src=x onerror=alert(1)>] ` ] slash\\",
+            ),
+        ] {
+            let adoc = html_to_adoc(source);
+            let converted = convert_with_asciidoctor(&adoc);
+            let document = Html::parse_document(&converted);
+            let selector = Selector::parse("code").unwrap();
+            let codes = document
+                .select(&selector)
+                .map(|node| node.text().collect::<String>())
+                .collect::<Vec<_>>();
+            assert_eq!(codes, [expected], "{source:?}: {adoc:?}");
+            assert!(!converted.contains("<img src=x"));
+        }
     }
 
     #[test]
     fn code_with_custom_descendant_preserves_exact_containing_source_listing() {
         let source = "<code>before<foo onclick='x'>inside</foo>after</code>";
 
-        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            html_to_adoc(source),
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
     }
 
     #[test]
     fn pre_with_custom_descendant_preserves_exact_containing_source_listing() {
         let source = "<pre>before<foo onclick='x'>inside</foo>after</pre>";
 
-        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            html_to_adoc(source),
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
     }
 
     #[test]
@@ -1223,7 +1373,7 @@ mod tests {
 
         assert_eq!(
             html_to_adoc(html),
-            "----\n<iframe src='x'></iframe>\n----\n\n"
+            "[subs=specialcharacters]\n----\n<iframe src='x'></iframe>\n----\n\n"
         );
     }
 
@@ -1231,7 +1381,10 @@ mod tests {
     fn preserves_embed_source_attribute_quotes_in_listing() {
         let html = "<embed src='x'>";
 
-        assert_eq!(html_to_adoc(html), "----\n<embed src='x'>\n----\n\n");
+        assert_eq!(
+            html_to_adoc(html),
+            "[subs=specialcharacters]\n----\n<embed src='x'>\n----\n\n"
+        );
     }
 
     #[test]
@@ -1241,7 +1394,10 @@ mod tests {
 
         assert_eq!(
             adoc,
-            "----\n<embed src='one'>\n----\n\n----\n<embed src='two'>\n----\n\n"
+            concat!(
+                "[subs=specialcharacters]\n----\n<embed src='one'>\n----\n\n",
+                "[subs=specialcharacters]\n----\n<embed src='two'>\n----\n\n",
+            )
         );
     }
 
@@ -1253,8 +1409,8 @@ mod tests {
         assert_eq!(
             adoc,
             concat!(
-                "----\n<iframe src='x'></iframe>\n----\n\n",
-                "----\n<iframe src=\"x\"></iframe>\n----\n\n",
+                "[subs=specialcharacters]\n----\n<iframe src='x'></iframe>\n----\n\n",
+                "[subs=specialcharacters]\n----\n<iframe src=\"x\"></iframe>\n----\n\n",
             )
         );
     }
@@ -1267,8 +1423,8 @@ mod tests {
         assert_eq!(
             adoc,
             concat!(
-                "----\n<iframe src='first'></iframe>\n----\n\n",
-                "----\n<iframe src='second'></iframe>\n----\n\n",
+                "[subs=specialcharacters]\n----\n<iframe src='first'></iframe>\n----\n\n",
+                "[subs=specialcharacters]\n----\n<iframe src='second'></iframe>\n----\n\n",
             )
         );
     }
@@ -1339,32 +1495,44 @@ mod tests {
     fn renders_top_level_plain_unknown_inline_html_as_listing() {
         let source = "<foo>x</foo>";
 
-        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            html_to_adoc(source),
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
     }
 
     #[test]
     fn renders_top_level_custom_embed_like_unknown_inline_as_listing() {
         let source = "<lj-embed data-id='1'>x</lj-embed>";
 
-        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            html_to_adoc(source),
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
     }
 
     #[test]
     fn renders_attributed_unknown_inline_html_as_listing() {
         let source = r#"<foo data-x="1">x</foo>"#;
 
-        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            html_to_adoc(source),
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
     }
 
     #[test]
     fn custom_inline_elements_are_exact_visible_listings_with_boundaries() {
         for (source, expected) in [
-            ("<foo>x</foo>", "----\n<foo>x</foo>\n----\n\n"),
+            (
+                "<foo>x</foo>",
+                "[subs=specialcharacters]\n----\n<foo>x</foo>\n----\n\n",
+            ),
             (
                 r#"before<foo data-x="1">inside</foo>after"#,
                 concat!(
                     "before\n\n",
-                    "----\n<foo data-x=\"1\">inside</foo>\n----\n\n",
+                    "[subs=specialcharacters]\n----\n<foo data-x=\"1\">inside</foo>\n----\n\n",
                     "after\n\n",
                 ),
             ),
@@ -1372,7 +1540,7 @@ mod tests {
                 r#"<p>before<lj-embed data-id="1">inside</lj-embed>after</p>"#,
                 concat!(
                     "before\n\n",
-                    "----\n<lj-embed data-id=\"1\">inside</lj-embed>\n----\n\n",
+                    "[subs=specialcharacters]\n----\n<lj-embed data-id=\"1\">inside</lj-embed>\n----\n\n",
                     "after\n\n",
                 ),
             ),
@@ -1380,7 +1548,7 @@ mod tests {
                 r#"before<span><foo data-x="1">inside</foo></span>after"#,
                 concat!(
                     "before\n\n",
-                    "----\n<foo data-x=\"1\">inside</foo>\n----\n\n",
+                    "[subs=specialcharacters]\n----\n<foo data-x=\"1\">inside</foo>\n----\n\n",
                     "after\n\n",
                 ),
             ),
@@ -1393,7 +1561,7 @@ mod tests {
     fn keeps_top_level_plain_unknown_inline_listing_block_separated() {
         assert_eq!(
             html_to_adoc("a<foo>b</foo>c"),
-            "a\n\n----\n<foo>b</foo>\n----\n\nc\n\n"
+            "a\n\n[subs=specialcharacters]\n----\n<foo>b</foo>\n----\n\nc\n\n"
         );
     }
 
@@ -1401,7 +1569,7 @@ mod tests {
     fn keeps_top_level_attributed_unknown_inline_listing_block_separated() {
         assert_eq!(
             html_to_adoc("a<foo data-x='1'>b</foo>c"),
-            "a\n\n----\n<foo data-x='1'>b</foo>\n----\n\nc\n\n"
+            "a\n\n[subs=specialcharacters]\n----\n<foo data-x='1'>b</foo>\n----\n\nc\n\n"
         );
     }
 
@@ -1409,7 +1577,10 @@ mod tests {
     fn keeps_top_level_custom_unknown_inline_listing_block_separated() {
         assert_eq!(
             html_to_adoc("a<lj-embed data-id='1'>b</lj-embed>c"),
-            "a\n\n----\n<lj-embed data-id='1'>b</lj-embed>\n----\n\nc\n\n"
+            concat!(
+                "a\n\n[subs=specialcharacters]\n",
+                "----\n<lj-embed data-id='1'>b</lj-embed>\n----\n\nc\n\n",
+            )
         );
     }
 
@@ -1445,7 +1616,10 @@ mod tests {
         ] {
             let adoc = html_to_adoc(html);
 
-            assert_eq!(adoc, format!("----\n{html}\n----\n\n"));
+            assert_eq!(
+                adoc,
+                format!("[subs=specialcharacters]\n----\n{html}\n----\n\n")
+            );
         }
     }
 
@@ -1457,7 +1631,10 @@ mod tests {
         ] {
             let adoc = html_to_adoc(html);
 
-            assert_eq!(adoc, format!("----\n{html}\n----\n\n"));
+            assert_eq!(
+                adoc,
+                format!("[subs=specialcharacters]\n----\n{html}\n----\n\n")
+            );
         }
     }
 
@@ -1485,7 +1662,10 @@ mod tests {
         let html = r#"<p><span><iframe src="x"></iframe></span></p>"#;
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc, "----\n<iframe src=\"x\"></iframe>\n----\n\n");
+        assert_eq!(
+            adoc,
+            "[subs=specialcharacters]\n----\n<iframe src=\"x\"></iframe>\n----\n\n"
+        );
         assert_ne!(adoc, "\n\n");
     }
 
@@ -1496,7 +1676,10 @@ mod tests {
 
         assert!(adoc.lines().any(|line| line == "----"));
         assert!(!adoc.lines().any(|line| line == "_----" || line == "----_"));
-        assert_eq!(adoc, "----\n<iframe src=\"x\"></iframe>\n----\n\n");
+        assert_eq!(
+            adoc,
+            "[subs=specialcharacters]\n----\n<iframe src=\"x\"></iframe>\n----\n\n"
+        );
     }
 
     #[test]
@@ -1506,8 +1689,7 @@ mod tests {
 
         assert!(adoc.lines().any(|line| line == "----"));
         assert!(!adoc.lines().any(|line| line == "*----" || line == "----*"));
-        assert!(!adoc.lines().any(|line| line.starts_with("include::x[]")));
-        assert!(adoc.contains("----\n\\include::x[]\n----"));
+        assert!(adoc.contains("[subs=specialcharacters]\n----\ninclude::x[]\n----"));
     }
 
     #[test]
@@ -1525,7 +1707,10 @@ mod tests {
         let html = r#"<a href="x"><iframe src="y"></iframe></a>"#;
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc, "----\n<iframe src=\"y\"></iframe>\n----\n\n");
+        assert_eq!(
+            adoc,
+            "[subs=specialcharacters]\n----\n<iframe src=\"y\"></iframe>\n----\n\n"
+        );
         assert!(!adoc.contains("x[----"));
         assert!(!adoc.contains("----]"));
     }
@@ -1535,9 +1720,11 @@ mod tests {
         let html = r#"<a href="x"><script>include::x[]</script></a>"#;
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc, "----\n\\include::x[]\n----\n\n");
+        assert_eq!(
+            adoc,
+            "[subs=specialcharacters]\n----\ninclude::x[]\n----\n\n"
+        );
         assert!(!adoc.contains("x[----"));
-        assert!(!adoc.lines().any(|line| line.starts_with("include::x[]")));
     }
 
     #[test]
@@ -1584,7 +1771,10 @@ mod tests {
         let html = "<foo><p>x</p></foo>";
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc, "----\n<foo><p>x</p></foo>\n----\n\n");
+        assert_eq!(
+            adoc,
+            "[subs=specialcharacters]\n----\n<foo><p>x</p></foo>\n----\n\n"
+        );
         assert_ne!(adoc, "x");
     }
 
@@ -1604,7 +1794,9 @@ mod tests {
         let adoc = html_to_adoc(html);
 
         assert!(!adoc.contains("beforexafter"));
-        assert!(adoc.contains("before\n\n----\n<center>x</center>\n----\n\nafter"));
+        assert!(adoc.contains(
+            "before\n\n[subs=specialcharacters]\n----\n<center>x</center>\n----\n\nafter"
+        ));
     }
 
     #[test]
@@ -1613,7 +1805,10 @@ mod tests {
         let adoc = html_to_adoc(html);
 
         assert!(!adoc.contains("beforeafter"));
-        assert!(adoc.contains("before\n\n----\n<object data=\"x\"></object>\n----\n\nafter"));
+        assert!(adoc.contains(concat!(
+            "before\n\n[subs=specialcharacters]\n",
+            "----\n<object data=\"x\"></object>\n----\n\nafter",
+        )));
     }
 
     #[test]
@@ -1625,7 +1820,7 @@ mod tests {
             adoc,
             concat!(
                 "before\n\n",
-                "----\n<lj-embed data-id=\"1\">x</lj-embed>\n----\n\n",
+                "[subs=specialcharacters]\n----\n<lj-embed data-id=\"1\">x</lj-embed>\n----\n\n",
                 "after\n\n",
             )
         );
@@ -2268,10 +2463,10 @@ mod tests {
     }
 
     #[test]
-    fn keeps_generated_inline_code_passthrough_unescaped() {
+    fn keeps_generated_inline_code_encoding_unescaped() {
         let adoc = html_to_adoc("<p><code>a`+]</code></p>");
 
-        assert_eq!(adoc, "pass:q[a`+\\]]\n\n");
+        assert_eq!(adoc, "`pass:c[a]pass:[&#96;]pass:c[+\\]]`\n\n");
     }
 
     #[test]
@@ -2442,10 +2637,10 @@ mod tests {
 
     #[test]
     fn neutralizes_root_plain_text_pass_macro_prefix_before_generated_link_macro() {
-        let adoc = html_to_adoc(r#"pass:q<a href="">[x]</a>"#);
+        let adoc = html_to_adoc(r#"pass:q<a href="">x</a>"#);
 
         assert!(!adoc.lines().any(|line| line == "pass:q[x]"));
-        assert!(adoc.contains(r"\pass:q[x]"));
+        assert!(adoc.contains(r"\pass:q[x]"), "{adoc:?}");
     }
 
     #[test]
@@ -2492,7 +2687,7 @@ mod tests {
 
         assert!(!adoc.contains("++++"));
         assert!(!adoc.contains("++++\n<script>alert(1)</script>\n++++"));
-        assert!(adoc.contains("before\n\n----\nalert(1)\n----\n\nafter"));
+        assert!(adoc.contains("before\n\n[subs=specialcharacters]\n----\nalert(1)\n----\n\nafter"));
     }
 
     #[test]
@@ -2501,7 +2696,11 @@ mod tests {
 
         assert!(!adoc.contains("++++"));
         assert!(!adoc.contains("++++\n<style>body{color:red}</style>\n++++"));
-        assert!(adoc.contains("before\n\n----\nbody{color:red}\n----\n\nafter"));
+        assert!(
+            adoc.contains(
+                "before\n\n[subs=specialcharacters]\n----\nbody{color:red}\n----\n\nafter"
+            )
+        );
     }
 
     #[test]
@@ -2605,7 +2804,10 @@ mod tests {
             "</span>".repeat(depth)
         );
 
-        assert_eq!(html_to_adoc(&html), "----\ndeep-marker\n----\n\n");
+        assert_eq!(
+            html_to_adoc(&html),
+            "[subs=specialcharacters]\n----\ndeep-marker\n----\n\n"
+        );
     }
 
     #[test]
@@ -2617,7 +2819,7 @@ mod tests {
             "</span>".repeat(depth)
         );
 
-        assert_eq!(html_to_adoc(&html), "`deep-marker`");
+        assert_eq!(html_to_adoc(&html), "`pass:c[deep-marker]`");
     }
 
     #[test]
@@ -3348,7 +3550,10 @@ mod tests {
 
         let adoc = html_to_adoc_with_links(source, Some(&r));
 
-        assert_eq!(adoc, format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            adoc,
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
         assert!(!adoc.contains("++++"), "got: {adoc:?}");
     }
 
@@ -3388,7 +3593,10 @@ mod tests {
 
         let adoc = html_to_adoc_with_links(source, Some(&r));
 
-        assert_eq!(adoc, format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            adoc,
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
         assert!(!adoc.contains("++++"), "got: {adoc:?}");
     }
 
@@ -3408,7 +3616,10 @@ mod tests {
 
         let adoc = html_to_adoc_with_links(source, Some(&r));
 
-        assert_eq!(adoc, format!("----\n{source}\n----\n\n"));
+        assert_eq!(
+            adoc,
+            format!("[subs=specialcharacters]\n----\n{source}\n----\n\n")
+        );
     }
 
     #[test]
@@ -3426,7 +3637,9 @@ mod tests {
         let adoc = html_to_adoc_with_links(table, Some(&r));
 
         assert!(
-            adoc.contains(&format!("----\n{table}\n----\n\n")),
+            adoc.contains(&format!(
+                "[subs=specialcharacters]\n----\n{table}\n----\n\n"
+            )),
             "got: {adoc:?}"
         );
         assert!(!adoc.contains("++++"), "got: {adoc:?}");
@@ -3552,6 +3765,7 @@ mod tests {
             adoc,
             concat!(
                 "before\n\n",
+                "[subs=specialcharacters]\n",
                 "----\n",
                 r#"<lj-embed data-id="1" onclick="alert(1)">inside</lj-embed>"#,
                 "\n----\n\n",
@@ -3583,7 +3797,13 @@ mod tests {
 
         assert_eq!(
             adoc,
-            format!("----\n{code_source}\n----\n\n----\n{pre_source}\n----\n\n")
+            format!(
+                concat!(
+                    "[subs=specialcharacters]\n----\n{}\n----\n\n",
+                    "[subs=specialcharacters]\n----\n{}\n----\n\n",
+                ),
+                code_source, pre_source,
+            )
         );
 
         let html = convert_with_asciidoctor(&adoc);
