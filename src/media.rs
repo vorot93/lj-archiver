@@ -912,8 +912,12 @@ mod tests {
             "http://[3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
             "http://[2001:2::]/pic.jpg",
             "http://[2001:2:0:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:1:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[2001:2:1::]/pic.jpg",
             "http://[fec0::]/pic.jpg",
             "http://[feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
+            "http://[ff00::]/pic.jpg",
             // IPv6 special-purpose ranges from the installed std source.
             "http://[64:ff9b:1::]/pic.jpg",
             "http://[64:ff9b:1:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
@@ -943,6 +947,7 @@ mod tests {
             "http://1.0.0.0/pic.jpg",
             "http://100.63.255.255/pic.jpg",
             "http://100.128.0.0/pic.jpg",
+            "http://191.255.255.255/pic.jpg",
             "http://192.0.0.9/pic.jpg",
             "http://192.0.0.10/pic.jpg",
             "http://192.0.1.0/pic.jpg",
@@ -954,10 +959,10 @@ mod tests {
             "http://[2001:db9::]/pic.jpg",
             "http://[3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
             "http://[3fff:1000::]/pic.jpg",
-            "http://[64:ff9b::808:808]/pic.jpg",
+            "http://[64:ff9b:0:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
             "http://[64:ff9b:2::]/pic.jpg",
             "http://[ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
-            "http://[101::]/pic.jpg",
+            "http://[100:0:0:1::]/pic.jpg",
             "http://[2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
             "http://[2001:200::]/pic.jpg",
             "http://[2001:1::1]/pic.jpg",
@@ -988,7 +993,10 @@ mod tests {
             embedded_ipv4("64:ff9b::ffff:ffff".parse().unwrap()),
             Some(Ipv4Addr::BROADCAST)
         );
-        assert_eq!(embedded_ipv4("64:ff9a:ffff::".parse().unwrap()), None);
+        assert_eq!(
+            embedded_ipv4("64:ff9a:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()),
+            None
+        );
         assert_eq!(embedded_ipv4("64:ff9b:0:1::".parse().unwrap()), None);
 
         assert_eq!(
@@ -999,14 +1007,25 @@ mod tests {
             embedded_ipv4("2002:ffff:ffff::".parse().unwrap()),
             Some(Ipv4Addr::BROADCAST)
         );
-        assert_eq!(embedded_ipv4("2001:ffff::".parse().unwrap()), None);
+        assert_eq!(
+            embedded_ipv4("2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()),
+            None
+        );
         assert_eq!(embedded_ipv4("2003::".parse().unwrap()), None);
 
         assert_eq!(embedded_ipv4("::".parse().unwrap()), None);
         assert_eq!(embedded_ipv4("::1".parse().unwrap()), None);
         assert_eq!(
+            embedded_ipv4("::2".parse().unwrap()),
+            Some(Ipv4Addr::new(0, 0, 0, 2))
+        );
+        assert_eq!(
             embedded_ipv4("::8.8.8.8".parse().unwrap()),
             Some(Ipv4Addr::new(8, 8, 8, 8))
+        );
+        assert_eq!(
+            embedded_ipv4("::ffff:ffff".parse().unwrap()),
+            Some(Ipv4Addr::BROADCAST)
         );
         assert_eq!(embedded_ipv4("::1:0:0".parse().unwrap()), None);
     }
