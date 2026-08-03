@@ -282,6 +282,44 @@ impl PendingLinkScanStats {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PendingCandidate {
+    start: usize,
+    end: usize,
+    recorded: bool,
+    pending_token_shape: bool,
+}
+
+fn has_pending_token_shape(candidate: &str) -> bool {
+    let Some(body) = candidate
+        .strip_prefix(PENDING_LINK_SEPARATOR)
+        .and_then(|candidate| candidate.strip_suffix(PENDING_LINK_SEPARATOR))
+    else {
+        return false;
+    };
+    let mut parts = body.split(':');
+    let Some("lj-archiver-link") = parts.next() else {
+        return false;
+    };
+    let Some(namespace) = parts.next() else {
+        return false;
+    };
+    let Some(target_id) = parts.next() else {
+        return false;
+    };
+    let Some(ordinal) = parts.next() else {
+        return false;
+    };
+
+    namespace.len() == 32
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && target_id.parse::<u64>().is_ok()
+        && ordinal.parse::<usize>().is_ok()
+        && parts.next().is_none()
+}
+
 fn resolve_pending_links_with_scan_stats(
     text: &str,
     links: &[PendingLink],
@@ -300,43 +338,74 @@ fn resolve_pending_links_with_scan_stats(
     let mut resolved = String::with_capacity(text.len());
     let mut active_links = Vec::with_capacity(links.len());
     let mut stats = PendingLinkScanStats::default();
+    let separator_len = PENDING_LINK_SEPARATOR.len_utf8();
+    let mut separator_positions = Vec::new();
+    let mut scan_cursor = 0;
+    while let Some(relative_start) = text[scan_cursor..].find(PENDING_LINK_SEPARATOR) {
+        let start = scan_cursor + relative_start;
+        separator_positions.push(start);
+        scan_cursor = start + separator_len;
+    }
+
+    let candidates = separator_positions
+        .windows(2)
+        .map(|positions| {
+            let start = positions[0];
+            let end = positions[1] + separator_len;
+            let candidate = &text[start..end];
+            PendingCandidate {
+                start,
+                end,
+                recorded: replacements.contains_key(candidate),
+                pending_token_shape: has_pending_token_shape(candidate),
+            }
+        })
+        .collect::<Vec<_>>();
+    stats.candidates = candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, candidate)| {
+            candidate.recorded
+                || candidate.pending_token_shape
+                || *index == 0
+                || !candidates[*index - 1].recorded
+        })
+        .count();
+
     let mut cursor = 0;
-
-    while let Some(relative_start) = text[cursor..].find(PENDING_LINK_SEPARATOR) {
-        let start = cursor + relative_start;
-        resolved.push_str(&text[cursor..start]);
-        stats.account_input_range(cursor, start, false);
-
-        let terminator_search_start = start + PENDING_LINK_SEPARATOR.len_utf8();
-        let Some(relative_end) = text[terminator_search_start..].find(PENDING_LINK_SEPARATOR)
-        else {
-            resolved.push_str(&text[start..]);
-            stats.account_input_range(start, text.len(), false);
-            stats.cursor_advanced_bytes += text.len() - cursor;
-            cursor = text.len();
-            break;
-        };
-        let end = terminator_search_start + relative_end + PENDING_LINK_SEPARATOR.len_utf8();
-        let candidate = &text[start..end];
-        if let Some((target, target_id, context)) = replacements.get(candidate) {
-            let output_start = resolved.len();
-            resolved.push_str(target);
-            active_links.push(ActiveLink {
-                start: output_start,
-                end: resolved.len(),
-                target_id: *target_id,
-                context: *context,
-            });
-            stats.account_input_range(start, end, true);
-            stats.cursor_advanced_bytes += end - cursor;
-            cursor = end;
-        } else {
-            resolved.push(PENDING_LINK_SEPARATOR);
-            stats.account_input_range(start, terminator_search_start, false);
-            stats.cursor_advanced_bytes += terminator_search_start - cursor;
-            cursor = terminator_search_start;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !candidate.recorded {
+            continue;
         }
-        stats.candidates += 1;
+
+        let mut replacement_start = candidate.start;
+        if index > 0
+            && (candidates[index - 1].recorded || candidates[index - 1].pending_token_shape)
+        {
+            replacement_start += separator_len;
+        }
+        let mut replacement_end = candidate.end;
+        if index + 1 < candidates.len()
+            && !candidates[index + 1].recorded
+            && candidates[index + 1].pending_token_shape
+        {
+            replacement_end -= separator_len;
+        }
+
+        resolved.push_str(&text[cursor..replacement_start]);
+        stats.account_input_range(cursor, replacement_start, false);
+        let (target, target_id, context) = replacements[&text[candidate.start..candidate.end]];
+        let output_start = resolved.len();
+        resolved.push_str(target);
+        active_links.push(ActiveLink {
+            start: output_start,
+            end: resolved.len(),
+            target_id,
+            context,
+        });
+        stats.account_input_range(replacement_start, replacement_end, true);
+        stats.cursor_advanced_bytes += replacement_end - cursor;
+        cursor = replacement_end;
     }
 
     if cursor < text.len() {
@@ -890,6 +959,80 @@ mod tests {
             PendingLinkError::OccurrenceCount {
                 expected: 1,
                 actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_resolution_resolves_distinct_recorded_tokens_sharing_one_separator() {
+        let first = "\u{1f}first\u{1f}";
+        let second = "\u{1f}second\u{1f}";
+        let links = [
+            pending_link(
+                first,
+                1,
+                "xref:1.adoc",
+                "https://news.livejournal.com/1.html",
+            ),
+            pending_link(
+                second,
+                2,
+                "xref:2.adoc",
+                "https://news.livejournal.com/2.html",
+            ),
+        ];
+        let text = "before \u{1f}first\u{1f}second\u{1f} after";
+
+        assert_eq!(
+            resolve_pending_links(text, &links, &HashSet::from([1, 2])).unwrap(),
+            ResolvedLinks {
+                contents: "before xref:1.adocxref:2.adoc after".to_string(),
+                links: vec![
+                    ActiveLink {
+                        start: 7,
+                        end: 18,
+                        target_id: 1,
+                        context: ActiveLinkContext::Xref,
+                    },
+                    ActiveLink {
+                        start: 18,
+                        end: 29,
+                        target_id: 2,
+                        context: ActiveLinkContext::Xref,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn pending_resolution_preserves_unrecorded_token_sharing_recorded_closing_separator() {
+        let recorded = "\u{1f}recorded\u{1f}";
+        let links = [pending_link(
+            recorded,
+            7,
+            "xref:7.adoc",
+            "https://news.livejournal.com/7.html",
+        )];
+        let text = concat!(
+            "before \u{1f}recorded\u{1f}lj-archiver-link:",
+            "ffeeddccbbaa99887766554433221100:8:0\u{1f} after",
+        );
+
+        assert_eq!(
+            resolve_pending_links(text, &links, &HashSet::from([7])).unwrap(),
+            ResolvedLinks {
+                contents: concat!(
+                    "before xref:7.adoc\u{1f}lj-archiver-link:",
+                    "ffeeddccbbaa99887766554433221100:8:0\u{1f} after",
+                )
+                .to_string(),
+                links: vec![ActiveLink {
+                    start: 7,
+                    end: 18,
+                    target_id: 7,
+                    context: ActiveLinkContext::Xref,
+                }],
             }
         );
     }
