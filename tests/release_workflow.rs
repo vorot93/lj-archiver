@@ -22,6 +22,7 @@ fn assert_external_actions_use_full_shas(workflow: &str) {
 #[test]
 fn publisher_revalidates_and_peels_the_remote_tag_before_the_sole_create() {
     let workflow = include_str!("../.github/workflows/release.yml");
+    assert_eq!(workflow.matches("gh release create").count(), 1);
     assert_eq!(workflow.matches("\n  publish:\n").count(), 1);
     let publisher = workflow
         .split_once("\n  publish:\n")
