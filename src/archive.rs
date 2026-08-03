@@ -53,6 +53,9 @@ impl Archive {
     }
 
     pub fn inspect_existing(&self) -> Result<Option<ExistingArchive>> {
+        storage::inspect_controlled_directory(&self.root, Path::new("assets"), true)?;
+        storage::inspect_controlled_directory(&self.root, Path::new(".lj-archiver"), false)?;
+        storage::inspect_controlled_directory(&self.root, Path::new(".lj-archiver/links"), true)?;
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => inspect_entries(entries, &self.root)?,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -126,25 +129,30 @@ impl Archive {
     }
 
     pub(crate) fn write_post_at(&self, path: &Path, contents: &str) -> Result<PathBuf> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| LjError::Write {
-                path: parent.to_path_buf(),
-                source,
-            })?;
+        let posts = self.root.join("posts");
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| invalid_archive(path, "post destination is outside the archive root"))?;
+        let numeric_adoc = path.parent() == Some(posts.as_path())
+            && path.extension() == Some(OsStr::new("adoc"))
+            && path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .is_some_and(|stem| stem.parse::<u64>().is_ok());
+        if !numeric_adoc {
+            return Err(invalid_archive(
+                path,
+                "post destination must be a numeric .adoc file under posts",
+            ));
         }
-        storage::write_atomic(path, contents.as_bytes())?;
+        storage::write_atomic_controlled(&self.root, relative, contents.as_bytes())?;
         Ok(path.to_path_buf())
     }
 
     pub fn write_pending_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
-        let path = self.root.join("posts").join(format!("{id}.pending"));
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| LjError::Write {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        storage::write_atomic(&path, contents.as_bytes())?;
+        let relative = PathBuf::from("posts").join(format!("{id}.pending"));
+        let path = self.root.join(&relative);
+        storage::write_atomic_controlled(&self.root, &relative, contents.as_bytes())?;
         Ok(path)
     }
 
@@ -401,6 +409,61 @@ mod tests {
     }
 
     #[test]
+    fn inspection_rejects_controlled_directory_components_that_are_plain_files() {
+        let dir = tempdir().unwrap();
+        for relative in ["assets", ".lj-archiver", ".lj-archiver/links"] {
+            let root = dir.path().join(relative.replace('/', "-"));
+            write_valid_index(&root, "news");
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "not a directory").unwrap();
+
+            let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+            assert_invalid_archive(error, &path, "directory");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_rejects_symlinked_controlled_directory_components() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        for relative in ["assets", ".lj-archiver", ".lj-archiver/links"] {
+            let root = dir.path().join(relative.replace('/', "-"));
+            let outside = dir
+                .path()
+                .join(format!("{}-outside", relative.replace('/', "-")));
+            write_valid_index(&root, "news");
+            fs::create_dir(&outside).unwrap();
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            symlink(&outside, &path).unwrap();
+
+            let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+            assert_invalid_archive(error, &path, "directory");
+        }
+    }
+
+    #[test]
+    fn inspection_accepts_absent_or_empty_real_controlled_directories() {
+        let dir = tempdir().unwrap();
+        let absent_root = dir.path().join("absent");
+        write_valid_index(&absent_root, "news");
+        assert!(
+            Archive::new(&absent_root, "news")
+                .inspect_existing()
+                .is_ok()
+        );
+
+        let empty_root = dir.path().join("empty");
+        write_valid_index(&empty_root, "news");
+        fs::create_dir(empty_root.join("assets")).unwrap();
+        fs::create_dir_all(empty_root.join(".lj-archiver/links")).unwrap();
+        assert!(Archive::new(&empty_root, "news").inspect_existing().is_ok());
+    }
+
+    #[test]
     fn inspection_accepts_case_and_hyphen_underscore_journal_alias() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("archive");
@@ -618,6 +681,70 @@ mod tests {
         let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
         assert!(index.contains("= news Archive"));
         assert!(index.contains("xref:posts/166511.adoc[Title]"));
+    }
+
+    #[test]
+    fn write_post_at_rejects_outside_and_nonnumeric_destinations() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let outside = dir.path().join("outside.adoc");
+
+        assert!(matches!(
+            archive.write_post_at(&outside, "= Outside\n"),
+            Err(LjError::InvalidArchive { .. })
+        ));
+        assert!(!outside.exists());
+
+        let nonnumeric = root.join("posts/draft.adoc");
+        assert!(matches!(
+            archive.write_post_at(&nonnumeric, "= Draft\n"),
+            Err(LjError::InvalidArchive { .. })
+        ));
+        assert!(!nonnumeric.exists());
+    }
+
+    #[test]
+    fn post_and_pending_writes_reject_nonregular_destinations() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        fs::create_dir_all(root.join("posts/1.adoc")).unwrap();
+        fs::create_dir(root.join("posts/2.pending")).unwrap();
+
+        assert!(matches!(
+            archive.write_post(1, "= Post\n"),
+            Err(LjError::InvalidArchive { .. })
+        ));
+        assert!(matches!(
+            archive.write_pending_post(2, "pending"),
+            Err(LjError::InvalidArchive { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_writes_reject_symlinked_posts_directory_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let outside = dir.path().join("outside");
+        let archive = Archive::new(&root, "news");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("posts")).unwrap();
+
+        assert!(matches!(
+            archive.write_post(1, "= Post\n"),
+            Err(LjError::InvalidArchive { .. })
+        ));
+        assert!(matches!(
+            archive.write_pending_post(2, "pending"),
+            Err(LjError::InvalidArchive { .. })
+        ));
+        assert!(!outside.join("1.adoc").exists());
+        assert!(!outside.join("2.pending").exists());
     }
 
     #[test]

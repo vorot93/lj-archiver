@@ -7,7 +7,6 @@ use reqwest::header::LOCATION;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ops::Range,
     path::{Path, PathBuf},
@@ -232,8 +231,18 @@ async fn download_asset(
     filename: &str,
     allow_local_media: bool,
 ) -> Result<bool> {
-    let path = assets_dir.join(filename);
-    if path.is_file() {
+    let root = assets_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty());
+    let relative_directory = assets_dir.file_name();
+    let (Some(root), Some(relative_directory)) = (root, relative_directory) else {
+        return Err(LjError::InvalidArchive {
+            path: assets_dir.to_path_buf(),
+            reason: "media destination must be a leaf directory under an archive root".to_string(),
+        });
+    };
+    let relative = PathBuf::from(relative_directory).join(filename);
+    if storage::controlled_file_exists(root, &relative)? {
         return Ok(true); // already fetched this run or a prior --resume run
     }
 
@@ -256,12 +265,7 @@ async fn download_asset(
         return Ok(false);
     };
 
-    fs::create_dir_all(assets_dir).map_err(|source| LjError::Write {
-        path: assets_dir.to_path_buf(),
-        source,
-    })?;
-
-    storage::write_atomic(&path, &bytes)?;
+    storage::write_atomic_controlled(root, &relative, &bytes)?;
 
     Ok(true)
 }
@@ -469,6 +473,81 @@ mod tests {
                 .join(rewritten.assets[0].relative_path.file_name().unwrap())
                 .exists()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlinked_asset_directory_before_fetching_or_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pic.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let assets_dir = root.join("assets");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, &assets_dir).unwrap();
+        let image_url = Url::parse(&format!("{}/pic.jpg", server.uri())).unwrap();
+        let filename = filename_for_url(&image_url);
+        let html = format!(r#"<img src="{image_url}">"#);
+
+        let error = match rewrite_inline_media(
+            &html,
+            &Url::parse(&server.uri()).unwrap(),
+            &assets_dir,
+            true,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("symlinked asset directory was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, LjError::InvalidArchive { .. }));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(!outside.join(filename).exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_nonregular_asset_destination_before_fetching_or_overwriting() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pic.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let assets_dir = dir.path().join("assets");
+        let image_url = Url::parse(&format!("{}/pic.jpg", server.uri())).unwrap();
+        let destination = assets_dir.join(filename_for_url(&image_url));
+        std::fs::create_dir_all(&destination).unwrap();
+        let html = format!(r#"<img src="{image_url}">"#);
+
+        let error = match rewrite_inline_media(
+            &html,
+            &Url::parse(&server.uri()).unwrap(),
+            &assets_dir,
+            true,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("nonregular asset destination was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, LjError::InvalidArchive { .. }));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(destination.is_dir());
     }
 
     #[tokio::test]
