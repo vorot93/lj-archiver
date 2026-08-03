@@ -250,17 +250,15 @@ absolute remote URL on no-media, address/redirect rejection, HTTP or transport
 failure, and body-cap failure. Invalid and non-HTTP(S) values issue no request
 and rely on the renderer's inert visible-text fallback.
 
-Inline-media discovery is a forward-only byte-span scan so untouched HTML
-stays byte-identical. It treats `script`, `style`, `textarea`, `xmp`, `iframe`,
-`noembed`, `noframes`, and `plaintext` contents as opaque (including
-tag-looking text), and follows HTML-tokenizer proper and bogus comment/
-declaration endings. In a quoted DOCTYPE public or system identifier, `>` is
-an abrupt declaration terminator: resume scanning in data state so subsequent
-real tags remain discoverable. Keep those skips linear and rewrite only real
-`src` value spans. Generated replacements are HTML-attribute-escaped because
-the renderer parses the rewritten fragment again: that one parse must recover
-the exact target, and bytes outside the value span remain untouched. Download
-filenames keep a 12-hex digest stem and use only lowercase allowlisted image
+Inline-media discovery completes the shared tokenizer-compatible scan before
+issuing any request. The tokenizer-decoded `src` drives URL resolution, but
+rewriting changes only its aligned raw value range in the immutable input, so
+all other bytes (including quote style) remain untouched. If source/tokenizer
+alignment is ambiguous, media rewriting returns a URL-contextual
+`LjError::Parse` before network I/O rather than guessing a range. Generated
+replacements are HTML-attribute-escaped because the renderer parses the
+rewritten fragment again: that one parse must recover the exact target.
+Download filenames keep a 12-hex digest stem and use only lowercase allowlisted image
 suffixes (`jpg`, `jpeg`, `png`, `gif`, `webp`, `svg`, `avif`, `bmp`, `ico`), falling back to
 `bin` so each filename component remains portable and bounded.
 

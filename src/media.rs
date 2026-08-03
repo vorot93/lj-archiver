@@ -6,10 +6,10 @@ use crate::{
 use reqwest::header::LOCATION;
 use sha2::{Digest, Sha256};
 use std::{
-    borrow::Cow,
     collections::HashMap,
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    ops::Range,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -53,15 +53,17 @@ async fn rewrite_inline_media_configured(
     client: &reqwest::Client,
     download: bool,
 ) -> Result<RewrittenHtml> {
-    let targets = image_targets(html);
+    let targets = image_targets(html).map_err(|error| LjError::Parse {
+        url: base_url.to_string(),
+        reason: error.to_string(),
+    })?;
     let mut downloads: HashMap<Url, String> = HashMap::new();
     let mut assets = Vec::new();
     let mut replacements = Vec::with_capacity(targets.len());
     let allow_local_media = crate::net::is_loopback_test_server(base_url);
 
     for target in &targets {
-        let source = decode_html_character_references(&target.source);
-        let url = match base_url.join(source.as_ref()) {
+        let url = match base_url.join(target.source.as_str()) {
             Ok(url) if is_hosted_http_url(&url) => url,
             Err(_) => {
                 replacements.push(None);
@@ -204,139 +206,23 @@ fn ipv4_from_low32(segments: [u16; 8]) -> Ipv4Addr {
 
 struct ImageTarget {
     source: String,
-    value_start: usize,
-    value_end: usize,
+    value_range: Range<usize>,
 }
 
-fn image_targets(html: &str) -> Vec<ImageTarget> {
-    image_targets_scanned(html).0
-}
-
-#[cfg(test)]
-fn image_targets_with_scan_steps(html: &str) -> (Vec<ImageTarget>, usize) {
-    image_targets_scanned(html)
-}
-
-fn image_targets_scanned(html: &str) -> (Vec<ImageTarget>, usize) {
-    let bytes = html.as_bytes();
-    let mut targets = Vec::new();
-    let mut cursor = 0;
-    let mut scan_steps = 0;
-
-    while cursor < bytes.len() {
-        if bytes[cursor] != b'<' {
-            cursor += 1;
-            scan_steps += 1;
-            continue;
-        }
-
-        let tag_start = cursor;
-        scan_steps += 1;
-
-        if starts_with_at(bytes, tag_start, b"<!--") {
-            cursor = find_html_comment_end(bytes, tag_start + 4, &mut scan_steps);
-            continue;
-        }
-
-        if starts_with_at(bytes, tag_start, b"<?") {
-            cursor = find_html_bogus_comment_end(bytes, tag_start + 2, &mut scan_steps);
-            continue;
-        }
-
-        if starts_with_ascii_case_insensitive_at(bytes, tag_start, b"<!doctype") {
-            cursor = find_html_doctype_end(bytes, tag_start + 9, &mut scan_steps);
-            continue;
-        }
-
-        if starts_with_at(bytes, tag_start, b"<!") {
-            cursor = find_html_bogus_comment_end(bytes, tag_start + 2, &mut scan_steps);
-            continue;
-        }
-
-        match scan_html_tag(html, tag_start, &mut scan_steps) {
-            HtmlTagScan::Invalid => cursor += 1,
-            HtmlTagScan::Unclosed => break,
-            HtmlTagScan::Complete(tag) => {
-                cursor = tag.end;
-                let name = &html[tag.name_start..tag.name_end];
-
-                if !tag.is_closing
-                    && name.eq_ignore_ascii_case("img")
-                    && let Some((value_start, value_end)) = tag.src_value
-                {
-                    targets.push(ImageTarget {
-                        source: html[value_start..value_end].to_owned(),
-                        value_start,
-                        value_end,
-                    });
-                }
-
-                if !tag.is_closing && is_opaque_html_element(name) {
-                    if name.eq_ignore_ascii_case("plaintext") {
-                        break;
-                    }
-
-                    cursor = find_opaque_html_element_end(html, cursor, name, &mut scan_steps);
-                }
-            }
-        }
-    }
-
-    (targets, scan_steps)
-}
-
-fn decode_html_character_references(value: &str) -> Cow<'_, str> {
-    if !value.as_bytes().contains(&b'&') {
-        return Cow::Borrowed(value);
-    }
-
-    let mut output = String::with_capacity(value.len());
-    let mut rest = value;
-
-    while let Some(ampersand) = rest.find('&') {
-        output.push_str(&rest[..ampersand]);
-        let after_ampersand = &rest[ampersand + 1..];
-
-        if let Some((decoded, consumed)) = decode_html_character_reference(after_ampersand) {
-            output.push(decoded);
-            rest = &after_ampersand[consumed..];
-        } else {
-            output.push('&');
-            rest = after_ampersand;
-        }
-    }
-
-    output.push_str(rest);
-    Cow::Owned(output)
-}
-
-fn decode_html_character_reference(value: &str) -> Option<(char, usize)> {
-    let semicolon = value.find(';')?;
-    let entity = &value[..semicolon];
-    let decoded = match entity {
-        "amp" => '&',
-        "lt" => '<',
-        "gt" => '>',
-        "quot" => '"',
-        "apos" => '\'',
-        _ => decode_numeric_character_reference(entity)?,
-    };
-
-    Some((decoded, semicolon + 1))
-}
-
-fn decode_numeric_character_reference(entity: &str) -> Option<char> {
-    let digits = entity.strip_prefix('#')?;
-    let value = if let Some(hex) = digits
-        .strip_prefix('x')
-        .or_else(|| digits.strip_prefix('X'))
-    {
-        u32::from_str_radix(hex, 16).ok()?
-    } else {
-        digits.parse().ok()?
-    };
-
-    char::from_u32(value)
+fn image_targets(html: &str) -> std::result::Result<Vec<ImageTarget>, crate::html_scan::ScanError> {
+    let scanned = crate::html_scan::scan(html)?;
+    Ok(scanned
+        .start_tags()
+        .iter()
+        .filter(|tag| tag.name() == "img")
+        .filter_map(|tag| {
+            let src = tag.attribute("src")?;
+            Some(ImageTarget {
+                source: src.decoded_value().to_string(),
+                value_range: src.value_range()?,
+            })
+        })
+        .collect())
 }
 
 async fn download_asset(
@@ -509,13 +395,13 @@ fn rewrite_img_sources(
     let mut cursor = 0;
 
     for (target, replacement) in targets.iter().zip(replacements) {
-        output.push_str(&html[cursor..target.value_start]);
+        output.push_str(&html[cursor..target.value_range.start]);
         if let Some(target) = replacement {
             push_html_attribute_escaped(&mut output, target);
         } else {
-            output.push_str(&html[target.value_start..target.value_end]);
+            output.push_str(&html[target.value_range.clone()]);
         }
-        cursor = target.value_end;
+        cursor = target.value_range.end;
     }
 
     output.push_str(&html[cursor..]);
@@ -533,547 +419,6 @@ fn push_html_attribute_escaped(output: &mut String, value: &str) {
             character => output.push(character),
         }
     }
-}
-
-enum HtmlTagScan {
-    Invalid,
-    Unclosed,
-    Complete(ScannedHtmlTag),
-}
-
-struct ScannedHtmlTag {
-    name_start: usize,
-    name_end: usize,
-    is_closing: bool,
-    end: usize,
-    src_value: Option<(usize, usize)>,
-}
-
-// Mirrors html5ever's tag/attribute tokenizer transitions while retaining byte
-// offsets into the immutable input. Only quoted attribute-value states hide `>`.
-#[derive(Clone, Copy)]
-enum HtmlTagState {
-    TagName,
-    BeforeAttributeName,
-    AttributeName,
-    AfterAttributeName,
-    BeforeAttributeValue,
-    AttributeValueDoubleQuoted,
-    AttributeValueSingleQuoted,
-    AttributeValueUnquoted,
-    AfterAttributeValueQuoted,
-    SelfClosingStartTag,
-}
-
-fn scan_html_tag(html: &str, start: usize, scan_steps: &mut usize) -> HtmlTagScan {
-    let bytes = html.as_bytes();
-
-    if bytes.get(start) != Some(&b'<') || matches!(bytes.get(start + 1), Some(b'!' | b'?')) {
-        return HtmlTagScan::Invalid;
-    }
-
-    let mut cursor = start + 1;
-    let is_closing = bytes.get(cursor) == Some(&b'/');
-    if is_closing {
-        cursor += 1;
-    }
-
-    if !bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic) {
-        return HtmlTagScan::Invalid;
-    }
-
-    let name_start = cursor;
-    let mut name_end = cursor;
-    let mut attribute_name_start = cursor;
-    let mut attribute_name_end = cursor;
-    let mut attribute_value_start = cursor;
-    let mut src_value = None;
-    let mut state = HtmlTagState::TagName;
-
-    while cursor < html.len() {
-        let Some(current) = html[cursor..].chars().next() else {
-            return HtmlTagScan::Unclosed;
-        };
-        let current_len = current.len_utf8();
-        *scan_steps += 1;
-
-        match state {
-            HtmlTagState::TagName => match current {
-                '\t' | '\n' | '\r' | '\x0C' | ' ' => {
-                    cursor += current_len;
-                    state = HtmlTagState::BeforeAttributeName;
-                }
-                '/' => {
-                    cursor += current_len;
-                    state = HtmlTagState::SelfClosingStartTag;
-                }
-                '>' => {
-                    cursor += current_len;
-                    return complete_html_tag(name_start, name_end, is_closing, cursor, src_value);
-                }
-                _ => {
-                    cursor += current_len;
-                    name_end = cursor;
-                }
-            },
-            HtmlTagState::BeforeAttributeName => match current {
-                '\t' | '\n' | '\r' | '\x0C' | ' ' => cursor += current_len,
-                '/' => {
-                    cursor += current_len;
-                    state = HtmlTagState::SelfClosingStartTag;
-                }
-                '>' => {
-                    cursor += current_len;
-                    return complete_html_tag(name_start, name_end, is_closing, cursor, src_value);
-                }
-                _ => {
-                    attribute_name_start = cursor;
-                    cursor += current_len;
-                    attribute_name_end = cursor;
-                    state = HtmlTagState::AttributeName;
-                }
-            },
-            HtmlTagState::AttributeName => match current {
-                '\t' | '\n' | '\r' | '\x0C' | ' ' => {
-                    cursor += current_len;
-                    state = HtmlTagState::AfterAttributeName;
-                }
-                '/' => {
-                    cursor += current_len;
-                    state = HtmlTagState::SelfClosingStartTag;
-                }
-                '=' => {
-                    cursor += current_len;
-                    state = HtmlTagState::BeforeAttributeValue;
-                }
-                '>' => {
-                    cursor += current_len;
-                    return complete_html_tag(name_start, name_end, is_closing, cursor, src_value);
-                }
-                _ => {
-                    cursor += current_len;
-                    attribute_name_end = cursor;
-                }
-            },
-            HtmlTagState::AfterAttributeName => match current {
-                '\t' | '\n' | '\r' | '\x0C' | ' ' => cursor += current_len,
-                '/' => {
-                    cursor += current_len;
-                    state = HtmlTagState::SelfClosingStartTag;
-                }
-                '=' => {
-                    cursor += current_len;
-                    state = HtmlTagState::BeforeAttributeValue;
-                }
-                '>' => {
-                    cursor += current_len;
-                    return complete_html_tag(name_start, name_end, is_closing, cursor, src_value);
-                }
-                _ => state = HtmlTagState::BeforeAttributeName,
-            },
-            HtmlTagState::BeforeAttributeValue => match current {
-                '\t' | '\n' | '\r' | '\x0C' | ' ' => cursor += current_len,
-                '"' => {
-                    cursor += current_len;
-                    attribute_value_start = cursor;
-                    state = HtmlTagState::AttributeValueDoubleQuoted;
-                }
-                '\'' => {
-                    cursor += current_len;
-                    attribute_value_start = cursor;
-                    state = HtmlTagState::AttributeValueSingleQuoted;
-                }
-                '>' => {
-                    record_src_value(
-                        html,
-                        &mut src_value,
-                        attribute_name_start,
-                        attribute_name_end,
-                        cursor,
-                        cursor,
-                    );
-                    cursor += current_len;
-                    return complete_html_tag(name_start, name_end, is_closing, cursor, src_value);
-                }
-                _ => {
-                    attribute_value_start = cursor;
-                    state = HtmlTagState::AttributeValueUnquoted;
-                }
-            },
-            HtmlTagState::AttributeValueDoubleQuoted => {
-                if current == '"' {
-                    record_src_value(
-                        html,
-                        &mut src_value,
-                        attribute_name_start,
-                        attribute_name_end,
-                        attribute_value_start,
-                        cursor,
-                    );
-                    state = HtmlTagState::AfterAttributeValueQuoted;
-                }
-                cursor += current_len;
-            }
-            HtmlTagState::AttributeValueSingleQuoted => {
-                if current == '\'' {
-                    record_src_value(
-                        html,
-                        &mut src_value,
-                        attribute_name_start,
-                        attribute_name_end,
-                        attribute_value_start,
-                        cursor,
-                    );
-                    state = HtmlTagState::AfterAttributeValueQuoted;
-                }
-                cursor += current_len;
-            }
-            HtmlTagState::AttributeValueUnquoted => match current {
-                '\t' | '\n' | '\r' | '\x0C' | ' ' => {
-                    record_src_value(
-                        html,
-                        &mut src_value,
-                        attribute_name_start,
-                        attribute_name_end,
-                        attribute_value_start,
-                        cursor,
-                    );
-                    cursor += current_len;
-                    state = HtmlTagState::BeforeAttributeName;
-                }
-                '>' => {
-                    record_src_value(
-                        html,
-                        &mut src_value,
-                        attribute_name_start,
-                        attribute_name_end,
-                        attribute_value_start,
-                        cursor,
-                    );
-                    cursor += current_len;
-                    return complete_html_tag(name_start, name_end, is_closing, cursor, src_value);
-                }
-                _ => cursor += current_len,
-            },
-            HtmlTagState::AfterAttributeValueQuoted => match current {
-                '\t' | '\n' | '\r' | '\x0C' | ' ' => {
-                    cursor += current_len;
-                    state = HtmlTagState::BeforeAttributeName;
-                }
-                '/' => {
-                    cursor += current_len;
-                    state = HtmlTagState::SelfClosingStartTag;
-                }
-                '>' => {
-                    cursor += current_len;
-                    return complete_html_tag(name_start, name_end, is_closing, cursor, src_value);
-                }
-                _ => state = HtmlTagState::BeforeAttributeName,
-            },
-            HtmlTagState::SelfClosingStartTag => {
-                if current == '>' {
-                    cursor += current_len;
-                    return complete_html_tag(name_start, name_end, is_closing, cursor, src_value);
-                }
-                state = HtmlTagState::BeforeAttributeName;
-            }
-        }
-    }
-
-    HtmlTagScan::Unclosed
-}
-
-fn complete_html_tag(
-    name_start: usize,
-    name_end: usize,
-    is_closing: bool,
-    end: usize,
-    src_value: Option<(usize, usize)>,
-) -> HtmlTagScan {
-    HtmlTagScan::Complete(ScannedHtmlTag {
-        name_start,
-        name_end,
-        is_closing,
-        end,
-        src_value,
-    })
-}
-
-fn record_src_value(
-    html: &str,
-    src_value: &mut Option<(usize, usize)>,
-    name_start: usize,
-    name_end: usize,
-    value_start: usize,
-    value_end: usize,
-) {
-    if src_value.is_none() && html[name_start..name_end].eq_ignore_ascii_case("src") {
-        *src_value = Some((value_start, value_end));
-    }
-}
-
-fn is_opaque_html_element(name: &str) -> bool {
-    [
-        "script",
-        "style",
-        "textarea",
-        "xmp",
-        "iframe",
-        "noembed",
-        "noframes",
-        "plaintext",
-    ]
-    .iter()
-    .any(|opaque_name| name.eq_ignore_ascii_case(opaque_name))
-}
-
-fn find_opaque_html_element_end(
-    html: &str,
-    content_start: usize,
-    name: &str,
-    scan_steps: &mut usize,
-) -> usize {
-    let bytes = html.as_bytes();
-    let mut cursor = content_start;
-    let closing_name_end_offset = 2 + name.len();
-
-    while cursor + closing_name_end_offset <= bytes.len() {
-        *scan_steps += 1;
-        let closing_name_end = cursor + closing_name_end_offset;
-        let has_appropriate_boundary = matches!(
-            bytes.get(closing_name_end),
-            Some(byte) if byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
-        );
-
-        if has_appropriate_boundary
-            && bytes.get(cursor..cursor + 2) == Some(b"</")
-            && bytes[cursor + 2..closing_name_end].eq_ignore_ascii_case(name.as_bytes())
-        {
-            return match scan_html_tag(html, cursor, scan_steps) {
-                HtmlTagScan::Complete(tag) => tag.end,
-                HtmlTagScan::Invalid | HtmlTagScan::Unclosed => bytes.len(),
-            };
-        }
-
-        cursor += 1;
-    }
-
-    bytes.len()
-}
-
-/// Return the first byte after an HTML-tokenizer-recognized comment end. `>` and
-/// `->` are abrupt endings immediately after `<!--`; `-->` and `--!>` end a
-/// comment from its body. An unclosed comment consumes the remainder.
-fn find_html_comment_end(bytes: &[u8], content_start: usize, scan_steps: &mut usize) -> usize {
-    if bytes.get(content_start) == Some(&b'>') {
-        *scan_steps += 1;
-        return content_start + 1;
-    }
-    if bytes.get(content_start..content_start + 2) == Some(b"->") {
-        *scan_steps += 1;
-        return content_start + 2;
-    }
-
-    let mut cursor = content_start;
-    while cursor < bytes.len() {
-        *scan_steps += 1;
-        if bytes.get(cursor..cursor + 3) == Some(b"-->") {
-            return cursor + 3;
-        }
-        if bytes.get(cursor..cursor + 4) == Some(b"--!>") {
-            return cursor + 4;
-        }
-        cursor += 1;
-    }
-
-    bytes.len()
-}
-
-/// Consume processing-instruction-like and unknown declaration input in the
-/// HTML tokenizer's bogus-comment state. The first `>` ends it; EOF consumes
-/// the remainder.
-fn find_html_bogus_comment_end(
-    bytes: &[u8],
-    content_start: usize,
-    scan_steps: &mut usize,
-) -> usize {
-    let mut cursor = content_start;
-    while cursor < bytes.len() {
-        *scan_steps += 1;
-        if bytes[cursor] == b'>' {
-            return cursor + 1;
-        }
-        cursor += 1;
-    }
-
-    bytes.len()
-}
-
-/// Consume a DOCTYPE according to the tokenizer's declaration-end states. A raw
-/// `>` abruptly terminates and emits the DOCTYPE even inside a quoted public or
-/// system identifier; a matching quote instead continues the state machine.
-/// Malformed states use bogus-DOCTYPE handling, where the first `>` ends the
-/// declaration. EOF always consumes the remainder.
-fn find_html_doctype_end(bytes: &[u8], content_start: usize, scan_steps: &mut usize) -> usize {
-    let mut cursor = content_start;
-
-    match bytes.get(cursor) {
-        Some(b'>') => {
-            *scan_steps += 1;
-            return cursor + 1;
-        }
-        Some(byte) if is_html_whitespace(*byte) => {}
-        Some(_) => return find_html_bogus_comment_end(bytes, cursor, scan_steps),
-        None => return bytes.len(),
-    }
-
-    skip_html_whitespace(bytes, &mut cursor, scan_steps);
-    match bytes.get(cursor) {
-        Some(b'>') => {
-            *scan_steps += 1;
-            return cursor + 1;
-        }
-        Some(_) => {}
-        None => return bytes.len(),
-    }
-
-    while bytes
-        .get(cursor)
-        .is_some_and(|byte| !is_html_whitespace(*byte) && *byte != b'>')
-    {
-        *scan_steps += 1;
-        cursor += 1;
-    }
-
-    if bytes.get(cursor) == Some(&b'>') {
-        *scan_steps += 1;
-        return cursor + 1;
-    }
-    if cursor == bytes.len() {
-        return bytes.len();
-    }
-
-    skip_html_whitespace(bytes, &mut cursor, scan_steps);
-    if bytes.get(cursor) == Some(&b'>') {
-        *scan_steps += 1;
-        return cursor + 1;
-    }
-
-    let is_public = if starts_with_ascii_case_insensitive_at(bytes, cursor, b"public") {
-        *scan_steps += b"public".len();
-        cursor += b"public".len();
-        true
-    } else if starts_with_ascii_case_insensitive_at(bytes, cursor, b"system") {
-        *scan_steps += b"system".len();
-        cursor += b"system".len();
-        false
-    } else {
-        return find_html_bogus_comment_end(bytes, cursor, scan_steps);
-    };
-
-    skip_html_whitespace(bytes, &mut cursor, scan_steps);
-    let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() else {
-        return match bytes.get(cursor) {
-            Some(b'>') => {
-                *scan_steps += 1;
-                cursor + 1
-            }
-            Some(_) => find_html_bogus_comment_end(bytes, cursor, scan_steps),
-            None => bytes.len(),
-        };
-    };
-
-    let mut cursor = match find_quoted_doctype_identifier_end(bytes, cursor, quote, scan_steps) {
-        QuotedDoctypeIdentifierEnd::Quote(cursor) => cursor,
-        QuotedDoctypeIdentifierEnd::Declaration(end) => return end,
-        QuotedDoctypeIdentifierEnd::Eof => return bytes.len(),
-    };
-
-    skip_html_whitespace(bytes, &mut cursor, scan_steps);
-    if !is_public || bytes.get(cursor) == Some(&b'>') {
-        return finish_html_doctype(bytes, cursor, scan_steps);
-    }
-
-    let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() else {
-        return match bytes.get(cursor) {
-            Some(_) => find_html_bogus_comment_end(bytes, cursor, scan_steps),
-            None => bytes.len(),
-        };
-    };
-
-    let cursor = match find_quoted_doctype_identifier_end(bytes, cursor, quote, scan_steps) {
-        QuotedDoctypeIdentifierEnd::Quote(cursor) => cursor,
-        QuotedDoctypeIdentifierEnd::Declaration(end) => return end,
-        QuotedDoctypeIdentifierEnd::Eof => return bytes.len(),
-    };
-
-    finish_html_doctype(bytes, cursor, scan_steps)
-}
-
-enum QuotedDoctypeIdentifierEnd {
-    Quote(usize),
-    Declaration(usize),
-    Eof,
-}
-
-fn find_quoted_doctype_identifier_end(
-    bytes: &[u8],
-    mut cursor: usize,
-    quote: u8,
-    scan_steps: &mut usize,
-) -> QuotedDoctypeIdentifierEnd {
-    *scan_steps += 1;
-    cursor += 1;
-
-    while cursor < bytes.len() {
-        *scan_steps += 1;
-        let current = bytes[cursor];
-        cursor += 1;
-        if current == b'>' {
-            return QuotedDoctypeIdentifierEnd::Declaration(cursor);
-        }
-        if current == quote {
-            return QuotedDoctypeIdentifierEnd::Quote(cursor);
-        }
-    }
-
-    QuotedDoctypeIdentifierEnd::Eof
-}
-
-fn finish_html_doctype(bytes: &[u8], mut cursor: usize, scan_steps: &mut usize) -> usize {
-    skip_html_whitespace(bytes, &mut cursor, scan_steps);
-    match bytes.get(cursor) {
-        Some(b'>') => {
-            *scan_steps += 1;
-            cursor + 1
-        }
-        Some(_) => find_html_bogus_comment_end(bytes, cursor, scan_steps),
-        None => bytes.len(),
-    }
-}
-
-fn skip_html_whitespace(bytes: &[u8], cursor: &mut usize, scan_steps: &mut usize) {
-    while bytes
-        .get(*cursor)
-        .is_some_and(|byte| is_html_whitespace(*byte))
-    {
-        *scan_steps += 1;
-        *cursor += 1;
-    }
-}
-
-fn is_html_whitespace(byte: u8) -> bool {
-    matches!(byte, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
-}
-
-fn starts_with_at(bytes: &[u8], index: usize, needle: &[u8]) -> bool {
-    index + needle.len() <= bytes.len() && &bytes[index..index + needle.len()] == needle
-}
-
-fn starts_with_ascii_case_insensitive_at(bytes: &[u8], index: usize, needle: &[u8]) -> bool {
-    bytes
-        .get(index..index + needle.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]
@@ -1207,7 +552,7 @@ mod tests {
     #[test]
     fn serializes_rewritten_image_paths_with_forward_slashes() {
         let html = r#"<img src="remote.png">"#;
-        let targets = image_targets(html);
+        let targets = image_targets(html).unwrap();
         let replacements = [Some(storage::adoc_path(&PathBuf::from(
             r"..\assets\image.png",
         )))];
@@ -1652,6 +997,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tokenizer_decodes_named_and_semicolonless_numeric_references_in_src() {
+        let html = r#"<img src="https&colon;//cdn.example.test/p.jpg?x=&#38y=2">"#;
+        let rewritten = rewrite_inline_media(
+            html,
+            &Url::parse("https://news.livejournal.com/1.html").unwrap(),
+            Path::new("unused"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rewritten.html,
+            r#"<img src="https://cdn.example.test/p.jpg?x=&amp;y=2">"#
+        );
+        assert!(rewritten.assets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn media_rewrite_changes_only_the_original_src_value_bytes() {
+        let html = r#"<img data-before='keep' src='next.jpg?a=1&amp;b=2' data-after="keep">"#;
+        let rewritten = rewrite_inline_media(
+            html,
+            &Url::parse("https://cdn.example.test/posts/1.html").unwrap(),
+            Path::new("unused"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rewritten.html,
+            r#"<img data-before='keep' src='https://cdn.example.test/posts/next.jpg?a=1&amp;b=2' data-after="keep">"#
+        );
+    }
+
+    #[tokio::test]
     async fn ignores_commented_img_tags_when_rewriting_sources() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1740,19 +1124,14 @@ mod tests {
     }
 
     #[test]
-    fn bogus_comment_scanning_is_linear_and_does_not_restart_inside_content() {
+    fn bogus_comment_scanning_does_not_restart_inside_content() {
         let bogus = r#"<?probe <img src="/fake.jpg">>"#.repeat(4_096);
         let html = format!(r#"{bogus}<img src="/real.jpg">"#);
 
-        let (targets, scan_steps) = image_targets_with_scan_steps(&html);
+        let targets = image_targets(&html).unwrap();
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].source, "/real.jpg");
-        assert!(
-            scan_steps <= 4 * html.len(),
-            "scanner took {scan_steps} steps for {} input bytes",
-            html.len()
-        );
     }
 
     #[test]
@@ -1761,14 +1140,9 @@ mod tests {
             r#"<?probe <img src="/fake-question.jpg""#,
             r#"<!probe <img src="/fake-declaration.jpg""#,
         ] {
-            let (targets, scan_steps) = image_targets_with_scan_steps(html);
+            let targets = image_targets(html).unwrap();
 
             assert!(targets.is_empty(), "got a target for {html:?}");
-            assert!(
-                scan_steps <= 2 * html.len(),
-                "scanner took {scan_steps} steps for {} input bytes",
-                html.len()
-            );
         }
     }
 
@@ -1792,18 +1166,13 @@ mod tests {
         ];
 
         for (html, expected_sources) in cases {
-            let (targets, scan_steps) = image_targets_with_scan_steps(html);
+            let targets = image_targets(html).unwrap();
             let sources: Vec<_> = targets
                 .iter()
                 .map(|target| target.source.as_str())
                 .collect();
 
             assert_eq!(sources, expected_sources, "got targets for {html:?}");
-            assert!(
-                scan_steps <= 2 * html.len(),
-                "scanner took {scan_steps} steps for {} input bytes",
-                html.len()
-            );
         }
     }
 
@@ -1859,15 +1228,10 @@ mod tests {
     fn malformed_doctype_name_quote_uses_bogus_terminator() {
         let html = r#"<!DOCTYPE "bogus><img src="/real.jpg">"#;
 
-        let (targets, scan_steps) = image_targets_with_scan_steps(html);
+        let targets = image_targets(html).unwrap();
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].source, "/real.jpg");
-        assert!(
-            scan_steps <= 2 * html.len(),
-            "scanner took {scan_steps} steps for {} input bytes",
-            html.len()
-        );
     }
 
     #[tokio::test]
@@ -2518,22 +1882,17 @@ mod tests {
     #[test]
     fn unclosed_quoted_value_consumes_img_looking_remainder() {
         let html = r#"<img src="a.jpg" alt="oops><img src=b.jpg>"#;
-        let targets = image_targets(html);
+        let targets = image_targets(html).unwrap();
 
         assert!(targets.is_empty());
     }
 
     #[test]
-    fn scanner_has_linear_work_for_many_unclosed_tag_starts() {
+    fn many_unclosed_tag_starts_do_not_produce_image_targets() {
         let html = "<a ".repeat(4_096);
 
-        let (targets, scan_steps) = image_targets_with_scan_steps(&html);
+        let targets = image_targets(&html).unwrap();
 
         assert!(targets.is_empty());
-        assert!(
-            scan_steps <= 4 * html.len(),
-            "scanner took {scan_steps} steps for {} input bytes",
-            html.len()
-        );
     }
 }

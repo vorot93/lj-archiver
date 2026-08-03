@@ -22,7 +22,6 @@ pub(crate) struct ScannedHtml {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // The complete scanner API is consumed by staged caller migrations.
 pub(crate) struct ScannedStartTag {
     name: String,
     source_range: Range<usize>,
@@ -30,7 +29,6 @@ pub(crate) struct ScannedStartTag {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // The complete scanner API is consumed by staged caller migrations.
 pub(crate) struct ScannedAttribute {
     name: String,
     decoded_value: String,
@@ -51,16 +49,17 @@ impl ScannedHtml {
     }
 }
 
-#[allow(dead_code)] // The complete scanner API is consumed by staged caller migrations.
 impl ScannedStartTag {
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
+    #[allow(dead_code)] // Consumed by the staged passthrough source migration.
     pub(crate) fn source_range(&self) -> Range<usize> {
         self.source_range.clone()
     }
 
+    #[allow(dead_code)] // Consumed by the staged passthrough source migration.
     pub(crate) fn attributes(&self) -> &[ScannedAttribute] {
         &self.attributes
     }
@@ -72,8 +71,8 @@ impl ScannedStartTag {
     }
 }
 
-#[allow(dead_code)] // The complete scanner API is consumed by staged caller migrations.
 impl ScannedAttribute {
+    #[allow(dead_code)] // Consumed by staged attribute-sensitive caller migrations.
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
@@ -86,6 +85,7 @@ impl ScannedAttribute {
         self.value_range.clone()
     }
 
+    #[allow(dead_code)] // Consumed by staged attribute-sensitive caller migrations.
     pub(crate) fn is_qualified(&self) -> bool {
         self.qualified
     }
