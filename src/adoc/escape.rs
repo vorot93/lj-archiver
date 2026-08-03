@@ -34,10 +34,21 @@ pub(crate) fn neutralize_active_adoc_lines(text: &str) -> String {
     let mut output = String::new();
 
     for line in text.split_inclusive('\n') {
-        if starts_with_active_adoc_syntax(line.trim_end_matches('\n')) {
+        let line_without_newline = line.trim_end_matches('\n');
+        let trimmed = line_without_newline.trim_start();
+
+        if let Some(marker) = description_list_marker_position(trimmed) {
+            let leading_len = line_without_newline.len() - trimmed.len();
+            let marker = leading_len + marker;
+            output.push_str(&line[..marker + 1]);
+            output.push_str("pass:[:]");
+            output.push_str(&line[marker + 2..]);
+        } else if starts_with_active_adoc_syntax(line_without_newline) {
             output.push('\\');
+            output.push_str(line);
+        } else {
+            output.push_str(line);
         }
-        output.push_str(line);
     }
 
     output
@@ -317,6 +328,9 @@ fn starts_with_active_adoc_syntax(text: &str) -> bool {
         || starts_with_heading(trimmed)
         || starts_with_list_marker(trimmed)
         || starts_with_admonition_label(trimmed)
+        || starts_with_line_comment(trimmed)
+        || starts_with_hyphen_list_marker(trimmed)
+        || starts_with_description_list_marker(trimmed)
         || is_active_delimiter_only(trimmed)
 }
 
@@ -379,6 +393,43 @@ fn starts_with_admonition_label(text: &str) -> bool {
             .and_then(|rest| rest.strip_prefix(':'))
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
     })
+}
+
+fn starts_with_line_comment(text: &str) -> bool {
+    text.starts_with("//")
+}
+
+fn starts_with_hyphen_list_marker(text: &str) -> bool {
+    text.strip_prefix('-')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(char::is_whitespace)
+}
+
+fn starts_with_description_list_marker(text: &str) -> bool {
+    description_list_marker_position(text).is_some()
+}
+
+fn description_list_marker_position(text: &str) -> Option<usize> {
+    if text.starts_with('\\') {
+        return None;
+    }
+
+    let bytes = text.as_bytes();
+    let mut has_term = false;
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes.get(cursor..cursor + 2) == Some(b"::")
+            && has_term
+            && bytes.get(cursor + 2).is_none_or(u8::is_ascii_whitespace)
+        {
+            return Some(cursor);
+        }
+        has_term |= !bytes[cursor].is_ascii_whitespace();
+        cursor += 1;
+    }
+
+    None
 }
 
 fn is_delimiter_only(text: &str, delimiter: char) -> bool {
@@ -527,6 +578,17 @@ pub(crate) fn neutralize_pending_plain_text_block_macro(output: &mut String) {
     let line_start = output.rfind('\n').map_or(0, |index| index + 1);
     let line = &output[line_start..];
 
+    if let Some(prefix) = line.strip_suffix(":pass:[:]") {
+        let prefix = prefix.to_string();
+        if is_block_macro_prefix(&prefix) {
+            output.truncate(line_start);
+            output.push('\\');
+            output.push_str(&prefix);
+            output.push_str("::");
+            return;
+        }
+    }
+
     if ends_with_block_macro_prefix(line) || ends_with_inline_passthrough_macro_prefix(line) {
         output.insert(line_start, '\\');
     }
@@ -537,8 +599,12 @@ fn ends_with_block_macro_prefix(text: &str) -> bool {
         return false;
     };
 
-    !prefix.is_empty()
-        && prefix.chars().all(|character| {
+    is_block_macro_prefix(prefix)
+}
+
+fn is_block_macro_prefix(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
         })
 }

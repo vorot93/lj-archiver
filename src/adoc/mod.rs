@@ -2092,6 +2092,41 @@ mod tests {
     }
 
     #[test]
+    fn neutralizes_missing_plain_text_line_start_constructs() {
+        for (html, active, escaped) in [
+            (
+                "<p>// visible comment</p>",
+                "// visible comment",
+                r"\// visible comment",
+            ),
+            (
+                "<p>- visible item</p>",
+                "- visible item",
+                r"\- visible item",
+            ),
+            (
+                "<p>term:: visible definition</p>",
+                "term:: visible definition",
+                "term:pass:[:] visible definition",
+            ),
+            ("<p>term::</p>", "term::", "term:pass:[:]"),
+        ] {
+            let adoc = html_to_adoc(html);
+            assert!(!adoc.lines().any(|line| line == active), "{adoc:?}");
+            assert!(adoc.contains(escaped), "{adoc:?}");
+        }
+    }
+
+    #[test]
+    fn neutralizes_missing_constructs_after_breaks_and_inline_boundaries() {
+        let adoc =
+            html_to_adoc("<p>ok<br>-<span> item</span><br>term<span>:: definition</span></p>");
+
+        assert!(adoc.contains("\n\\- item"), "{adoc:?}");
+        assert!(adoc.contains("\nterm:pass:[:] definition"), "{adoc:?}");
+    }
+
+    #[test]
     fn neutralizes_plain_text_admonition_label() {
         let adoc = html_to_adoc("<p>NOTE: text</p>");
 
@@ -3091,6 +3126,41 @@ mod tests {
             )
         );
         assert!(!resolved.contains(",role=red"), "got: {resolved:?}");
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn neutralizes_missing_constructs_after_asciidoctor_conversion() {
+        let adoc = [
+            html_to_adoc("<p>// visible comment</p>"),
+            html_to_adoc("<p>- visible item</p>"),
+            html_to_adoc("<p>term:: visible definition</p>"),
+            html_to_adoc("<p>term::</p>"),
+        ]
+        .concat();
+
+        let html = convert_with_asciidoctor(&adoc);
+        let document = Html::parse_document(&html);
+        let visible_text = document.root_element().text().collect::<String>();
+
+        for visible in [
+            "// visible comment",
+            "- visible item",
+            "term:: visible definition",
+            "term::",
+        ] {
+            assert!(
+                visible_text.contains(visible),
+                "missing {visible:?} in: {html}"
+            );
+        }
+        assert!(
+            document
+                .select(&Selector::parse(".ulist, .dlist").unwrap())
+                .next()
+                .is_none(),
+            "unexpected list in: {html}"
+        );
     }
 
     #[test]

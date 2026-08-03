@@ -169,7 +169,8 @@ HTTP(S) references are resolved against the individual post's delivered final
 URL and written as absolute external targets. Non-HTTP(S) link and image
 schemes are kept as inert visible text rather than active AsciiDoc macros.
 Plain text from posts and comments is also kept literal when it resembles an
-AsciiDoc macro, attribute, heading, list, or other active syntax.
+AsciiDoc macro, attribute, heading, list (including hyphen lists and
+description lists), comment, or other active syntax.
 Unsupported HTML is preserved as raw HTML only when every element, attribute,
 and URL belongs to a reviewed inert subset. Active HTML and custom, namespaced,
 or otherwise unknown capabilities remain visible in source listings instead of
