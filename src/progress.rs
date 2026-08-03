@@ -216,11 +216,12 @@ impl Progress {
             title: title.to_string(),
         });
         let done = self.inner.completed.fetch_add(1, Ordering::Relaxed) + 1;
+        let terminal_title = sanitize_terminal_text(title);
         match self.inner.mode {
-            Mode::Interactive => self.bar_step(&format!("{id}  \"{title}\"")),
+            Mode::Interactive => self.bar_step(&format!("{id}  \"{terminal_title}\"")),
             Mode::Plain => {
                 let total = self.inner.total.load(Ordering::Relaxed);
-                eprintln!("{}", plain_post_line(done, total, id, title));
+                eprintln!("{}", plain_post_line(done, total, id, &terminal_title));
             }
             Mode::Quiet => {}
         }
@@ -323,6 +324,22 @@ fn plain_post_line(done: usize, total: usize, id: u64, title: &str) -> String {
     format!("[{done}/{total}] archived {id}  \"{title}\"")
 }
 
+fn sanitize_terminal_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    *character,
+                    '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                )
+        })
+        .collect()
+}
+
 fn plain_skip_line(done: usize, total: usize, id: u64) -> String {
     format!("[{done}/{total}] skipped {id} (exists)")
 }
@@ -384,6 +401,13 @@ mod tests {
             single_done_line(166511, Path::new("out/posts/166511.adoc")),
             "archived 166511 -> out/posts/166511.adoc"
         );
+    }
+
+    #[test]
+    fn terminal_text_sanitizer_removes_controls_and_bidi_formatting_only() {
+        let hostile = "safe\u{1b}]0;owned\u{7} text\u{85}\u{202e}spoof\u{2066}x\u{2069}";
+
+        assert_eq!(sanitize_terminal_text(hostile), "safe]0;owned textspoofx");
     }
 
     #[test]

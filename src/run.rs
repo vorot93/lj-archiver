@@ -21,6 +21,7 @@ use futures::{StreamExt, stream};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
+    fmt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -102,7 +103,39 @@ pub struct RunOutcome {
     pub failed: usize,
     pub failed_pages: usize,
     pub failures: Vec<PostFailure>,
+    pub warnings: Vec<RunWarning>,
     pub journal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunWarning {
+    LinkMetadataNotWritten { post_id: u64, message: String },
+    FinalLinkUpgradePreserved { post_id: u64, message: String },
+    PendingCleanupFailed { post_id: u64, message: String },
+    RetainedPostPreserved { post_id: u64, message: String },
+}
+
+impl fmt::Display for RunWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RunWarning::LinkMetadataNotWritten { post_id, message } => write!(
+                formatter,
+                "post {post_id}: trusted link metadata was not written: {message}"
+            ),
+            RunWarning::FinalLinkUpgradePreserved { post_id, message } => write!(
+                formatter,
+                "post {post_id}: external links were retained during final upgrade: {message}"
+            ),
+            RunWarning::PendingCleanupFailed { post_id, message } => write!(
+                formatter,
+                "post {post_id}: finalized pending file could not be removed: {message}"
+            ),
+            RunWarning::RetainedPostPreserved { post_id, message } => write!(
+                formatter,
+                "post {post_id}: retained post bytes were preserved: {message}"
+            ),
+        }
+    }
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -128,6 +161,12 @@ pub async fn run_archive(
     options: &RunOptions,
     progress: &Progress,
 ) -> Result<RunOutcome> {
+    if options.concurrency == 0 {
+        return Err(LjError::InvalidOptions {
+            reason: "concurrency must be greater than zero".to_string(),
+        });
+    }
+
     match parse_target(target, options.journal_context.as_deref())? {
         ArchiveTarget::Post { journal, id, url } => {
             archive_post(options, progress, journal, id, url).await
@@ -160,7 +199,7 @@ async fn archive_post(
 
     progress.single_started(id);
     let client = LjClient::new(options.user_agent.as_deref())?;
-    let post = fetch_and_write_post(
+    let (post, warnings) = fetch_and_write_post(
         &client,
         options,
         &archive,
@@ -184,6 +223,7 @@ async fn archive_post(
         failed: 0,
         failed_pages: 0,
         failures: Vec::new(),
+        warnings,
         journal: None,
     })
 }
@@ -220,14 +260,20 @@ impl FinalPostWriter for AtomicFinalPostWriter {
     }
 }
 
-fn warn_metadata_failure(post_id: u64, publication: &PostPublication) {
+fn warn_metadata_failure(post_id: u64, publication: &PostPublication) -> Option<RunWarning> {
     if let Some(error) = &publication.metadata_warning {
         tracing::warn!(
             post_id,
             error = %error,
             "post was published but trusted link metadata could not be written"
         );
+        return Some(RunWarning::LinkMetadataNotWritten {
+            post_id,
+            message: error.to_string(),
+        });
     }
+
+    None
 }
 
 async fn archive_journal_with_writer<W: FinalPostWriter>(
@@ -281,33 +327,35 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     let mut finalized = Vec::new();
     let mut retained = Vec::new();
     let mut failures = Vec::new();
+    let mut warnings = Vec::new();
     let mut skipped = 0usize;
     let mut archived = 0usize;
     let no_local_ids = HashSet::new();
     while let Some(outcome) = outcomes.next().await {
         match outcome {
             JournalPostOutcome::Prepared(mut post) => {
-                let first_stage =
-                    archive
-                        .read_pending_post(&post.pending_path)
-                        .and_then(|pending| {
-                            let external =
-                                resolve_pending_links(&pending, &post.links, &no_local_ids)
-                                    .map_err(|error| LjError::LinkIntegrity {
-                                        url: post.delivered_url.to_string(),
-                                        reason: error.to_string(),
-                                    })?;
-                            writer.publish_post(
-                                &archive,
-                                post.archived.id,
-                                &post.archived.path,
-                                &external,
-                            )
-                        });
+                let first_stage = archive
+                    .read_pending_post(post.archived.id)
+                    .and_then(|pending| {
+                        let external = resolve_pending_links(&pending, &post.links, &no_local_ids)
+                            .map_err(|error| LjError::LinkIntegrity {
+                                url: post.delivered_url.to_string(),
+                                reason: error.to_string(),
+                            })?;
+                        writer.publish_post(
+                            &archive,
+                            post.archived.id,
+                            &post.archived.path,
+                            &external,
+                        )
+                    });
 
                 match first_stage {
                     Ok(publication) => {
-                        warn_metadata_failure(post.archived.id, &publication);
+                        if let Some(warning) = warn_metadata_failure(post.archived.id, &publication)
+                        {
+                            warnings.push(warning);
+                        }
                         post.archived.path = publication.path;
                         posts.insert(post.archived.id, post.archived.clone());
                         archived += 1;
@@ -321,7 +369,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                             url: post.delivered_url,
                             message: error.to_string(),
                         });
-                        cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
+                        cleanup_pending_post(&archive, post.archived.id, &mut warnings);
                     }
                 }
             }
@@ -337,7 +385,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     let final_ids = posts.keys().copied().collect::<HashSet<_>>();
 
     for post in &finalized {
-        match archive.read_pending_post(&post.pending_path) {
+        match archive.read_pending_post(post.archived.id) {
             Ok(pending) => match resolve_pending_links(&pending, &post.links, &final_ids) {
                 Ok(local) => {
                     match writer.publish_post(
@@ -347,7 +395,11 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                         &local,
                     ) {
                         Ok(publication) => {
-                            warn_metadata_failure(post.archived.id, &publication);
+                            if let Some(warning) =
+                                warn_metadata_failure(post.archived.id, &publication)
+                            {
+                                warnings.push(warning);
+                            }
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -355,6 +407,10 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                                 error = %error,
                                 "could not upgrade finalized post links; retaining external links"
                             );
+                            warnings.push(RunWarning::FinalLinkUpgradePreserved {
+                                post_id: post.archived.id,
+                                message: error.to_string(),
+                            });
                         }
                     }
                 }
@@ -368,6 +424,10 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                         error = %error,
                         "could not resolve finalized post links; retaining external links"
                     );
+                    warnings.push(RunWarning::FinalLinkUpgradePreserved {
+                        post_id: post.archived.id,
+                        message: error.to_string(),
+                    });
                 }
             },
             Err(error) => {
@@ -376,14 +436,25 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                     error = %error,
                     "could not reread pending post for local link upgrade; retaining external links"
                 );
+                warnings.push(RunWarning::FinalLinkUpgradePreserved {
+                    post_id: post.archived.id,
+                    message: error.to_string(),
+                });
             }
         }
-        cleanup_pending_post(&archive, post.archived.id, &post.pending_path);
+        cleanup_pending_post(&archive, post.archived.id, &mut warnings);
     }
 
     let final_targets = trusted_target_filenames(&posts)?;
     for post in &retained {
-        repair_retained_post(&archive, writer, &journal, &final_targets, post);
+        repair_retained_post(
+            &archive,
+            writer,
+            &journal,
+            &final_targets,
+            post,
+            &mut warnings,
+        );
     }
 
     progress.archiving_finished();
@@ -407,6 +478,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
         failed: failures.len(),
         failed_pages,
         failures,
+        warnings,
         journal: Some(journal),
     })
 }
@@ -457,7 +529,7 @@ async fn archive_journal_post(
                     || random_link_namespace(&namespace_url),
                 );
                 let rendered = rendered?;
-                let pending_path = archive.write_pending_post(id, &rendered.contents)?;
+                archive.write_pending_post(id, &rendered.contents)?;
 
                 Result::Ok(PreparedPost {
                     archived: ArchivedPost {
@@ -466,7 +538,6 @@ async fn archive_journal_post(
                         path: destination,
                     },
                     delivered_url: delivered_url.clone(),
-                    pending_path,
                     links: rendered.links,
                 })
             }
@@ -492,13 +563,17 @@ async fn archive_journal_post(
     }
 }
 
-fn cleanup_pending_post(archive: &Archive, id: u64, path: &std::path::Path) {
-    if let Err(error) = archive.remove_pending_post(path) {
+fn cleanup_pending_post(archive: &Archive, id: u64, warnings: &mut Vec<RunWarning>) {
+    if let Err(error) = archive.remove_pending_post(id) {
         tracing::warn!(
             post_id = id,
             error = %error,
             "could not remove finalized pending post"
         );
+        warnings.push(RunWarning::PendingCleanupFailed {
+            post_id: id,
+            message: error.to_string(),
+        });
     }
 }
 
@@ -508,6 +583,7 @@ fn repair_retained_post<W: FinalPostWriter>(
     journal: &str,
     final_targets: &HashMap<u64, String>,
     post: &ArchivedPost,
+    warnings: &mut Vec<RunWarning>,
 ) {
     let contents = match std::fs::read_to_string(&post.path) {
         Ok(contents) => contents,
@@ -521,6 +597,10 @@ fn repair_retained_post<W: FinalPostWriter>(
                 error = %error,
                 "could not read retained post for trusted link repair; preserving existing bytes"
             );
+            warnings.push(RunWarning::RetainedPostPreserved {
+                post_id: post.id,
+                message: error.to_string(),
+            });
             return;
         }
     };
@@ -531,6 +611,10 @@ fn repair_retained_post<W: FinalPostWriter>(
                 post_id = post.id,
                 "retained post has no trusted link metadata; preserving existing bytes"
             );
+            warnings.push(RunWarning::RetainedPostPreserved {
+                post_id: post.id,
+                message: "trusted link metadata is missing".to_string(),
+            });
             return;
         }
         Err(error) => {
@@ -539,6 +623,10 @@ fn repair_retained_post<W: FinalPostWriter>(
                 error = %error,
                 "could not read trusted link metadata; preserving retained post bytes"
             );
+            warnings.push(RunWarning::RetainedPostPreserved {
+                post_id: post.id,
+                message: error.to_string(),
+            });
             return;
         }
     };
@@ -550,6 +638,10 @@ fn repair_retained_post<W: FinalPostWriter>(
                 error = %error,
                 "trusted link metadata could not be validated; preserving retained post bytes"
             );
+            warnings.push(RunWarning::RetainedPostPreserved {
+                post_id: post.id,
+                message: error.to_string(),
+            });
             return;
         }
     };
@@ -558,13 +650,21 @@ fn repair_retained_post<W: FinalPostWriter>(
     }
 
     match writer.publish_post(archive, post.id, &post.path, &resolved) {
-        Ok(publication) => warn_metadata_failure(post.id, &publication),
+        Ok(publication) => {
+            if let Some(warning) = warn_metadata_failure(post.id, &publication) {
+                warnings.push(warning);
+            }
+        }
         Err(error) => {
             tracing::warn!(
                 post_id = post.id,
                 error = %error,
                 "could not publish trusted retained-link repair; retaining existing post"
             );
+            warnings.push(RunWarning::RetainedPostPreserved {
+                post_id: post.id,
+                message: error.to_string(),
+            });
         }
     }
 }
@@ -629,7 +729,7 @@ async fn fetch_and_write_post(
     requested_id: u64,
     requested_url: &Url,
     write_policy: PostWritePolicy,
-) -> Result<ArchivedPost> {
+) -> Result<(ArchivedPost, Vec<RunWarning>)> {
     let mut post =
         fetch_requested_post(client, requested_journal, requested_id, requested_url).await?;
     rewrite_post_media(&mut post, options, archive).await?;
@@ -655,13 +755,18 @@ async fn fetch_and_write_post(
             }
         })?;
     let publication = archive.publish_post(&write_policy.destination, &resolved)?;
-    warn_metadata_failure(requested_id, &publication);
+    let warnings = warn_metadata_failure(requested_id, &publication)
+        .into_iter()
+        .collect();
 
-    Ok(ArchivedPost {
-        id: requested_id,
-        title: post.title.clone(),
-        path: publication.path,
-    })
+    Ok((
+        ArchivedPost {
+            id: requested_id,
+            title: post.title.clone(),
+            path: publication.path,
+        },
+        warnings,
+    ))
 }
 
 struct PostWritePolicy {
@@ -817,7 +922,6 @@ fn failure_reason(failed_pages: usize, failures: &[PostFailure]) -> String {
 struct PreparedPost {
     archived: ArchivedPost,
     delivered_url: Url,
-    pending_path: PathBuf,
     links: Vec<PendingLink>,
 }
 
@@ -900,6 +1004,52 @@ mod tests {
             reason.contains("2 archive page(s) failed to fetch"),
             "unexpected reason: {reason}"
         );
+    }
+
+    #[test]
+    fn pending_cleanup_failure_is_captured_in_authoritative_warnings() {
+        let dir = tempdir().unwrap();
+        let archive = Archive::new(dir.path().join("out"), "news");
+        let mut warnings = Vec::new();
+
+        cleanup_pending_post(&archive, 1, &mut warnings);
+
+        assert!(matches!(
+            warnings.as_slice(),
+            [RunWarning::PendingCleanupFailed { post_id: 1, .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_run_archive_rejects_zero_concurrency_before_network_activity() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">One</a>"#),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let mut options = journal_cli(&server, dir.path(), false).options();
+        options.concurrency = 0;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            run_archive("news", &options, &Progress::hidden()),
+        )
+        .await
+        .expect("zero concurrency must return rather than remain pending");
+
+        assert!(matches!(result, Err(LjError::InvalidOptions { .. })));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]
@@ -1173,11 +1323,10 @@ mod tests {
         )
         .await;
 
-        let pending_path = match outcome {
+        match outcome {
             JournalPostOutcome::Prepared(post) => {
                 assert_eq!(post.archived.id, 1);
                 assert_eq!(post.archived.title, "Post Title");
-                post.pending_path
             }
             JournalPostOutcome::Skipped(post) => {
                 panic!("late unverified post {} was incorrectly skipped", post.id)
@@ -1206,7 +1355,7 @@ mod tests {
                 .any(|event| matches!(event, ProgressEvent::PostSkipped { id: 1 })),
             "{events:?}"
         );
-        archive.remove_pending_post(&pending_path).unwrap();
+        archive.remove_pending_post(1).unwrap();
     }
 
     #[tokio::test]
@@ -3116,6 +3265,10 @@ mod tests {
         assert_eq!(outcome.archived, 2);
         assert_eq!(outcome.failed, 0);
         assert!(outcome.failures.is_empty());
+        assert!(matches!(
+            outcome.warnings.as_slice(),
+            [RunWarning::FinalLinkUpgradePreserved { post_id: 1, .. }]
+        ));
         let post_path = dir.path().join("out/posts/1.adoc");
         let post = std::fs::read_to_string(&post_path).unwrap();
         assert!(
@@ -3175,8 +3328,58 @@ mod tests {
         assert_eq!(outcome.skipped, 0);
         assert_eq!(outcome.failed, 0);
         assert!(outcome.failures.is_empty());
+        assert!(matches!(
+            outcome.warnings.as_slice(),
+            [RunWarning::LinkMetadataNotWritten { post_id: 1, .. }]
+        ));
         assert_eq!(writer.calls_for(1), 2);
         read_matching_link_metadata(&dir.path().join("out/posts/1.adoc"));
+    }
+
+    #[tokio::test]
+    async fn resume_valid_already_final_metadata_is_a_byte_exact_noop_without_publication() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2024/12/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">One</a>"#),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempdir().unwrap();
+        let baseline = "= Existing\n\nxref:1.adoc[Self]\n";
+        seed_existing_archive(dir.path(), &[(1, "Existing", baseline)], false);
+        let post_path = dir.path().join("out/posts/1.adoc");
+        write_link_metadata_fixture(
+            &post_path,
+            baseline,
+            vec![stored_link(baseline, "xref:1.adoc", 1, "xref")],
+        );
+        let metadata_path = link_metadata_path(&post_path);
+        let before_post = std::fs::read(&post_path).unwrap();
+        let before_metadata = std::fs::read(&metadata_path).unwrap();
+        let options = journal_cli(&server, dir.path(), true).options();
+        let writer = InjectedFinalPostWriter::with_injections([], []);
+
+        let outcome =
+            archive_journal_with_writer(&options, &Progress::hidden(), "news".to_string(), &writer)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.warnings.is_empty());
+        assert_eq!(writer.calls_for(1), 0);
+        assert_eq!(std::fs::read(&post_path).unwrap(), before_post);
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), before_metadata);
     }
 
     #[tokio::test]
@@ -3378,6 +3581,10 @@ mod tests {
         assert_eq!(outcome.archived, 0);
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.failed, 1);
+        assert!(matches!(
+            outcome.warnings.as_slice(),
+            [RunWarning::RetainedPostPreserved { post_id: 1, .. }]
+        ));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("out/posts/01.adoc")).unwrap(),
             baseline

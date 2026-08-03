@@ -80,14 +80,38 @@ fn neutralize_inline_adoc_syntax(text: &str) -> String {
 }
 
 fn neutralize_inline_attribute_references(text: &str) -> String {
+    let mut scan_steps = AttributeScanSteps::default();
+    neutralize_inline_attribute_references_scanned(text, &mut scan_steps)
+}
+
+#[cfg(test)]
+fn neutralize_inline_attribute_references_with_scan_steps(text: &str) -> (String, usize) {
+    let mut scan_steps = AttributeScanSteps::default();
+    let output = neutralize_inline_attribute_references_scanned(text, &mut scan_steps);
+    (output, scan_steps.count)
+}
+
+fn neutralize_inline_attribute_references_scanned(
+    text: &str,
+    scan_steps: &mut AttributeScanSteps,
+) -> String {
     let bytes = text.as_bytes();
+    // Special set/counter forms may contain arbitrary values. A reverse pass
+    // makes their same-line closing-brace check O(1) per opening candidate.
+    let closing_brace_before_line_break = closing_brace_before_line_break(bytes, scan_steps);
     let mut output = String::new();
     let mut cursor = 0;
 
     while cursor < bytes.len() {
+        scan_steps.add(1);
         if bytes[cursor] == b'{'
             && !is_immediately_escaped(bytes, cursor)
-            && is_attribute_reference_at(bytes, cursor)
+            && is_attribute_reference_at(
+                bytes,
+                cursor,
+                &closing_brace_before_line_break,
+                scan_steps,
+            )
         {
             output.push('\\');
         }
@@ -103,7 +127,17 @@ fn neutralize_inline_attribute_references(text: &str) -> String {
     output
 }
 
-fn is_attribute_reference_at(bytes: &[u8], start: usize) -> bool {
+fn is_attribute_reference_at(
+    bytes: &[u8],
+    start: usize,
+    closing_brace_before_line_break: &[bool],
+    scan_steps: &mut AttributeScanSteps,
+) -> bool {
+    if is_special_attribute_reference_at(bytes, start, closing_brace_before_line_break, scan_steps)
+    {
+        return true;
+    }
+
     let Some(first) = bytes.get(start + 1) else {
         return false;
     };
@@ -113,6 +147,7 @@ fn is_attribute_reference_at(bytes: &[u8], start: usize) -> bool {
 
     let mut cursor = start + 2;
     while let Some(byte) = bytes.get(cursor) {
+        scan_steps.add(1);
         if *byte == b'}' {
             return true;
         }
@@ -123,6 +158,55 @@ fn is_attribute_reference_at(bytes: &[u8], start: usize) -> bool {
     }
 
     false
+}
+
+fn is_special_attribute_reference_at(
+    bytes: &[u8],
+    start: usize,
+    closing_brace_before_line_break: &[bool],
+    scan_steps: &mut AttributeScanSteps,
+) -> bool {
+    const SPECIAL_PREFIXES: [&[u8]; 3] = [b"set:", b"counter:", b"counter2:"];
+    let content = &bytes[start + 1..];
+
+    SPECIAL_PREFIXES.iter().any(|prefix| {
+        scan_steps.add(1);
+        content.starts_with(prefix) && closing_brace_before_line_break[start + 1 + prefix.len()]
+    })
+}
+
+fn closing_brace_before_line_break(bytes: &[u8], scan_steps: &mut AttributeScanSteps) -> Vec<bool> {
+    let mut result = vec![false; bytes.len() + 1];
+    let mut closing_brace_is_available = false;
+
+    for (cursor, byte) in bytes.iter().enumerate().rev() {
+        scan_steps.add(1);
+        match *byte {
+            b'\n' | b'\r' => closing_brace_is_available = false,
+            b'}' => closing_brace_is_available = true,
+            _ => {}
+        }
+        result[cursor] = closing_brace_is_available;
+    }
+
+    result
+}
+
+#[derive(Default)]
+struct AttributeScanSteps {
+    #[cfg(test)]
+    count: usize,
+}
+
+impl AttributeScanSteps {
+    fn add(&mut self, count: usize) {
+        #[cfg(test)]
+        {
+            self.count += count;
+        }
+        #[cfg(not(test))]
+        let _ = count;
+    }
 }
 
 fn is_attribute_name_start(byte: u8) -> bool {
@@ -255,7 +339,13 @@ fn is_targetless_builtin_macro(name: &[u8]) -> bool {
 }
 
 fn is_immediately_escaped(bytes: &[u8], start: usize) -> bool {
-    start > 0 && bytes[start - 1] == b'\\'
+    bytes[..start]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 fn neutralize_inline_passthrough_macros(text: &str) -> String {
@@ -544,7 +634,44 @@ pub(crate) fn sanitize_macro_label(text: &str) -> String {
     let normalized = normalize_inline_text(&text.replace(['[', ']', '\n', '\r'], " "))
         .trim()
         .to_string();
-    neutralize_plain_adoc_fragment_at_line_start(&normalized, false)
+    neutralize_plain_adoc_fragment_at_line_start(&encode_macro_label_delimiters(&normalized), false)
+}
+
+pub(crate) fn sanitize_rendered_macro_label(text: &str) -> String {
+    let normalized = normalize_inline_text(&text.replace(['[', ']', '\n', '\r'], " "))
+        .trim()
+        .to_string();
+    let trailing_backslashes = normalized
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count();
+    let safe_prefix_len = normalized.len() - trailing_backslashes;
+    let mut encoded = normalized[..safe_prefix_len].replace(',', "&#44;");
+
+    for _ in 0..trailing_backslashes {
+        encoded.push_str("&#92;");
+    }
+
+    neutralize_plain_adoc_fragment_at_line_start(&encoded, false)
+}
+
+pub(crate) fn encode_authored_backslashes(text: &str) -> String {
+    text.replace('\\', "&#92;")
+}
+
+fn encode_macro_label_delimiters(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+
+    for character in text.chars() {
+        match character {
+            ',' => output.push_str("&#44;"),
+            '\\' => output.push_str("&#92;"),
+            character => output.push(character),
+        }
+    }
+
+    output
 }
 
 pub(crate) fn sanitize_macro_target(text: &str) -> String {
@@ -681,6 +808,21 @@ fn ends_with_inline_passthrough_macro_prefix(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_special_attribute_candidates_have_linear_scan_work() {
+        let candidates = 25_000;
+        let input = "{set:".repeat(candidates);
+
+        let (actual, scan_steps) = neutralize_inline_attribute_references_with_scan_steps(&input);
+
+        assert_eq!(actual, input);
+        assert!(
+            scan_steps <= 4 * input.len(),
+            "attribute scanner took {scan_steps} steps for {} input bytes",
+            input.len()
+        );
+    }
 
     #[test]
     fn overlapping_macro_candidates_have_linear_scan_work() {

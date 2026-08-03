@@ -7,8 +7,20 @@ use iced::{
 };
 use lj_archiver::{
     progress::{Progress, ProgressEvent},
-    run::{RunOutcome, run_archive},
+    run::{RunOutcome, RunWarning, run_archive},
 };
+
+fn running_status_text(phase: &Phase) -> String {
+    match phase {
+        Phase::Discovering { found } => format!("Discovering posts… ({found} found)"),
+        Phase::FetchingPost => "Fetching post…".to_string(),
+        Phase::Archiving { done, total } => format!("Archiving {done}/{total}…"),
+    }
+}
+
+fn completion_warning_lines(warnings: &[RunWarning]) -> Vec<String> {
+    warnings.iter().map(ToString::to_string).collect()
+}
 
 fn progress_message(run_id: u64, event: ProgressEvent) -> Message {
     Message::Progress { run_id, event }
@@ -117,11 +129,11 @@ impl App {
     fn status_view(&self) -> Element<'_, Message> {
         match &self.state {
             State::Idle => text("").into(),
-            State::Running(Phase::Discovering { found }) => {
-                text!("Discovering posts… ({found} found)").into()
+            State::Running(phase @ (Phase::Discovering { .. } | Phase::FetchingPost)) => {
+                text(running_status_text(phase)).into()
             }
-            State::Running(Phase::Archiving { done, total }) => column![
-                text!("Archiving {done}/{total}…"),
+            State::Running(phase @ Phase::Archiving { done, total }) => column![
+                text(running_status_text(phase)),
                 progress_bar(0.0..=(*total as f32).max(1.0), *done as f32),
             ]
             .spacing(6)
@@ -132,6 +144,7 @@ impl App {
                 failed,
                 failed_pages,
                 failures,
+                warnings,
                 ..
             } => {
                 let mut col = column![
@@ -155,6 +168,13 @@ impl App {
                                 .on_press(Message::OpenUrl(url))
                                 .style(button::text),
                         );
+                    }
+                    col = col.push(scrollable(list).height(200.0));
+                }
+                if !warnings.is_empty() {
+                    let mut list = column![text("Warnings:")].spacing(4);
+                    for warning in completion_warning_lines(warnings) {
+                        list = list.push(text(warning));
                     }
                     col = col.push(scrollable(list).height(200.0));
                 }
@@ -214,6 +234,24 @@ mod tests {
         assert!(matches!(app.state, State::Running(_)));
         assert_eq!(task.units(), 2);
         drop(task);
+    }
+
+    #[test]
+    fn fetching_phase_has_a_distinct_rendered_status() {
+        assert_eq!(running_status_text(&Phase::FetchingPost), "Fetching post…");
+    }
+
+    #[test]
+    fn completion_warning_lines_render_typed_terminal_warnings() {
+        let warning = lj_archiver::run::RunWarning::PendingCleanupFailed {
+            post_id: 8,
+            message: "permission denied".to_string(),
+        };
+
+        assert_eq!(
+            completion_warning_lines(&[warning]),
+            ["post 8: finalized pending file could not be removed: permission denied"]
+        );
     }
 
     #[test]

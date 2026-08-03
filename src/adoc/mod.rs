@@ -140,7 +140,7 @@ fn format_datetime(datetime: chrono::DateTime<chrono::Utc>) -> String {
 fn escape_title(value: &str) -> String {
     let title = value.replace(['\r', '\n'], " ");
 
-    neutralize_plain_adoc_fragment_at_line_start(title.trim(), false)
+    neutralize_plain_adoc_fragment_at_line_start(&encode_authored_backslashes(title.trim()), false)
 }
 
 pub(crate) fn sanitize_xref_label(value: &str) -> String {
@@ -149,12 +149,12 @@ pub(crate) fn sanitize_xref_label(value: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    neutralize_plain_adoc_fragment_at_line_start(&normalized, false)
+    sanitize_macro_label(&normalized)
 }
 
 fn escape_attribute_value(value: &str) -> String {
     let normalized = value.replace(['\r', '\n'], " ");
-    neutralize_plain_adoc_fragment_at_line_start(&normalized, false)
+    neutralize_plain_adoc_fragment_at_line_start(&encode_authored_backslashes(&normalized), false)
 }
 
 pub fn html_to_adoc(html: &str) -> String {
@@ -451,12 +451,12 @@ fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
             );
 
             let Some(macro_target) = macro_target else {
-                return sanitize_macro_label(&text);
+                return sanitize_rendered_macro_label(&text);
             };
 
             render_inline_wrapper_with_label(
                 &text,
-                &sanitize_macro_label(&text),
+                &sanitize_rendered_macro_label(&text),
                 &format!("{macro_target}["),
                 "]",
             )
@@ -876,6 +876,10 @@ mod tests {
     use url::Url;
 
     const USER_FRAGMENT: &str = "image:evil.png[] xref:1.adoc[x] {secret}";
+    const SPECIAL_ATTRIBUTE_FRAGMENT: &str = concat!(
+        "{set:lj-archiver-post-link-prefix:javascript:alert(1)//} ",
+        "{counter:owned} {counter2:owned}",
+    );
 
     #[test]
     fn converts_basic_inline_html() {
@@ -3019,6 +3023,45 @@ mod tests {
     }
 
     #[test]
+    fn neutralizes_special_attribute_references_in_every_authored_text_context() {
+        let mut comment = test_comment(0, false);
+        comment.author = SPECIAL_ATTRIBUTE_FRAGMENT.to_string();
+        comment.subject = Some(SPECIAL_ATTRIBUTE_FRAGMENT.to_string());
+        comment.body_html = format!("<p>{SPECIAL_ATTRIBUTE_FRAGMENT}</p>");
+        let mut post = test_post_with_comments(vec![comment]);
+        post.title = SPECIAL_ATTRIBUTE_FRAGMENT.to_string();
+        post.poster = Some(SPECIAL_ATTRIBUTE_FRAGMENT.to_string());
+        post.tags = vec![SPECIAL_ATTRIBUTE_FRAGMENT.to_string()];
+        post.body_html = format!(
+            concat!(
+                "<p>{0} <a href=\"https://example.test/\">{0}</a></p>",
+                "<p><a href=\"https://news.livejournal.com/166512.html\">",
+                "<img src=\"https://cdn.example.test/photo.jpg\" alt=\"{0}\"></a></p>",
+            ),
+            SPECIAL_ATTRIBUTE_FRAGMENT,
+        );
+        let rewriter = news_rewriter();
+
+        let rendered = render_post(&post, true, Some(&rewriter));
+
+        for special in [
+            "{set:lj-archiver-post-link-prefix:javascript:alert(1)//}",
+            "{counter:owned}",
+            "{counter2:owned}",
+        ] {
+            assert!(
+                rendered.matches(&format!(r"\{special}")).count() >= 7,
+                "special attribute reference was not neutralized in every context: {rendered:?}"
+            );
+            assert!(
+                !rendered.contains(&format!(" {special}")),
+                "active special attribute reference remained: {rendered:?}"
+            );
+        }
+        assert!(rendered.contains("link={lj-archiver-post-link-prefix}166512.adoc]"));
+    }
+
+    #[test]
     fn neutralizes_inline_macros_and_attribute_references_in_post_attributes() {
         let mut post = test_post_with_comments(vec![]);
         post.author = USER_FRAGMENT.to_string();
@@ -3277,6 +3320,63 @@ mod tests {
             )
         );
         assert!(!rendered.ends_with("\n\n"), "got: {rendered:?}");
+    }
+
+    #[test]
+    fn encodes_commas_and_authored_backslashes_before_macro_label_delimiters() {
+        let adoc = html_to_adoc(concat!(
+            "<p>",
+            r#"<a href="https://one.example/">first\</a> "#,
+            r#"<a href="https://two.example/">second</a> "#,
+            r#"<img src="https://cdn.example/one.jpg" alt="x,link=javascript:alert(1)\"> "#,
+            r#"<a href="https://safe.example/"><img src="https://cdn.example/two.jpg" alt="linked,alt\"></a>"#,
+            "</p>",
+        ));
+
+        assert_eq!(
+            adoc,
+            concat!(
+                "https://one.example/[first&#92;] ",
+                "https://two.example/[second] ",
+                "image::https://cdn.example/one.jpg[x&#44;link=javascript:alert(1)&#92;] ",
+                "image:https://cdn.example/two.jpg[linked&#44;alt&#92;,",
+                "link=https://safe.example/]\n\n",
+            )
+        );
+    }
+
+    #[test]
+    fn encodes_authored_backslashes_in_xref_labels_before_the_closing_delimiter() {
+        assert_eq!(sanitize_xref_label(r"First\"), "First&#92;");
+    }
+
+    #[test]
+    fn encodes_terminal_backslashes_in_authored_heading_and_attribute_lines() {
+        let mut post = test_post_with_comments(vec![]);
+        post.title = "Post \\".to_string();
+        post.poster = Some("poster \\".to_string());
+        post.tags = vec!["tag \\".to_string()];
+        post.body_html = concat!(
+            r#"<a href="https://news.livejournal.com/166512.html">"#,
+            r#"<img src="https://cdn.example.test/photo.jpg" alt="photo"></a>"#,
+        )
+        .to_string();
+        let rewriter = news_rewriter();
+
+        let rendered = render_post(&post, false, Some(&rewriter));
+
+        assert!(
+            rendered.starts_with("= Post &#92;\n\n"),
+            "got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(":lj-poster: poster &#92;\n:lj-date:"),
+            "got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(":lj-tags: tag &#92;\nifndef::lj-archiver-post-link-prefix"),
+            "got: {rendered:?}"
+        );
     }
 
     #[test]
@@ -3544,6 +3644,162 @@ mod tests {
             "got: {html}"
         );
         assert!(!html.contains("class=\"image red\""), "got: {html}");
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn special_attribute_references_convert_visible_inert_before_generated_post_links() {
+        let mut comment = test_comment(0, false);
+        comment.author = SPECIAL_ATTRIBUTE_FRAGMENT.to_string();
+        comment.subject = Some(SPECIAL_ATTRIBUTE_FRAGMENT.to_string());
+        comment.body_html = format!("<p>{SPECIAL_ATTRIBUTE_FRAGMENT}</p>");
+        let mut post = test_post_with_comments(vec![comment]);
+        post.title = SPECIAL_ATTRIBUTE_FRAGMENT.to_string();
+        post.poster = Some(SPECIAL_ATTRIBUTE_FRAGMENT.to_string());
+        post.tags = vec![SPECIAL_ATTRIBUTE_FRAGMENT.to_string()];
+        post.body_html = format!(
+            concat!(
+                "<p>{0} <a href=\"https://example.test/\">{0}</a></p>",
+                "<p><a href=\"https://news.livejournal.com/166512.html\">",
+                "<img src=\"https://cdn.example.test/photo.jpg\" alt=\"{0}\"></a></p>",
+            ),
+            SPECIAL_ATTRIBUTE_FRAGMENT,
+        );
+
+        let html = convert_with_asciidoctor(&render_post(&post, true, Some(&news_rewriter())));
+        let document = Html::parse_document(&html);
+        let active_hrefs = document
+            .select(&Selector::parse("[href]").unwrap())
+            .filter_map(|element| element.attr("href"))
+            .collect::<Vec<_>>();
+
+        assert!(active_hrefs.contains(&"166512.adoc"), "got: {html}");
+        assert!(
+            active_hrefs
+                .iter()
+                .all(|href| !href.to_ascii_lowercase().starts_with("javascript:")),
+            "special attribute reference created an active URL: {html}"
+        );
+        let visible = document.root_element().text().collect::<String>();
+        for literal in [
+            "{set:lj-archiver-post-link-prefix:javascript:alert(1)//}",
+            "{counter:owned}",
+            "{counter2:owned}",
+        ] {
+            assert!(visible.contains(literal), "missing {literal:?} in: {html}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn macro_label_delimiters_convert_without_injection_or_adjacent_macro_absorption() {
+        let adoc = html_to_adoc(concat!(
+            "<p>",
+            r#"<a href="https://one.example/">first\</a> and "#,
+            r#"<a href="https://two.example/">second</a></p>"#,
+            "<p>",
+            r#"<img src="https://cdn.example/one.jpg" alt="x,link=javascript:alert(1)"></p>"#,
+            "<p>",
+            r#"<a href="https://safe-one.example/"><img src="https://cdn.example/two.jpg" alt="linked,alt\"></a> and "#,
+            r#"<a href="https://safe-two.example/"><img src="https://cdn.example/three.jpg" alt="third"></a>"#,
+            "</p>",
+        ));
+        let html = convert_with_asciidoctor(&adoc);
+        let document = Html::parse_document(&html);
+        let hrefs = document
+            .select(&Selector::parse("a[href]").unwrap())
+            .filter_map(|anchor| anchor.attr("href"))
+            .collect::<Vec<_>>();
+        let images = document
+            .select(&Selector::parse("img").unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(hrefs.contains(&"https://one.example/"), "got: {html}");
+        assert!(hrefs.contains(&"https://two.example/"), "got: {html}");
+        assert!(hrefs.contains(&"https://safe-one.example/"), "got: {html}");
+        assert!(hrefs.contains(&"https://safe-two.example/"), "got: {html}");
+        assert!(
+            hrefs
+                .iter()
+                .all(|href| !href.to_ascii_lowercase().starts_with("javascript:")),
+            "authored alt injected an active URL: {html}"
+        );
+        assert_eq!(images.len(), 3, "adjacent image macro was absorbed: {html}");
+        assert_eq!(images[0].attr("alt"), Some("x,link=javascript:alert(1)"));
+        assert_eq!(images[1].attr("alt"), Some(r"linked,alt\"));
+        assert_eq!(images[2].attr("alt"), Some("third"));
+
+        let dir = tempdir().unwrap();
+        let archive = crate::archive::Archive::new(dir.path(), "news");
+        archive
+            .write_index(&[
+                crate::models::ArchivedPost {
+                    id: 1,
+                    title: r"First\".to_string(),
+                    path: dir.path().join("posts/1.adoc"),
+                },
+                crate::models::ArchivedPost {
+                    id: 2,
+                    title: "Second".to_string(),
+                    path: dir.path().join("posts/2.adoc"),
+                },
+            ])
+            .unwrap();
+        let index = fs::read_to_string(dir.path().join("index.adoc")).unwrap();
+        let index_html = convert_with_asciidoctor(&index);
+        let index_document = Html::parse_document(&index_html);
+        let index_hrefs = index_document
+            .select(&Selector::parse("a[href]").unwrap())
+            .filter_map(|anchor| anchor.attr("href"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            index_hrefs,
+            ["posts/1.html", "posts/2.html"],
+            "one index label absorbed the next row: {index_html}"
+        );
+        assert!(
+            index_document
+                .root_element()
+                .text()
+                .collect::<String>()
+                .contains(r"First\"),
+            "authored index backslash was not visible: {index_html}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn terminal_backslashes_do_not_continue_into_renderer_owned_header_lines() {
+        let mut post = test_post_with_comments(vec![]);
+        post.title = "Post \\".to_string();
+        post.poster = Some("poster \\".to_string());
+        post.tags = vec!["tag \\".to_string()];
+        post.body_html = concat!(
+            r#"<a href="https://news.livejournal.com/166512.html">"#,
+            r#"<img src="https://cdn.example.test/photo.jpg" alt="photo"></a>"#,
+        )
+        .to_string();
+        let rendered = render_post(&post, false, Some(&news_rewriter()));
+        let rendered = rendered.replacen("= Post &#92;", "== Post &#92;", 1);
+        let html = convert_with_asciidoctor(&format!(
+            "{rendered}\nMetadata: {{lj-poster}} | {{lj-date}} | {{lj-tags}}\n"
+        ));
+        let document = Html::parse_document(&html);
+        let visible = document.root_element().text().collect::<String>();
+
+        assert!(
+            visible.contains(r"Post \"),
+            "title line was corrupted: {html}"
+        );
+        assert!(
+            visible.contains(r"Metadata: poster \ | 2024-12-17T16:01:00Z | tag \"),
+            "attribute line continuation corrupted trusted header lines: {html}"
+        );
+        assert!(html.contains("href=\"166512.adoc\""), "got: {html}");
+        assert!(
+            !html.contains("{lj-archiver-post-link-prefix}"),
+            "got: {html}"
+        );
     }
 
     #[test]

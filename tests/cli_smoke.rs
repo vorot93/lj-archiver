@@ -224,6 +224,54 @@ async fn cli_journal_shows_progress_on_stderr() {
 }
 
 #[tokio::test]
+async fn cli_progress_sanitizes_remote_title_controls_without_changing_archive_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/calendar"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2024/12/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">Hostile</a>"#),
+        )
+        .mount(&server)
+        .await;
+    let title = "Safe&#27;]0;owned&#7; text&#x85;&#x202e;spoof&#x2066;x&#x2069;";
+    Mock::given(method("GET"))
+        .and(path("/news/1.html"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            concat!(
+                r#"<article class="lj-post" data-journal="news" data-itemid="1">"#,
+                r#"<h1 class="entry-title">{}</h1>"#,
+                r#"<a class="entry-author" href="https://news.livejournal.com/">news</a>"#,
+                r#"<div class="entry-content"><p>Body.</p></div></article>"#,
+            ),
+            title,
+        )))
+        .mount(&server)
+        .await;
+    let dir = tempdir().unwrap();
+
+    let assert = archive_command(&server, &dir.path().join("out"))
+        .arg("news")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "archived 1  \"Safe]0;owned text…spoofx\"",
+        ));
+    let stderr = assert.get_output().stderr.as_slice();
+    assert!(!stderr.contains(&0x1b));
+    assert!(!stderr.contains(&0x07));
+    assert!(!stderr.windows(3).any(|bytes| bytes == [0xe2, 0x80, 0xae]));
+    let post = std::fs::read(dir.path().join("out/posts/1.adoc")).unwrap();
+    assert!(post.contains(&0x1b));
+    assert!(post.contains(&0x07));
+    assert!(post.windows(3).any(|bytes| bytes == [0xe2, 0x80, 0xae]));
+}
+
+#[tokio::test]
 async fn cli_quiet_suppresses_all_progress() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

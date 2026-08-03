@@ -92,12 +92,14 @@ A desktop GUI is available alongside the command-line tool. It lets you enter a
 target (a journal name, `journal/id`, or a post URL), choose an output folder,
 toggle comments and media, optionally generate a single-file `book.adoc`, watch
 archiving progress, and open the finished archive folder. It shows a count
-warning when archive pages fail and lists failed posts with clickable links.
+warning when archive pages fail, lists failed posts with clickable links, and
+lists integrity warnings such as preserved post bytes or unavailable trusted
+link metadata in the final completion view.
 Choose either a truly empty folder or a valid existing archive for the same
 journal; the GUI automatically resumes a matching archive.
 Delayed updates from an earlier run cannot change a later run. Intermediate
 progress updates are bounded and may be dropped when the GUI is busy, but the
-final result supplies the exact counts and failure details.
+final result supplies the exact counts, failure details, and integrity warnings.
 
 Download an installer for your platform from the project's GitHub Releases:
 
@@ -168,7 +170,7 @@ cross-references safely when a post is retained or skipped by `--resume`. Keep
 this directory with `posts/` if you want those upgrades on later runs. Each
 post file remains independently usable without its metadata. Older, missing,
 stale, or user-invalidated metadata never triggers a broad scan of the post
-source: the post stays unchanged and the run prints a warning.
+source: the post stays unchanged and the run reports an integrity warning.
 
 During a completed journal export, links to other exported posts become local
 cross-references. Other root-relative, path-relative, and protocol-relative
@@ -260,7 +262,8 @@ ordinary cross-references and linked-image click targets are retargeted to each
 surviving post's exact validated filename; targets absent from the final set
 revert to canonical external journal post URLs. Missing or invalid metadata,
 or a failed upgrade, preserves the existing post unchanged and prints a
-warning. There is no fallback scan for link-like text. A successfully finalized
+warning in the CLI and in the GUI's completion view. There is no fallback scan
+for link-like text. A successfully finalized
 current post always has complete external fallback targets rather than internal
 staging markers.
 
@@ -271,6 +274,9 @@ lines instead (`discovered N posts`, `[i/N] archived <id>`, and a final
 `done: … archived, … skipped, … failed` summary). Use `-q`/`--quiet` to suppress
 progress entirely (errors are still reported). `-v`/`--verbose` keeps the
 progress bar and prints debug logs above it; standard output is not used.
+Remote titles are stripped of terminal control and bidi-formatting characters
+only for this progress display; the archived title is not changed by that
+display sanitizer.
 
 Adult-flagged public posts are archived automatically. LiveJournal gates such
 posts behind an age-affirmation interstitial; `lj-archiver` sends the

@@ -6,7 +6,7 @@ use crate::{
 };
 use scraper::{Html, Selector};
 use std::{collections::HashSet, sync::LazyLock};
-use url::Url;
+use url::{Host, Url};
 
 static ANCHOR_HREF: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("a[href]").expect("static selector must parse"));
@@ -164,7 +164,9 @@ pub async fn discover_post_ids(
 }
 
 fn is_production_base_url(base_url: &Url) -> bool {
-    base_url.scheme() == "https" && base_url.host_str() == Some("livejournal.com")
+    base_url.scheme() == "https"
+        && crate::net::normalized_domain_host(base_url)
+            .is_some_and(|host| host.eq_ignore_ascii_case("livejournal.com"))
 }
 
 fn validate_journal(journal: &str) -> Result<()> {
@@ -240,24 +242,34 @@ fn post_id_from_url(url: &Url, base_url: &Url, journal: &str) -> Option<u64> {
 
 fn same_origin(left: &Url, right: &Url) -> bool {
     left.scheme() == right.scheme()
-        && hosts_equal(left.host_str(), right.host_str())
+        && hosts_equal(left, right)
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-fn hosts_equal(left: Option<&str>, right: Option<&str>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+fn hosts_equal(left: &Url, right: &Url) -> bool {
+    match (left.host(), right.host()) {
+        (Some(Host::Domain(_)), Some(Host::Domain(_))) => {
+            match (
+                crate::net::normalized_domain_host(left),
+                crate::net::normalized_domain_host(right),
+            ) {
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                _ => false,
+            }
+        }
+        (Some(Host::Ipv4(left)), Some(Host::Ipv4(right))) => left == right,
+        (Some(Host::Ipv6(left)), Some(Host::Ipv6(right))) => left == right,
         _ => false,
     }
 }
 
 fn is_users_livejournal_url(url: &Url) -> bool {
-    url.host_str()
+    crate::net::normalized_domain_host(url)
         .is_some_and(|host| host.eq_ignore_ascii_case("users.livejournal.com"))
 }
 
 fn journal_from_subdomain(url: &Url) -> Option<&str> {
-    let host = url.host_str()?;
+    let host = crate::net::normalized_domain_host(url)?;
     let journal = host.strip_suffix(".livejournal.com")?;
     (!journal.is_empty() && !journal.contains('.')).then_some(journal)
 }
@@ -360,6 +372,63 @@ mod tests {
             url.as_str(),
             "https://users.livejournal.com/example_user/calendar"
         );
+    }
+
+    #[test]
+    fn dotted_production_root_builds_calendar_urls_for_both_journal_schemes() {
+        let base = Url::parse("https://livejournal.com.").unwrap();
+
+        assert_eq!(
+            journal_calendar_url("news", &base).unwrap().as_str(),
+            "https://news.livejournal.com/calendar"
+        );
+        assert_eq!(
+            journal_calendar_url("example_user", &base)
+                .unwrap()
+                .as_str(),
+            "https://users.livejournal.com/example_user/calendar"
+        );
+    }
+
+    #[test]
+    fn dotted_subdomain_archive_accepts_calendar_year_month_and_post_links() {
+        let calendar = Url::parse("https://news.livejournal.com./calendar").unwrap();
+        let year_html = r#"<a href="https://news.livejournal.com./2024/">year</a>"#;
+        let month_html = r#"<a href="https://news.livejournal.com./2024/12/">month</a>"#;
+        let post_html = r#"<a href="https://news.livejournal.com./1.html">post</a>"#;
+
+        assert_eq!(parse_year_links(year_html, &calendar, "news").len(), 1);
+        assert_eq!(parse_month_links(month_html, &calendar, "news").len(), 1);
+        assert_eq!(parse_post_ids(post_html, &calendar, "news"), [1]);
+    }
+
+    #[test]
+    fn dotted_users_archive_accepts_calendar_year_month_and_post_links() {
+        let calendar = Url::parse("https://users.livejournal.com./example_user/calendar").unwrap();
+        let year_html = r#"<a href="https://users.livejournal.com./example_user/2024/">year</a>"#;
+        let month_html =
+            r#"<a href="https://users.livejournal.com./example_user/2024/12/">month</a>"#;
+        let post_html = r#"<a href="https://users.livejournal.com./example_user/1.html">post</a>"#;
+
+        assert_eq!(
+            parse_year_links(year_html, &calendar, "example_user").len(),
+            1
+        );
+        assert_eq!(
+            parse_month_links(month_html, &calendar, "example_user").len(),
+            1
+        );
+        assert_eq!(parse_post_ids(post_html, &calendar, "example_user"), [1]);
+    }
+
+    #[test]
+    fn same_origin_normalizes_dns_root_dots_but_keeps_ip_identity() {
+        let plain = Url::parse("https://news.livejournal.com/calendar").unwrap();
+        let dotted = Url::parse("https://news.livejournal.com./2024/").unwrap();
+        let ipv4 = Url::parse("https://127.0.0.1:443/").unwrap();
+
+        assert!(same_origin(&plain, &dotted));
+        assert!(!same_origin(&plain, &ipv4));
     }
 
     #[test]

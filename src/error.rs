@@ -6,6 +6,8 @@ pub type Result<T> = std::result::Result<T, LjError>;
 
 #[derive(Debug, Error)]
 pub enum LjError {
+    #[error("invalid run options: {reason}")]
+    InvalidOptions { reason: String },
     #[error("invalid target `{input}`: {reason}")]
     InvalidTarget { input: String, reason: String },
     #[error("http failure for {url}: {source}")]

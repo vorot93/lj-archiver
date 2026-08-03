@@ -59,7 +59,7 @@ async fn rewrite_inline_media_configured(
     let mut downloads: HashMap<Url, String> = HashMap::new();
     let mut assets = Vec::new();
     let mut replacements = Vec::with_capacity(targets.len());
-    let allow_local_media = crate::net::is_loopback_test_server(base_url);
+    let loopback_page_mode = crate::net::is_loopback_test_server(base_url);
 
     for target in &targets {
         let url = match base_url.join(target.source.as_str()) {
@@ -80,7 +80,7 @@ async fn rewrite_inline_media_configured(
         }
 
         let absolute_target = url.to_string();
-        if !download || (!allow_local_media && is_restricted_media_url(&url)) {
+        if !download || !media_url_is_allowed(&url, loopback_page_mode) {
             downloads.insert(url, absolute_target.clone());
             replacements.push(Some(absolute_target));
             continue;
@@ -89,7 +89,7 @@ async fn rewrite_inline_media_configured(
         let filename = filename_for_url(&url);
         let relative_path = relative_asset_path(&filename);
 
-        if download_asset(client, &url, assets_dir, &filename, allow_local_media).await? {
+        if download_asset(client, &url, assets_dir, &filename, loopback_page_mode).await? {
             let local_target = storage::adoc_path(&relative_path);
             downloads.insert(url.clone(), local_target.clone());
             replacements.push(Some(local_target));
@@ -138,6 +138,10 @@ fn is_restricted_media_url(url: &Url) -> bool {
         Host::Ipv4(address) => is_restricted_ip_literal(IpAddr::V4(address)),
         Host::Ipv6(address) => is_restricted_ip_literal(IpAddr::V6(address)),
     }
+}
+
+fn media_url_is_allowed(url: &Url, loopback_page_mode: bool) -> bool {
+    !is_restricted_media_url(url) || loopback_page_mode && crate::net::is_loopback_test_server(url)
 }
 
 fn is_restricted_ip_literal(address: IpAddr) -> bool {
@@ -229,7 +233,7 @@ async fn download_asset(
     url: &Url,
     assets_dir: &Path,
     filename: &str,
-    allow_local_media: bool,
+    loopback_page_mode: bool,
 ) -> Result<bool> {
     let root = assets_dir
         .parent()
@@ -248,7 +252,7 @@ async fn download_asset(
 
     let mut bytes = None;
     for attempt in 0..=MEDIA_DOWNLOAD_RETRIES {
-        match fetch_media_bytes(client, url, allow_local_media, MAX_MEDIA_BYTES).await {
+        match fetch_media_bytes(client, url, loopback_page_mode, MAX_MEDIA_BYTES).await {
             Ok(Some(response_bytes)) => {
                 bytes = Some(response_bytes);
                 break;
@@ -273,10 +277,10 @@ async fn download_asset(
 async fn fetch_media_bytes(
     client: &reqwest::Client,
     url: &Url,
-    allow_local_media: bool,
+    loopback_page_mode: bool,
     max_bytes: usize,
 ) -> std::result::Result<Option<Vec<u8>>, reqwest::Error> {
-    if !allow_local_media && is_restricted_media_url(url) {
+    if !media_url_is_allowed(url, loopback_page_mode) {
         return Ok(None);
     }
 
@@ -294,7 +298,7 @@ async fn fetch_media_bytes(
                 return Ok(None);
             };
 
-            if !allow_local_media && is_restricted_media_url(&redirect_url) {
+            if !media_url_is_allowed(&redirect_url, loopback_page_mode) {
                 return Ok(None);
             }
 
@@ -772,6 +776,55 @@ mod tests {
             let url = Url::parse(url).unwrap();
             assert!(is_restricted_media_url(&url), "{url} should be restricted");
         }
+    }
+
+    #[test]
+    fn loopback_page_mode_allows_only_individual_explicit_port_loopback_urls() {
+        for allowed in [
+            "http://127.0.0.1:8080/pic.jpg",
+            "http://localhost:8080/pic.jpg",
+            "http://[::1]:8080/pic.jpg",
+        ] {
+            let url = Url::parse(allowed).unwrap();
+            assert!(media_url_is_allowed(&url, true), "{allowed}");
+        }
+
+        for blocked in [
+            "http://10.0.0.1:8080/pic.jpg",
+            "http://169.254.169.254:8080/pic.jpg",
+            "http://[fc00::1]:8080/pic.jpg",
+            "http://[fe80::1]:8080/pic.jpg",
+            "http://127.0.0.1/pic.jpg",
+            "https://127.0.0.1:8080/pic.jpg",
+        ] {
+            let url = Url::parse(blocked).unwrap();
+            assert!(!media_url_is_allowed(&url, true), "{blocked}");
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_page_mode_rejects_a_portless_loopback_redirect_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect.jpg"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "http://127.0.0.1/private.jpg"),
+            )
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(250))
+            .redirect(reqwest::redirect::Policy::none())
+            .use_preconfigured_tls(crate::tls::rustls_config())
+            .build()
+            .unwrap();
+        let url = Url::parse(&format!("{}/redirect.jpg", server.uri())).unwrap();
+
+        let fetched = fetch_media_bytes(&client, &url, true, MAX_MEDIA_BYTES).await;
+
+        assert!(matches!(fetched, Ok(None)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

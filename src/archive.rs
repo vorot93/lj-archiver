@@ -194,25 +194,36 @@ impl Archive {
             })
     }
 
-    pub fn write_pending_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
-        let relative = PathBuf::from("posts").join(format!("{id}.pending"));
+    pub(crate) fn write_pending_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
+        let relative = self.pending_relative_path(id)?;
         let path = self.root.join(&relative);
         storage::write_atomic_controlled(&self.root, &relative, contents.as_bytes())?;
         Ok(path)
     }
 
-    pub fn read_pending_post(&self, path: &Path) -> Result<String> {
-        fs::read_to_string(path).map_err(|source| LjError::Read {
-            path: path.to_path_buf(),
-            source,
-        })
+    pub(crate) fn read_pending_post(&self, id: u64) -> Result<String> {
+        let relative = self.pending_relative_path(id)?;
+        storage::controlled_file_exists(&self.root, &relative)?;
+        let path = self.root.join(relative);
+        fs::read_to_string(&path).map_err(|source| LjError::Read { path, source })
     }
 
-    pub fn remove_pending_post(&self, path: &Path) -> Result<()> {
-        fs::remove_file(path).map_err(|source| LjError::Write {
-            path: path.to_path_buf(),
-            source,
-        })
+    pub(crate) fn remove_pending_post(&self, id: u64) -> Result<()> {
+        let relative = self.pending_relative_path(id)?;
+        storage::controlled_file_exists(&self.root, &relative)?;
+        let path = self.root.join(relative);
+        fs::remove_file(&path).map_err(|source| LjError::Write { path, source })
+    }
+
+    fn pending_relative_path(&self, id: u64) -> Result<PathBuf> {
+        if id == 0 {
+            return Err(invalid_archive(
+                &self.root,
+                "pending post id must be positive",
+            ));
+        }
+
+        Ok(PathBuf::from("posts").join(format!("{id}.pending")))
     }
 
     pub fn write_index(&self, posts: &[ArchivedPost]) -> Result<PathBuf> {
@@ -1177,22 +1188,46 @@ mod tests {
             path.extension().and_then(|extension| extension.to_str()),
             Some("adoc")
         );
-        assert_eq!(
-            archive.read_pending_post(&path).unwrap(),
-            "first pending body"
-        );
+        assert_eq!(archive.read_pending_post(1).unwrap(), "first pending body");
         assert!(!archive.post_path(1).exists());
 
         let replacement = archive
             .write_pending_post(1, "second pending body")
             .unwrap();
         assert_eq!(replacement, path);
-        assert_eq!(
-            archive.read_pending_post(&path).unwrap(),
-            "second pending body"
-        );
+        assert_eq!(archive.read_pending_post(1).unwrap(), "second pending body");
 
-        archive.remove_pending_post(&path).unwrap();
+        archive.remove_pending_post(1).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn pending_helpers_reject_zero_ids_and_nonregular_controlled_leaves() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+
+        assert!(matches!(
+            archive.write_pending_post(0, "pending"),
+            Err(LjError::InvalidArchive { .. })
+        ));
+        assert!(matches!(
+            archive.read_pending_post(0),
+            Err(LjError::InvalidArchive { .. })
+        ));
+        assert!(matches!(
+            archive.remove_pending_post(0),
+            Err(LjError::InvalidArchive { .. })
+        ));
+
+        fs::create_dir_all(root.join("posts/2.pending")).unwrap();
+        assert!(matches!(
+            archive.read_pending_post(2),
+            Err(LjError::InvalidArchive { .. })
+        ));
+        assert!(matches!(
+            archive.remove_pending_post(2),
+            Err(LjError::InvalidArchive { .. })
+        ));
     }
 }

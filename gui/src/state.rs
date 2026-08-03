@@ -7,7 +7,7 @@ use lj_archiver::{
     archive::Archive,
     models::{ArchiveTarget, PostFailure, RunOptions},
     progress::ProgressEvent,
-    run::RunOutcome,
+    run::{RunOutcome, RunWarning},
     target::parse_target,
 };
 use std::path::PathBuf;
@@ -37,6 +37,7 @@ impl Default for RunConfig {
 #[derive(Debug, Clone)]
 pub enum Phase {
     Discovering { found: usize },
+    FetchingPost,
     Archiving { done: usize, total: usize },
 }
 
@@ -52,6 +53,7 @@ pub enum State {
         failed: usize,
         failed_pages: usize,
         failures: Vec<PostFailure>,
+        warnings: Vec<RunWarning>,
     },
     Error {
         message: String,
@@ -111,7 +113,11 @@ impl App {
                     self.next_run_id = 1;
                 }
                 self.active_run_id = Some(self.next_run_id);
-                self.state = State::Running(Phase::Discovering { found: 0 });
+                let phase = match parse_target(self.config.target.trim(), None) {
+                    Ok(ArchiveTarget::Post { .. }) => Phase::FetchingPost,
+                    Ok(ArchiveTarget::Journal { .. }) | Err(_) => Phase::Discovering { found: 0 },
+                };
+                self.state = State::Running(phase);
             }
             Message::Progress { run_id, event } => {
                 if Some(*run_id) != self.active_run_id {
@@ -132,6 +138,7 @@ impl App {
                             failed: outcome.failed,
                             failed_pages: outcome.failed_pages,
                             failures: outcome.failures.clone(),
+                            warnings: outcome.warnings.clone(),
                         };
                     }
                     Err(message) => {
@@ -154,8 +161,11 @@ impl App {
             return;
         }
         match event {
-            ProgressEvent::DiscoveryStarted | ProgressEvent::SingleStarted { .. } => {
+            ProgressEvent::DiscoveryStarted => {
                 self.state = State::Running(Phase::Discovering { found: 0 });
+            }
+            ProgressEvent::SingleStarted { .. } => {
+                self.state = State::Running(Phase::FetchingPost);
             }
             ProgressEvent::DiscoveryTick { found, .. } => {
                 self.state = State::Running(Phase::Discovering { found: *found });
@@ -322,6 +332,7 @@ mod tests {
             failed,
             failed_pages: 0,
             failures,
+            warnings: Vec::new(),
             journal: Some("news".to_string()),
         }
     }
@@ -412,6 +423,43 @@ mod tests {
     }
 
     #[test]
+    fn single_post_start_and_progress_use_fetching_phase() {
+        let mut app = App::default();
+        app.update_state(&Message::TargetChanged("news/1".to_string()));
+        app.update_state(&Message::FolderChosen(Some(PathBuf::from("/tmp/out"))));
+        let run_id = start_run(&mut app);
+
+        assert!(matches!(app.state, State::Running(Phase::FetchingPost)));
+        app.update_state(&Message::Progress {
+            run_id,
+            event: ProgressEvent::SingleStarted { id: 1 },
+        });
+        assert!(matches!(app.state, State::Running(Phase::FetchingPost)));
+    }
+
+    #[test]
+    fn warning_bearing_success_reaches_done_with_authoritative_warnings() {
+        let mut app = App::default();
+        let run_id = start_run(&mut app);
+        let warning = RunWarning::RetainedPostPreserved {
+            post_id: 7,
+            message: "trusted metadata is stale".to_string(),
+        };
+        let mut completed = outcome(PathBuf::from("/tmp/out"), 0, vec![]);
+        completed.warnings.push(warning.clone());
+
+        app.update_state(&Message::Finished {
+            run_id,
+            result: Ok(completed),
+        });
+
+        assert!(matches!(
+            &app.state,
+            State::Done { warnings, .. } if warnings == &[warning]
+        ));
+    }
+
+    #[test]
     fn finished_ok_with_failures_reaches_done_carrying_failures() {
         let mut app = App::default();
         let run_id = start_run(&mut app);
@@ -450,6 +498,7 @@ mod tests {
             failed: 0,
             failed_pages: 2,
             failures: vec![],
+            warnings: vec![],
             journal: Some("news".to_string()),
         };
 
@@ -496,6 +545,7 @@ mod tests {
                 failed: 1,
                 failed_pages: 3,
                 failures: failures.clone(),
+                warnings: vec![],
                 journal: Some("news".to_string()),
             }),
         });
@@ -509,6 +559,7 @@ mod tests {
                 failed,
                 failed_pages,
                 failures: actual_failures,
+                ..
             } => {
                 assert_eq!(root, &PathBuf::from("/archive/output"));
                 assert_eq!((*archived, *skipped, *failed), (7, 2, 1));

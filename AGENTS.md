@@ -43,13 +43,16 @@ The current tool is public-content only. Do not add login, private-content acces
 The repo is a Cargo workspace. The root crate `lj-archiver` (lib + CLI) stays
 pure-Rust with no GUI dependencies; the member crate `gui/` (`lj-archiver-gui`)
 holds the iced 0.14 desktop GUI. CI keeps them apart: the `ci` job lints/tests
-`-p lj-archiver` (fast, no iced), the `gui` job compiles the GUI, and
+`-p lj-archiver` (fast, no iced), the `gui` job lints, tests, and builds the GUI, and
 `cargo fmt --all` covers both.
 
 Reuse seam (in the core, additive, CLI behavior unchanged):
 - `run::run_archive(target, &RunOptions, &Progress) -> Result<RunOutcome>` is the
   shared entry point. It returns `Ok` even when some journal posts/pages failed
-  (counts + `failures` in `RunOutcome`); only a hard failure yields `Err`. The
+  (counts + `failures` in `RunOutcome`); only a hard failure yields `Err`.
+  `RunOutcome::warnings` is the authoritative typed record of warning-only
+  integrity degradation; it must not depend on tracing or the lossy progress
+  channel. The
   CLI `run()` wrapper turns a partial-failure outcome back into
   `LjError::Discovery` (non-zero exit) — so the CLI is byte-identical, while the
   GUI can show a completed run with a failed-links list.
@@ -67,8 +70,11 @@ Progress is driven by one capacity-128 channel in
 Task::perform(run_archive(...), Message::Finished)])`. Both callbacks carry
 the active run generation. Progress may be dropped, so the separately delivered
 generation-tagged `Finished` result is authoritative for terminal state and
-exact counters. The iced view is manual-verify only (no headless harness) — smoke-test with
+exact counters, failures, and integrity warnings. The iced view is manual-verify only (no headless harness) — smoke-test with
 `cargo run -p lj-archiver-gui` against a small real post.
+
+The reducer uses `Phase::FetchingPost` for a direct post target and for
+`ProgressEvent::SingleStarted`; journal targets alone display discovery.
 
 The GUI reuses core `Archive::inspect_existing` and accepts a selected folder
 only when it is truly empty or a valid matching existing archive. It derives an
@@ -77,13 +83,18 @@ journal names with the shared hyphen/underscore alias rules before enabling
 auto-resume.
 
 Packaging uses cargo-packager (`[package.metadata.packager]` in `gui/Cargo.toml`).
-`.github/workflows/release.yml` builds installers on `v*` tags: macOS `.dmg`
+`.github/workflows/release.yml` accepts only an exact `v<workspace-version>` tag
+whose commit is on `master`, executes the same-commit CI gates, and then builds
+installers: macOS `.dmg`
 (Apple-Silicon-only — `macos-latest` is arm64, native build, no `--target`),
 Linux `.deb`+AppImage, Windows NSIS+`.msi`. Builds are unsigned. rfd 0.17 uses
 the XDG portal by default (no GTK3 link), keeping Linux free of GTK system libs.
-The installer version/filename comes from `workspace.package.version` in the
-root `Cargo.toml`, not from the git tag, so bump it to match before pushing a
-`v*` release tag.
+The matrix uploads installer-only artifacts; one final fan-in job rejects a
+missing or unexpected five-installer set before publishing once. All Actions
+are full-SHA pinned, Dependabot owns weekly GitHub Actions update proposals,
+and only that final publisher receives `contents: write`. The installer
+version/filename comes from `workspace.package.version` in the root
+`Cargo.toml`, so bump it before pushing the matching version tag.
 
 ## Development Commands
 
@@ -91,13 +102,16 @@ Run these before handing off changes:
 
 ```sh
 cargo fmt --all --check -- --config=imports_granularity=Crate
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
 ```
 
 Use focused commands while iterating, then run the full set before final review.
 
-The workspace root is itself the `lj-archiver` package, so bare `cargo test` and `cargo clippy` (as above) cover **only** that crate — the `gui` member (`lj-archiver-gui`) is silently skipped, so a green run does not mean the GUI compiles or its tests pass. Add `--workspace` (or run `-p lj-archiver-gui` separately) to include it; this mirrors CI's split into the `ci` (`-p lj-archiver`) and `gui` jobs. `cargo fmt --all` already covers both crates.
+The workspace root is itself the `lj-archiver` package, so bare `cargo test`
+and `cargo clippy` cover **only** that crate. The final bundle above uses
+`--workspace`; CI mirrors it with separate core and GUI jobs. `cargo fmt --all`
+already covers both crates.
 
 CI enforces the exact `fmt` invocation above. There is no `rustfmt.toml`, so the `--config=imports_granularity=Crate` flag is required; plain `cargo fmt` reformats imports differently and will fail the check.
 
@@ -160,6 +174,15 @@ For journal archives, preserve the current resilient behavior: continue past ind
 The AsciiDoc renderer (`src/adoc/`) produces byte-exact output guarded by a large black-box test suite; change it with care and assert exact output. Passthrough source recovery precomputes range-backed original-byte mappings with one tokenizer-compatible source scan plus one DOM traversal; both must remain linear. The shared scanner treats comments, declarations, and raw-text/RCDATA payloads as opaque, and aligns tokenizer-decoded attributes with ranges into the unchanged input rather than decoding or rescanning source values itself. Script payload scanning must retain ScriptData escaped and double-escaped states: an appropriate `</script>` in double-escaped data only returns to escaped data, so it is not the element's structural close. Quotes enter quoted attribute-value state only after `=`, and a self-closing non-void tag stays on the tag stack so normalized fallback retains its trailing children. A `ScanError` means alignment is unavailable: callers must use their explicit conservative fallback or return a parse error, never guess source ranges or attributes. Raw-text collection is iterative, while recursive rendering and plain-inline collection are capped at `MAX_RENDER_DEPTH`; missing a recursive cap lets deeply nested input overflow the stack (an uncatchable abort).
 
 The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
+
+Attribute-reference neutralization includes Asciidoctor's state-changing
+`{set:...}`, `{counter:...}`, and `{counter2:...}` forms, not only simple
+`{name}` references. Authored commas in image labels are numeric-reference
+encoded before an attribute list. Authored backslashes in raw macro labels and
+terminal backslashes in already-rendered labels, headings, and document
+attributes are encoded before a renderer-owned delimiter or newline. These
+encodings preserve converted visible text while preventing attribute
+injection, macro absorption, and line continuation into trusted output.
 
 A same-journal target in a linked image's `link=` attribute is a contextual
 `{lj-archiver-post-link-prefix}<id>.adoc` URI, not a complete
@@ -267,9 +290,18 @@ external fallback and public files never contain staging tokens. Pending-link
 substitution uses the validated exact-once records and one monotonic cursor and
 must remain linear.
 
-Every published post has an implementation-owned sidecar under
-`.lj-archiver/links`. A sidecar binds strictly sorted, nonoverlapping typed
-active spans to the exact SHA-256 digest of the full public post. Retained
+`run::run_archive` rejects `RunOptions::concurrency == 0` with
+`LjError::InvalidOptions` before target networking; never pass zero to
+`buffer_unordered`. Pending-post read/write/remove helpers are crate-private,
+accept a positive post ID rather than an arbitrary path, derive exactly
+`posts/<id>.pending`, and validate the controlled regular leaf before reading
+or removing it.
+
+Normal successful pair publication writes an implementation-owned matching
+sidecar under `.lj-archiver/links`. A sidecar binds strictly sorted,
+nonoverlapping typed active spans to the exact SHA-256 digest of the full public
+post. A warning-only post-success metadata I/O failure may leave that sidecar
+missing or stale while the externally complete post remains successful. Retained
 repair first validates the digest, span boundaries, context, target identity,
 and current expression, then touches only those valid recorded spans. Missing,
 older, stale, malformed, or user-invalidated sidecars preserve the post and
@@ -305,9 +337,11 @@ the requested ID. Identity mismatches fail only that row during journal exports
 and fail the whole run for a single-post target; no file is staged or written
 under the returned wrong ID.
 
-DNS hosts may carry the equivalent trailing root dot. Domain recognition strips
-one such dot consistently for LiveJournal and `localhost`; IP literals continue
-to use their parsed `Host` variants and are not normalized as domains.
+DNS hosts may carry the equivalent trailing root dot. Target parsing,
+discovery calendar/year/month/post filtering and same-origin checks, final-link
+identity, and `localhost` recognition strip one such dot consistently; IP
+literals continue to use their parsed `Host` variants and are not normalized
+as domains.
 
 Every archive render constructs a per-post `LinkRewriter` only after identity
 validation and uses that post's delivered `Post.url` as the sole resolution
@@ -324,6 +358,13 @@ Keep network behavior conservative.
 Do not weaken redirect validation or address blocking in `src/media.rs`.
 
 Media fetching must continue to reject non-HTTP(S) URLs, URLs without hosts, literal `localhost` hosts, and restricted IP literal hosts. Restricted literals include loopback, private IPv4, link-local, unspecified, IPv6 unique-local/link-local, and IPv6-embedded IPv4 forms (IPv4-mapped, NAT64, 6to4, and IPv4-compatible) that decode to a restricted address. Redirects are re-validated per hop, so a redirect to a blocked address is rejected.
+
+Hermetic fixture downloads enable a loopback-page mode only when the delivered
+page is an explicit-port loopback HTTP URL. That mode does not bypass the media
+policy globally: each initial candidate and redirect is allowed through the
+restricted-literal check only when that individual URL is also an
+explicit-port loopback HTTP URL. Private, link-local, portless loopback, and
+HTTPS loopback targets remain blocked.
 
 Media source scanning runs even under `--no-media`. Every real hosted HTTP(S)
 source is resolved against the delivered post URL and rewritten to either a
@@ -363,6 +404,11 @@ Every production `reqwest::Client` installs `net::affirmation_cookie_jar()` — 
 
 `src/progress.rs` renders archiving progress to stderr (stdout is unused). A `Progress` handle picks one of three modes at startup from `--quiet` and whether stderr is a TTY: Interactive (an `indicatif` bar/spinner driven through `tracing-indicatif` progress spans), Plain (stderr status lines when piped/redirected), and Quiet (`--quiet`, silent except errors). Discovery shows a spinner with a running total; archiving shows a determinate bar (count + ETA); both degrade to plain lines when piped.
 
+Remote titles pass through one display-only sanitizer before reaching either
+Interactive messages or Plain stderr lines. It removes C0/C1 controls and bidi
+formatting controls so ANSI/OSC/log spoofing cannot execute, while the parsed
+title used by archive rendering remains unchanged.
+
 Logging and progress share stderr, so `init_logging` wires `tracing-indicatif` deliberately — keep these invariants if you touch it:
 
 - Progress spans use a private tracing target (`PROGRESS_TARGET`), and the `IndicatifLayer` is filtered to that target alone, so only our spans draw bars — never dependency spans (which would otherwise show up as stray bars under `-v`).
@@ -376,7 +422,6 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
 
 - Comments on modern LiveJournal are JavaScript-loaded and absent from static HTML, so a static fetch cannot archive comment threads.
 - `:lj-author:` is the journal name, not the poster — the canonical account name from `Site.entry.journal` when its `ditemid` matches (e.g. `evo_lutio`, not the `evo-lutio` subdomain spelling, and never `users` for `users.livejournal.com` posts). The real poster is captured separately as `:lj-poster:` from `Site.entry`; for personal journals the poster equals the journal name.
-- Image `alt` text is not comma-safe: a comma in an `alt` shifts the display label across an AsciiDoc attribute boundary, for both block images (`image::`) and inline linked images (`image:…[alt,link=href]`). Only the linked-image `link=` href is comma-hardened (commas percent-encoded), so the link still resolves — this is a display-fidelity limit, not a broken link. `sanitize_macro_label` neutralizes brackets/newlines/macro-like text but leaves commas.
 
 ## Documentation Rules
 
