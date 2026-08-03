@@ -4,6 +4,7 @@ use crate::{
 };
 use chrono::SecondsFormat;
 use scraper::{ElementRef, Html, node::Node};
+use url::Url;
 
 mod classify;
 mod escape;
@@ -490,8 +491,17 @@ fn image_macro_target(src: &str, ctx: RenderCtx<'_>) -> Option<String> {
     match ctx.link_rewriter {
         Some(_) if src.starts_with("../assets/") => Some(sanitize_macro_target(src)),
         Some(rewriter) => rewriter.absolute_target(src),
-        None => Some(sanitize_macro_target(src)),
+        None => match Url::parse(src) {
+            Ok(_) if explicit_image_scheme_is_allowed(src) => Some(sanitize_macro_target(src)),
+            Err(url::ParseError::RelativeUrlWithoutBase) => Some(sanitize_macro_target(src)),
+            _ => None,
+        },
     }
+}
+
+fn explicit_image_scheme_is_allowed(src: &str) -> bool {
+    Url::parse(src)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
 }
 
 /// The sole `<img>` an anchor wraps, ignoring whitespace-only text. Returns
@@ -564,7 +574,13 @@ fn render_blockquote(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
 
 pub(super) fn render_specialcharacters_listing(content: &str) -> String {
     let delimiter = safe_block_delimiter(content, '-');
-    format!("[subs=specialcharacters]\n{delimiter}\n{content}\n{delimiter}\n\n")
+    let mut output = format!("[subs=specialcharacters]\n{delimiter}\n{content}");
+    if !content.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&delimiter);
+    output.push_str("\n\n");
+    output
 }
 
 fn render_listing(element: ElementRef<'_>) -> String {
@@ -913,6 +929,62 @@ mod tests {
     }
 
     #[test]
+    fn authored_additional_block_constructs_are_escaped_without_altering_generated_blocks() {
+        for marker in [
+            "<<<",
+            "'''",
+            ".Authored title",
+            "--",
+            "|===",
+            ",===",
+            ":===",
+            "!===",
+        ] {
+            let adoc = html_to_adoc(&format!("<p>before<br>{marker}<br>after</p>"));
+
+            assert!(
+                adoc.lines().any(|line| line == format!(r"\{marker} +")),
+                "missing protected marker in {adoc:?}"
+            );
+            assert!(
+                adoc.lines().any(|line| line == "after"),
+                "missing following prose in {adoc:?}"
+            );
+        }
+
+        assert_eq!(
+            html_to_adoc("<table><tr><td>cell</td></tr></table>"),
+            "++++\n<table><tr><td>cell</td></tr></table>\n++++\n\n"
+        );
+        assert_eq!(
+            html_to_adoc("<pre>code</pre>"),
+            "[subs=specialcharacters]\n----\ncode\n----\n\n"
+        );
+    }
+
+    #[test]
+    fn no_rewriter_rejects_explicit_non_http_image_schemes() {
+        for src in [
+            "data:image/svg+xml;base64,PHN2Zy8+",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "mailto:user@example.test",
+        ] {
+            let rendered = html_to_adoc(&format!(r#"<img src="{src}" alt="safe">"#));
+            assert_eq!(rendered, "safe");
+            assert!(!rendered.contains("image:"));
+        }
+        assert!(
+            html_to_adoc(r#"<img src="relative/pic.png" alt="relative">"#)
+                .contains("image::relative/pic.png[relative]")
+        );
+        assert!(
+            html_to_adoc(r#"<img src="https://cdn.example/pic.png" alt="remote">"#)
+                .contains("image::https://cdn.example/pic.png[remote]")
+        );
+    }
+
+    #[test]
     fn every_listing_declares_specialcharacters_only_substitutions() {
         for html in [
             "<pre>pass:[&lt;img src=x onerror=alert(1)&gt;]</pre>",
@@ -924,6 +996,20 @@ mod tests {
                 adoc.contains("[subs=specialcharacters]\n----"),
                 "missing explicit substitutions in {adoc:?}"
             );
+        }
+    }
+
+    #[test]
+    fn specialcharacters_listing_preserves_source_line_endings_exactly() {
+        for source in ["", "body", "body\n", "body\n\n"] {
+            let rendered = render_specialcharacters_listing(source);
+            let delimiter = rendered.lines().nth(1).unwrap();
+            let expected = if source.ends_with('\n') {
+                format!("[subs=specialcharacters]\n{delimiter}\n{source}{delimiter}\n\n")
+            } else {
+                format!("[subs=specialcharacters]\n{delimiter}\n{source}\n{delimiter}\n\n")
+            };
+            assert_eq!(rendered, expected);
         }
     }
 
@@ -1965,11 +2051,11 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_image_targets_with_dotted_block_macro_names() {
+    fn rejects_explicit_non_http_image_schemes_with_dotted_names() {
         let adoc = html_to_adoc(r#"<p><img src="foo.bar::x" alt="t"></p>"#);
 
         assert!(!adoc.contains("image::foo.bar::x[t]"));
-        assert_eq!(adoc, "image::foo.bar%3A%3Ax[t]\n\n");
+        assert_eq!(adoc, "t\n\n");
     }
 
     #[test]
@@ -4190,6 +4276,67 @@ mod tests {
                 "missing {visible:?} in: {html}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn additional_block_constructs_remain_literal_after_conversion() {
+        let markers = [
+            "<<<",
+            "'''",
+            ".Authored title",
+            "--",
+            "|===",
+            ",===",
+            ":===",
+            "!===",
+        ];
+        let html = markers
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| format!("<p>{marker}<br>after-{index}</p>"))
+            .collect::<String>();
+        let converted = convert_with_asciidoctor(&html_to_adoc(&html));
+        let document = Html::parse_document(&converted);
+        let visible = document.root_element().text().collect::<String>();
+
+        for (index, marker) in markers.iter().enumerate() {
+            assert!(visible.contains(marker), "{marker}: {converted}");
+            assert!(visible.contains(&format!("after-{index}")), "{converted}");
+        }
+        assert_eq!(
+            document.select(&Selector::parse("table").unwrap()).count(),
+            0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn explicit_non_http_image_schemes_are_not_emitted_after_conversion() {
+        let html = concat!(
+            r#"<p><img src="data:image/svg+xml;base64,PHN2Zy8+" alt="data"></p>"#,
+            r#"<p><img src="javascript:alert(1)" alt="javascript"></p>"#,
+            r#"<p><img src="file:///etc/passwd" alt="file"></p>"#,
+            r#"<p><img src="mailto:user@example.test" alt="mailto"></p>"#,
+            r#"<p><img src="relative/pic.png" alt="relative"></p>"#,
+            r#"<p><img src="https://cdn.example/pic.png" alt="remote"></p>"#,
+        );
+        let converted = convert_with_asciidoctor(&html_to_adoc(html));
+        let document = Html::parse_document(&converted);
+        let images = document
+            .select(&Selector::parse("img").unwrap())
+            .collect::<Vec<_>>();
+        let sources = images
+            .iter()
+            .map(|image| image.attr("src").unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources, ["relative/pic.png", "https://cdn.example/pic.png"]);
+        assert!(sources.iter().all(|src| {
+            !["data:", "javascript:", "file:", "mailto:"]
+                .iter()
+                .any(|scheme| src.to_ascii_lowercase().starts_with(scheme))
+        }));
     }
 
     fn convert_with_asciidoctor(adoc: &str) -> String {

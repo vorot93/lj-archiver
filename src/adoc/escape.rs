@@ -443,7 +443,19 @@ fn starts_with_non_description_active_adoc_syntax(text: &str) -> bool {
         || starts_with_admonition_label(trimmed)
         || starts_with_line_comment(trimmed)
         || starts_with_hyphen_list_marker(trimmed)
+        || starts_with_additional_block_construct(trimmed)
         || is_active_delimiter_only(trimmed)
+}
+
+fn starts_with_additional_block_construct(text: &str) -> bool {
+    let trimmed = text.trim();
+    matches!(
+        trimmed,
+        "<<<" | "'''" | "--" | "|===" | ",===" | ":===" | "!==="
+    ) || trimmed
+        .strip_prefix('.')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|character| !character.is_whitespace())
 }
 
 fn starts_with_block_macro(text: &str) -> bool {
@@ -808,6 +820,25 @@ fn ends_with_inline_passthrough_macro_prefix(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neutralizes_page_theme_title_open_and_table_block_lines() {
+        for authored in [
+            "<<<",
+            "'''",
+            ".Authored title",
+            "--",
+            "|===",
+            ",===",
+            ":===",
+            "!===",
+        ] {
+            assert_eq!(
+                neutralize_plain_adoc_fragment_at_line_start(authored, true),
+                format!(r"\{authored}")
+            );
+        }
+    }
 
     #[test]
     fn incomplete_special_attribute_candidates_have_linear_scan_work() {

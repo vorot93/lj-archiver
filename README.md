@@ -179,7 +179,9 @@ URL and written as absolute external targets. Non-HTTP(S) link and image
 schemes are kept as inert visible text rather than active AsciiDoc macros.
 Plain text from posts and comments is also kept literal when it resembles an
 AsciiDoc macro, attribute, heading, list (including hyphen lists and
-description lists), comment, or other active syntax.
+description lists), comment, page/thematic break, block title, open-block or
+table delimiter, or other active syntax. Explicit non-HTTP(S) image schemes
+are never emitted as image macros.
 Unsupported HTML is preserved as raw HTML only when every element, attribute,
 and URL belongs to a reviewed inert subset. Active HTML and custom, namespaced,
 or otherwise unknown capabilities remain visible in source listings instead of
