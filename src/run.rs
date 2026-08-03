@@ -824,6 +824,7 @@ mod tests {
 
     const COLLIDING_NAMESPACE: &str = "00112233445566778899aabbccddeeff";
     const SAFE_NAMESPACE: &str = "ffeeddccbbaa99887766554433221100";
+    const PENDING_SEPARATOR: char = '\u{1f}';
 
     #[test]
     fn failure_reason_reports_failed_archive_pages() {
@@ -857,6 +858,41 @@ mod tests {
             rendered.contents.contains(SAFE_NAMESPACE),
             "got: {:?}",
             rendered.contents
+        );
+    }
+
+    #[test]
+    fn pending_render_retries_shared_boundary_collision_without_generated_residual() {
+        let namespaces = [COLLIDING_NAMESPACE, SAFE_NAMESPACE];
+        let mut calls = 0;
+        let rendered = render_pending_post_with(
+            &post_containing_shared_boundary_prefix(COLLIDING_NAMESPACE),
+            false,
+            "news",
+            Arc::new(HashMap::from([(7, "7.adoc".to_string())])),
+            || {
+                let value = namespaces[calls];
+                calls += 1;
+                Ok(value.to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        validate_pending_links(&rendered.contents, &rendered.links).unwrap();
+        let safe_token = rendered.links[0].token.clone();
+        let safe_body = &safe_token
+            [PENDING_SEPARATOR.len_utf8()..safe_token.len() - PENDING_SEPARATOR.len_utf8()];
+        let resolved =
+            resolve_pending_links(&rendered.contents, &rendered.links, &HashSet::from([7]))
+                .unwrap()
+                .contents;
+
+        assert!(resolved.contains("xref:7.adoc[Seven]"), "got: {resolved:?}");
+        assert!(!resolved.contains(&safe_token), "got: {resolved:?}");
+        assert!(
+            !resolved.contains(&format!("{safe_body}{PENDING_SEPARATOR}")),
+            "got: {resolved:?}"
         );
     }
 
@@ -3213,6 +3249,18 @@ mod tests {
         post.body_html = format!(
             concat!(
                 "<p>authored \u{1f}lj-archiver-link:{}:7:0\u{1f} ",
+                r#"<a href="https://news.livejournal.com/7.html">Seven</a></p>"#,
+            ),
+            namespace
+        );
+        post
+    }
+
+    fn post_containing_shared_boundary_prefix(namespace: &str) -> Post {
+        let mut post = parsed_post("https://news.livejournal.com/1.html", "news", 1);
+        post.body_html = format!(
+            concat!(
+                "<p>\u{1f}lj-archiver-link:{}:7:0",
                 r#"<a href="https://news.livejournal.com/7.html">Seven</a></p>"#,
             ),
             namespace

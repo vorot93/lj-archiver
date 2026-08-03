@@ -233,7 +233,7 @@ pub(crate) fn validate_pending_links(
         let end = terminator_search_start + relative_end + PENDING_LINK_SEPARATOR.len_utf8();
         if let Some(actual) = occurrences.get_mut(&text[start..end]) {
             *actual += 1;
-            cursor = end;
+            cursor = end - PENDING_LINK_SEPARATOR.len_utf8();
         } else {
             cursor = terminator_search_start;
         }
@@ -829,6 +829,64 @@ mod tests {
 
         assert_eq!(
             resolve_pending_links(&text, &links, &HashSet::from([7])).unwrap_err(),
+            PendingLinkError::OccurrenceCount {
+                expected: 1,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_validation_rejects_partial_prefix_shared_boundary_collision() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+        let token = rewriter
+            .xref_target("https://news.livejournal.com/7.html")
+            .unwrap();
+        let body = &token
+            [PENDING_LINK_SEPARATOR.len_utf8()..token.len() - PENDING_LINK_SEPARATOR.len_utf8()];
+        let text = format!("authored {PENDING_LINK_SEPARATOR}{body}{token}[seven]");
+
+        assert_eq!(
+            validate_pending_links(&text, &rewriter.pending_links()).unwrap_err(),
+            PendingLinkError::OccurrenceCount {
+                expected: 1,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_validation_rejects_partial_suffix_shared_boundary_collision() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+        let token = rewriter
+            .xref_target("https://news.livejournal.com/7.html")
+            .unwrap();
+        let body = &token
+            [PENDING_LINK_SEPARATOR.len_utf8()..token.len() - PENDING_LINK_SEPARATOR.len_utf8()];
+        let text = format!("{token}{body}{PENDING_LINK_SEPARATOR} authored");
+
+        assert_eq!(
+            validate_pending_links(&text, &rewriter.pending_links()).unwrap_err(),
+            PendingLinkError::OccurrenceCount {
+                expected: 1,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_resolution_rejects_shared_boundary_collision_before_replacement() {
+        let rewriter = pending_rewriter_with_namespace(TEST_NAMESPACE);
+        let token = rewriter
+            .xref_target("https://news.livejournal.com/7.html")
+            .unwrap();
+        let body = &token
+            [PENDING_LINK_SEPARATOR.len_utf8()..token.len() - PENDING_LINK_SEPARATOR.len_utf8()];
+        let text = format!("authored {PENDING_LINK_SEPARATOR}{body}{token}[seven]");
+
+        assert_eq!(
+            resolve_pending_links(&text, &rewriter.pending_links(), &HashSet::from([7]))
+                .unwrap_err(),
             PendingLinkError::OccurrenceCount {
                 expected: 1,
                 actual: 2,
