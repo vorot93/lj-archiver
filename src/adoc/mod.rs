@@ -3077,6 +3077,34 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_deleted_comment_words_render_the_complete_body() {
+        use crate::parser::parse_post_page;
+        use url::Url;
+
+        let html = r#"
+            <article data-journal="news" data-itemid="1">
+              <div class="entry-content">post</div>
+            </article>
+            <section id="comments">
+              <div class="comment" id="t1">
+                <span class="comment-author">alice</span>
+                <div class="comment-content"><p>The Deleted comment label is confusing.</p></div>
+              </div>
+            </section>
+        "#;
+        let post = parse_post_page(
+            html,
+            &Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        )
+        .unwrap();
+
+        let rendered = render_post(&post, true, None);
+
+        assert!(rendered.contains("The Deleted comment label is confusing."));
+        assert!(!rendered.contains("_Deleted comment._"));
+    }
+
+    #[test]
     fn renders_deep_replies_as_block_titles() {
         let post = test_post_with_comments(vec![test_comment(4, false)]);
 

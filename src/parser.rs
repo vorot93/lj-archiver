@@ -224,10 +224,15 @@ fn comments(document: &Html) -> Vec<Comment> {
                 subject: first_text_in(comment, &COMMENT_SUBJECT),
                 posted_at: first_datetime_in(comment, &COMMENT_DATE),
                 body_html,
-                deleted: has_class(comment, "deleted") || body_text.contains("Deleted comment"),
+                deleted: has_class(comment, "deleted")
+                    || is_deleted_comment_placeholder(&body_text),
             }
         })
         .collect()
+}
+
+fn is_deleted_comment_placeholder(text: &str) -> bool {
+    text.split_whitespace().collect::<Vec<_>>().join(" ") == "Deleted comment"
 }
 
 fn source_article(document: &Html) -> Option<ElementRef<'_>> {
@@ -446,6 +451,35 @@ mod tests {
         assert_eq!(post.comments[1].parent_id.as_deref(), Some("t1"));
         assert_eq!(post.comments[1].depth, 1);
         assert!(post.comments[2].deleted);
+    }
+
+    #[test]
+    fn deleted_comment_words_inside_prose_do_not_delete_the_comment() {
+        let html = r#"
+            <article data-journal="news" data-itemid="1">
+              <div class="entry-content">post</div>
+            </article>
+            <section id="comments">
+              <div class="comment" id="t1">
+                <span class="comment-author">alice</span>
+                <div class="comment-content"><p>The Deleted comment label is confusing.</p></div>
+              </div>
+              <div class="comment" id="t2">
+                <span class="comment-author">bob</span>
+                <div class="comment-content"> Deleted
+                    comment </div>
+              </div>
+            </section>
+        "#;
+        let post = parse_post_page(
+            html,
+            &Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        )
+        .unwrap();
+
+        assert!(!post.comments[0].deleted);
+        assert!(post.comments[0].body_html.contains("label is confusing"));
+        assert!(post.comments[1].deleted);
     }
 
     #[test]
