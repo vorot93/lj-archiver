@@ -124,6 +124,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
 
     steps:
       - name: Download all platform installers
