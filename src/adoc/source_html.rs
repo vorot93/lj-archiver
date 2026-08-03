@@ -6,6 +6,79 @@ use url::Url;
 
 pub(crate) type SourceMap = HashMap<NodeId, Range<usize>>;
 
+const SAFE_ELEMENTS: &[&str] = &[
+    "a",
+    "abbr",
+    "address",
+    "article",
+    "aside",
+    "b",
+    "bdi",
+    "bdo",
+    "blockquote",
+    "br",
+    "caption",
+    "cite",
+    "code",
+    "col",
+    "colgroup",
+    "dd",
+    "del",
+    "dfn",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "figcaption",
+    "figure",
+    "footer",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "i",
+    "img",
+    "ins",
+    "kbd",
+    "li",
+    "main",
+    "mark",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "q",
+    "rp",
+    "rt",
+    "ruby",
+    "s",
+    "samp",
+    "section",
+    "small",
+    "span",
+    "strong",
+    "sub",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "time",
+    "tr",
+    "u",
+    "ul",
+    "var",
+    "wbr",
+];
+
+const SAFE_GLOBAL_ATTRIBUTES: &[&str] = &["class", "id", "title", "lang", "dir", "role"];
+
 pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     if is_stripped_chrome(element) {
         return String::new();
@@ -13,9 +86,7 @@ pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) ->
 
     let html = source_preserving_html(element, ctx);
 
-    if contains_script_or_style_tag(html.as_ref())
-        || contains_rejected_url_attribute(html.as_ref(), ctx)
-    {
+    if !passthrough_is_safe(html.as_ref()) {
         return render_source_listing(html.as_ref());
     }
 
@@ -24,30 +95,22 @@ pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) ->
     format!("{delimiter}\n{html}\n{delimiter}\n\n")
 }
 
-fn contains_rejected_url_attribute(source_html: &str, ctx: RenderCtx<'_>) -> bool {
-    let fragment = Html::parse_fragment(source_html);
+fn passthrough_is_safe(source_html: &str) -> bool {
+    let Ok(scanned) = crate::html_scan::scan(source_html) else {
+        return false;
+    };
 
-    fragment
-        .tree
-        .root()
-        .descendants()
-        .filter_map(ElementRef::wrap)
-        .any(|element| {
-            element.value().attrs().any(|(local_name, value)| {
-                matches!(local_name, "href" | "src") && !is_safe_url_reference(value, ctx)
+    scanned.start_tags().iter().all(|tag| {
+        SAFE_ELEMENTS.contains(&tag.name())
+            && tag.attributes().iter().all(|attribute| {
+                passthrough_attribute_is_safe(
+                    tag.name(),
+                    attribute.name(),
+                    attribute.is_qualified(),
+                ) && (!matches!(attribute.name(), "href" | "src")
+                    || has_safe_passthrough_url(attribute.decoded_value()))
             })
-        })
-}
-
-fn is_safe_url_reference(value: &str, ctx: RenderCtx<'_>) -> bool {
-    if let Some(rewriter) = ctx.link_rewriter {
-        return rewriter.absolute_target(value).is_some();
-    }
-
-    Url::parse("https://source.invalid/")
-        .expect("static URL is valid")
-        .join(value)
-        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+    })
 }
 
 fn render_source_listing(content: &str) -> String {
@@ -56,23 +119,79 @@ fn render_source_listing(content: &str) -> String {
     format!("{delimiter}\n{content}\n{delimiter}\n\n")
 }
 
-fn contains_script_or_style_tag(source_html: &str) -> bool {
-    crate::html_scan::scan(source_html).map_or(true, |scanned| {
-        scanned
-            .start_tags()
-            .iter()
-            .any(|tag| matches!(tag.name(), "script" | "style"))
-    })
+fn passthrough_attribute_is_safe(tag: &str, attribute: &str, qualified: bool) -> bool {
+    if qualified || attribute.starts_with("on") || matches!(attribute, "style" | "srcdoc") {
+        return false;
+    }
+
+    SAFE_GLOBAL_ATTRIBUTES.contains(&attribute)
+        || attribute.starts_with("aria-")
+        || match tag {
+            "a" => attribute == "href",
+            "img" => matches!(attribute, "src" | "alt" | "width" | "height"),
+            "col" | "colgroup" => attribute == "span",
+            "ol" => matches!(attribute, "start" | "reversed" | "type"),
+            "li" => attribute == "value",
+            "td" | "th" => {
+                matches!(
+                    attribute,
+                    "colspan" | "rowspan" | "headers" | "scope" | "abbr"
+                )
+            }
+            "time" | "del" | "ins" => attribute == "datetime",
+            _ => false,
+        }
+}
+
+fn has_safe_passthrough_url(value: &str) -> bool {
+    match Url::parse(value) {
+        Ok(url) => matches!(url.scheme(), "http" | "https") && url.has_host(),
+        Err(url::ParseError::RelativeUrlWithoutBase) => Url::parse("https://source.invalid/")
+            .and_then(|base| base.join(value))
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host()),
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn safe_block_delimiter(content: &str, character: char) -> String {
-    let mut delimiter = character.to_string().repeat(4);
+    safe_block_delimiter_impl(content, character, None)
+}
 
-    while content.lines().any(|line| line == delimiter) {
-        delimiter.push(character);
+#[cfg(test)]
+pub(super) fn safe_block_delimiter_with_steps(content: &str, character: char) -> (String, usize) {
+    let mut inspected = 0;
+    let delimiter = safe_block_delimiter_impl(content, character, Some(&mut inspected));
+
+    (delimiter, inspected)
+}
+
+fn safe_block_delimiter_impl(
+    content: &str,
+    character: char,
+    mut inspected: Option<&mut usize>,
+) -> String {
+    let mut maximum = 3;
+
+    for line in content.lines() {
+        let mut count = 0;
+        let mut only_delimiter_characters = true;
+
+        for candidate in line.chars() {
+            count += 1;
+            only_delimiter_characters &= candidate == character;
+            if let Some(steps) = inspected.as_deref_mut() {
+                *steps += 1;
+            }
+        }
+        if let Some(steps) = inspected.as_deref_mut() {
+            *steps += 1;
+        }
+        if only_delimiter_characters {
+            maximum = maximum.max(count);
+        }
     }
 
-    delimiter
+    character.to_string().repeat(maximum.max(3) + 1)
 }
 
 fn source_preserving_html<'a>(element: ElementRef<'_>, ctx: RenderCtx<'a>) -> Cow<'a, str> {

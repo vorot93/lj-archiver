@@ -170,6 +170,10 @@ URL and written as absolute external targets. Non-HTTP(S) link and image
 schemes are kept as inert visible text rather than active AsciiDoc macros.
 Plain text from posts and comments is also kept literal when it resembles an
 AsciiDoc macro, attribute, heading, list, or other active syntax.
+Unsupported HTML is preserved as raw HTML only when every element, attribute,
+and URL belongs to a reviewed inert subset. Active HTML and custom, namespaced,
+or otherwise unknown capabilities remain visible in source listings instead of
+being emitted as raw HTML.
 Archive paths written into AsciiDoc always use portable forward slashes.
 An image that links to another exported post also stays local: its click target
 resolves correctly both from a standalone file in `posts/` and when that post
@@ -294,4 +298,7 @@ It does not log in to LiveJournal, access friends-only or private posts, publish
 
 Comment threads are not always present in the fetched page: current LiveJournal renders comments dynamically (via JavaScript), so an archived post may have no comments. The post body, title, tags, author, poster, and publication date are captured. The poster (written to `:lj-poster:`) and the publication date (written to `:lj-date:`) come from the post page's embedded metadata. The recorded date is a best-effort publication timestamp — it reflects LiveJournal's event time for the post, which historically corresponds to the poster's local time. The author (written to `:lj-author:`) is the journal's canonical account name from the post's embedded metadata.
 
-Fetched pages are capped at 64 MiB. Pathologically deeply-nested HTML (beyond 256 levels) is preserved as passthrough rather than causing the archive to fail.
+Fetched pages are capped at 64 MiB. Pathologically deeply-nested HTML (beyond
+256 levels) is preserved as raw HTML when it passes the reviewed inert policy,
+or as a visible source listing otherwise, rather than causing the archive to
+fail.

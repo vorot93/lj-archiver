@@ -921,6 +921,34 @@ mod tests {
     }
 
     #[test]
+    fn active_passthrough_capabilities_fail_closed_to_source_listings() {
+        for source in [
+            r#"<table onclick="alert(1)"><tr><td>x</td></tr></table>"#,
+            r#"<iframe srcdoc="<script>alert(1)</script>"></iframe>"#,
+            r#"<section><meta http-equiv="refresh" content="0;url=https://example.test"></section>"#,
+            r#"<foo><p>custom</p></foo>"#,
+            r#"<section><svg><a href="https://example.test">x</a></svg></section>"#,
+        ] {
+            assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+        }
+    }
+
+    #[test]
+    fn reviewed_inert_table_passthrough_remains_raw() {
+        let source = concat!(
+            r#"<table class="record"><thead><tr><th scope="col">Name</th></tr></thead>"#,
+            "<tbody><tr><td>value</td></tr></tbody></table>",
+        );
+        assert_eq!(html_to_adoc(source), format!("++++\n{source}\n++++\n\n"));
+    }
+
+    #[test]
+    fn encoded_executable_url_fails_closed() {
+        let source = r#"<section><a href="java&#x73;cript:alert(1)">x</a></section>"#;
+        assert_eq!(html_to_adoc(source), format!("----\n{source}\n----\n\n"));
+    }
+
+    #[test]
     fn comment_tags_do_not_shift_passthrough_source_spans() {
         let html = "<p><!-- <div>fake</div> -->intro</p><div>real</div>";
         assert_eq!(
@@ -945,7 +973,7 @@ mod tests {
     fn malformed_space_after_tag_open_does_not_shift_real_div_source() {
         assert_eq!(
             html_to_adoc("< div>fake</div><div data-real='yes'>real</div>"),
-            "< div>fake\n\n++++\n<div data-real='yes'>real</div>\n++++\n\n"
+            "< div>fake\n\n----\n<div data-real='yes'>real</div>\n----\n\n"
         );
     }
 
@@ -953,7 +981,7 @@ mod tests {
     fn tokenizer_valid_punctuation_in_tag_name_does_not_shift_real_div_source() {
         assert_eq!(
             html_to_adoc("<div!>fake</div!><div data-real='yes'>real</div>"),
-            "fake\n\n++++\n<div data-real='yes'>real</div>\n++++\n\n"
+            "fake\n\n----\n<div data-real='yes'>real</div>\n----\n\n"
         );
     }
 
@@ -961,8 +989,8 @@ mod tests {
     fn quote_in_attribute_name_does_not_hide_tag_end_or_shift_real_div_source() {
         let input = "<div \">fake</div><div data-real='yes'>real</div>";
         let expected = concat!(
-            "++++\n<div \">fake</div>\n++++\n\n",
-            "++++\n<div data-real='yes'>real</div>\n++++\n\n"
+            "----\n<div \">fake</div>\n----\n\n",
+            "----\n<div data-real='yes'>real</div>\n----\n\n"
         );
         let adoc = html_to_adoc(input);
 
@@ -974,7 +1002,7 @@ mod tests {
     #[test]
     fn nul_in_tag_name_does_not_shift_following_real_div_source() {
         let input = "<div\0x>fake</div\0x><div data-real='yes'>real</div>";
-        let expected = "fake\n\n++++\n<div data-real='yes'>real</div>\n++++\n\n";
+        let expected = "fake\n\n----\n<div data-real='yes'>real</div>\n----\n\n";
         let adoc = html_to_adoc(input);
 
         assert_eq!(adoc, expected);
@@ -999,7 +1027,7 @@ mod tests {
     fn raw_text_end_tag_prefix_requires_appropriate_boundary() {
         let html = concat!(
             "<script>const x = \"</scripture><table>fake</table>\";</script>",
-            "<table data-kind='real'><tr><td>real</td></tr></table>"
+            "<table title='real'><tr><td>real</td></tr></table>"
         );
         assert_eq!(
             html_to_adoc(html),
@@ -1008,7 +1036,7 @@ mod tests {
                 "const x = \"</scripture><table>fake</table>\";\n",
                 "----\n\n",
                 "++++\n",
-                "<table data-kind='real'><tr><td>real</td></tr></table>\n",
+                "<table title='real'><tr><td>real</td></tr></table>\n",
                 "++++\n\n"
             )
         );
@@ -1016,19 +1044,19 @@ mod tests {
 
     #[test]
     fn abrupt_comment_end_preserves_following_source_span() {
-        let html = "<!--><div data-kind='abrupt'>real</div>";
+        let html = "<!--><div title='abrupt'>real</div>";
         assert_eq!(
             html_to_adoc(html),
-            "++++\n<div data-kind='abrupt'>real</div>\n++++\n\n"
+            "++++\n<div title='abrupt'>real</div>\n++++\n\n"
         );
     }
 
     #[test]
     fn bang_comment_end_preserves_following_source_span() {
-        let html = "<!-- comment --!><div data-kind='bang'>real</div>";
+        let html = "<!-- comment --!><div title='bang'>real</div>";
         assert_eq!(
             html_to_adoc(html),
-            "++++\n<div data-kind='bang'>real</div>\n++++\n\n"
+            "++++\n<div title='bang'>real</div>\n++++\n\n"
         );
     }
 
@@ -1044,6 +1072,19 @@ mod tests {
         assert!(
             !adoc.starts_with("++++\n<table><tr><td>before\n++++\nafter</td></tr></table>\n++++")
         );
+    }
+
+    #[test]
+    fn safe_delimiter_selection_scans_each_line_once() {
+        let mut content = String::new();
+        for length in 4..=20_000 {
+            content.push_str(&"-".repeat(length));
+            content.push('\n');
+        }
+
+        let (delimiter, inspected) = safe_block_delimiter_with_steps(&content, '-');
+        assert_eq!(delimiter.len(), 20_001);
+        assert!(inspected <= content.len() + 20_000);
     }
 
     #[test]
@@ -1115,55 +1156,59 @@ mod tests {
     }
 
     #[test]
-    fn preserves_iframe_source_attribute_quotes_as_passthrough() {
+    fn preserves_iframe_source_attribute_quotes_in_listing() {
         let html = "<iframe src='x'></iframe>";
 
         assert_eq!(
             html_to_adoc(html),
-            "++++\n<iframe src='x'></iframe>\n++++\n\n"
+            "----\n<iframe src='x'></iframe>\n----\n\n"
         );
     }
 
     #[test]
-    fn preserves_embed_source_attribute_quotes_as_passthrough() {
+    fn preserves_embed_source_attribute_quotes_in_listing() {
         let html = "<embed src='x'>";
 
-        assert_eq!(html_to_adoc(html), "++++\n<embed src='x'>\n++++\n\n");
+        assert_eq!(html_to_adoc(html), "----\n<embed src='x'>\n----\n\n");
     }
 
     #[test]
-    fn preserves_repeated_embeds_as_distinct_passthrough() {
+    fn preserves_repeated_embeds_as_distinct_listings() {
         let html = "<embed src='one'><embed src='two'>";
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc.matches("<embed src='one'>").count(), 1);
-        assert_eq!(adoc.matches("<embed src='two'>").count(), 1);
-        assert!(!adoc.contains("<embed src='one'>\n++++\n\n++++\n<embed src='one'>"));
-    }
-
-    #[test]
-    fn preserves_mixed_quote_repeated_iframes_as_distinct_passthrough() {
-        let html = "<iframe src='x'></iframe><iframe src=\"x\"></iframe>";
-        let adoc = html_to_adoc(html);
-
-        assert_eq!(adoc.matches("<iframe src='x'></iframe>").count(), 1);
-        assert_eq!(adoc.matches("<iframe src=\"x\"></iframe>").count(), 1);
-        assert_ne!(adoc.matches("<iframe src=\"x\"></iframe>").count(), 2);
-        assert!(
-            !adoc.contains("<iframe src='x'></iframe>\n++++\n\n++++\n<iframe src='x'></iframe>")
+        assert_eq!(
+            adoc,
+            "----\n<embed src='one'>\n----\n\n----\n<embed src='two'>\n----\n\n"
         );
     }
 
     #[test]
-    fn preserves_repeated_single_quoted_iframes_as_distinct_passthrough() {
+    fn preserves_mixed_quote_repeated_iframes_as_distinct_listings() {
+        let html = "<iframe src='x'></iframe><iframe src=\"x\"></iframe>";
+        let adoc = html_to_adoc(html);
+
+        assert_eq!(
+            adoc,
+            concat!(
+                "----\n<iframe src='x'></iframe>\n----\n\n",
+                "----\n<iframe src=\"x\"></iframe>\n----\n\n",
+            )
+        );
+    }
+
+    #[test]
+    fn preserves_repeated_single_quoted_iframes_as_distinct_listings() {
         let html = "<iframe src='first'></iframe><iframe src='second'></iframe>";
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc.matches("<iframe src='first'></iframe>").count(), 1);
-        assert_eq!(adoc.matches("<iframe src='second'></iframe>").count(), 1);
-        assert!(!adoc.contains(
-            "<iframe src='first'></iframe>\n++++\n\n++++\n<iframe src='first'></iframe>"
-        ));
+        assert_eq!(
+            adoc,
+            concat!(
+                "----\n<iframe src='first'></iframe>\n----\n\n",
+                "----\n<iframe src='second'></iframe>\n----\n\n",
+            )
+        );
     }
 
     #[test]
@@ -1290,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_additional_standard_block_elements_as_passthrough() {
+    fn active_standard_block_elements_fail_closed_to_listings() {
         for html in [
             "<menu><li>x</li></menu>",
             "<noscript><p>x</p></noscript>",
@@ -1299,7 +1344,7 @@ mod tests {
         ] {
             let adoc = html_to_adoc(html);
 
-            assert_eq!(adoc, format!("++++\n{html}\n++++\n\n"));
+            assert_eq!(adoc, format!("----\n{html}\n----\n\n"));
         }
     }
 
@@ -1336,22 +1381,22 @@ mod tests {
     }
 
     #[test]
-    fn preserves_iframe_passthrough_inside_inline_wrapper() {
+    fn preserves_iframe_listing_inside_inline_wrapper() {
         let html = r#"<p><span><iframe src="x"></iframe></span></p>"#;
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc, "++++\n<iframe src=\"x\"></iframe>\n++++\n\n");
+        assert_eq!(adoc, "----\n<iframe src=\"x\"></iframe>\n----\n\n");
         assert_ne!(adoc, "\n\n");
     }
 
     #[test]
-    fn preserves_iframe_passthrough_inside_em_wrapper() {
+    fn preserves_iframe_listing_inside_em_wrapper() {
         let html = r#"<p><em><iframe src="x"></iframe></em></p>"#;
         let adoc = html_to_adoc(html);
 
-        assert!(adoc.lines().any(|line| line == "++++"));
-        assert!(!adoc.lines().any(|line| line == "_++++" || line == "++++_"));
-        assert_eq!(adoc, "++++\n<iframe src=\"x\"></iframe>\n++++\n\n");
+        assert!(adoc.lines().any(|line| line == "----"));
+        assert!(!adoc.lines().any(|line| line == "_----" || line == "----_"));
+        assert_eq!(adoc, "----\n<iframe src=\"x\"></iframe>\n----\n\n");
     }
 
     #[test]
@@ -1376,13 +1421,13 @@ mod tests {
     }
 
     #[test]
-    fn preserves_iframe_passthrough_inside_link_wrapper() {
+    fn preserves_iframe_listing_inside_link_wrapper() {
         let html = r#"<a href="x"><iframe src="y"></iframe></a>"#;
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc, "++++\n<iframe src=\"y\"></iframe>\n++++\n\n");
-        assert!(!adoc.contains("x[++++"));
-        assert!(!adoc.contains("++++]"));
+        assert_eq!(adoc, "----\n<iframe src=\"y\"></iframe>\n----\n\n");
+        assert!(!adoc.contains("x[----"));
+        assert!(!adoc.contains("----]"));
     }
 
     #[test]
@@ -1435,40 +1480,40 @@ mod tests {
     }
 
     #[test]
-    fn preserves_unknown_element_with_block_child_as_passthrough() {
+    fn preserves_unknown_element_with_block_child_as_listing() {
         let html = "<foo><p>x</p></foo>";
         let adoc = html_to_adoc(html);
 
-        assert_eq!(adoc, "++++\n<foo><p>x</p></foo>\n++++\n\n");
+        assert_eq!(adoc, "----\n<foo><p>x</p></foo>\n----\n\n");
         assert_ne!(adoc, "x");
     }
 
     #[test]
-    fn keeps_iframe_passthrough_on_block_boundaries() {
+    fn keeps_iframe_listing_on_block_boundaries() {
         let html = r#"<p>before <iframe src="x"></iframe> after</p>"#;
         let adoc = html_to_adoc(html);
 
-        assert!(!adoc.contains("before ++++\n"));
-        assert!(!adoc.contains("++++\n after"));
-        assert!(adoc.contains("\n++++\n<iframe src=\"x\"></iframe>\n++++\n"));
+        assert!(!adoc.contains("before ----\n"));
+        assert!(!adoc.contains("----\n after"));
+        assert!(adoc.contains("\n----\n<iframe src=\"x\"></iframe>\n----\n"));
     }
 
     #[test]
-    fn keeps_center_passthrough_on_block_boundaries() {
+    fn keeps_center_listing_on_block_boundaries() {
         let html = "<p>before<center>x</center>after</p>";
         let adoc = html_to_adoc(html);
 
         assert!(!adoc.contains("beforexafter"));
-        assert!(adoc.contains("before\n\n++++\n<center>x</center>\n++++\n\nafter"));
+        assert!(adoc.contains("before\n\n----\n<center>x</center>\n----\n\nafter"));
     }
 
     #[test]
-    fn keeps_object_passthrough_on_block_boundaries() {
+    fn keeps_object_listing_on_block_boundaries() {
         let html = r#"<p>before<object data="x"></object>after</p>"#;
         let adoc = html_to_adoc(html);
 
         assert!(!adoc.contains("beforeafter"));
-        assert!(adoc.contains("before\n\n++++\n<object data=\"x\"></object>\n++++\n\nafter"));
+        assert!(adoc.contains("before\n\n----\n<object data=\"x\"></object>\n----\n\nafter"));
     }
 
     #[test]
@@ -3041,7 +3086,7 @@ mod tests {
     #[test]
     fn safe_url_attributes_keep_exact_raw_passthrough_control() {
         let source = concat!(
-            r#"<section data-kind='safe'><a href="/profile">safe link</a>"#,
+            r#"<section title='safe'><a href="/profile">safe link</a>"#,
             r#"<img src='photo.jpg' alt='safe image'></section>"#,
         );
         let r = LinkRewriter::new(
@@ -3079,7 +3124,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_namespaced_url_attribute_keeps_exact_raw_passthrough() {
+    fn hosted_namespaced_url_attribute_still_fails_closed_to_listing() {
         let source = concat!(
             r#"<section data-kind='safe-svg'><svg xmlns="http://www.w3.org/2000/svg" "#,
             r#"xmlns:xlink="http://www.w3.org/1999/xlink">"#,
@@ -3094,7 +3139,7 @@ mod tests {
 
         let adoc = html_to_adoc_with_links(source, Some(&r));
 
-        assert_eq!(adoc, format!("++++\n{source}\n++++\n\n"));
+        assert_eq!(adoc, format!("----\n{source}\n----\n\n"));
     }
 
     #[test]
@@ -3186,6 +3231,46 @@ mod tests {
 
     #[test]
     #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn active_capabilities_convert_inert_and_reviewed_table_stays_raw() {
+        let event_handler = r#"<table onclick="alert(1)"><tr><td>event cell</td></tr></table>"#;
+        let srcdoc = r#"<iframe srcdoc="<script>alert(2)</script>"></iframe>"#;
+        let safe_table = concat!(
+            r#"<table class="record"><thead><tr><th scope="col">Name</th></tr></thead>"#,
+            "<tbody><tr><td>value</td></tr></tbody></table>",
+        );
+        let adoc = format!(
+            "{}\n{}\n{}",
+            html_to_adoc(event_handler),
+            html_to_adoc(srcdoc),
+            html_to_adoc(safe_table)
+        );
+
+        let html = convert_with_asciidoctor(&adoc);
+        let document = Html::parse_document(&html);
+
+        assert!(
+            document
+                .select(&Selector::parse("[onclick], iframe, script").unwrap())
+                .next()
+                .is_none()
+        );
+        assert!(
+            document
+                .root_element()
+                .text()
+                .collect::<String>()
+                .contains("onclick")
+        );
+        assert!(
+            document
+                .select(&Selector::parse("table.record").unwrap())
+                .next()
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
     fn svg_xlink_passthrough_safety_is_inert_after_conversion() {
         let unsafe_source = concat!(
             r#"<section><svg xmlns="http://www.w3.org/2000/svg" "#,
@@ -3235,7 +3320,14 @@ mod tests {
             );
         }
         assert!(
-            active_values.contains(&"https://safe.example.test/page"),
+            !active_values.contains(&"https://safe.example.test/page"),
+            "got: {html}"
+        );
+        assert!(
+            document
+                .select(&Selector::parse("svg").unwrap())
+                .next()
+                .is_none(),
             "got: {html}"
         );
         let visible_text = document.root_element().text().collect::<String>();

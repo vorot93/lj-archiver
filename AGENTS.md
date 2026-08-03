@@ -159,16 +159,25 @@ locally to `xref:`, linked images resolve to the contextual URI, and a
 linked-image external fallback has commas encoded before token substitution so
 it cannot split the image attribute list.
 
-Unsupported HTML remains exact source-preserved passthrough when its recovered
-source span has only safe URL attributes. Safety-parse that exact span as a
-complete fragment before inspecting every attribute whose local name is
-`href` or `src` (including namespaced forms such as SVG `xlink:href`);
-inspecting only unqualified attributes or the original DOM subtree is
-insufficient because namespaces can hide an active URL and table
-foster-parenting can move a node outside the subtree while its bytes remain
-inside the emitted span. If a URL is not a hosted HTTP(S) reference, render the
-untouched span as a listing instead of raw `++++` passthrough, and never
-serialize the safety DOM.
+Unsupported HTML remains exact source-preserved raw passthrough only when the
+shared scanner classifies every tokenizer-decoded capability as reviewed and
+inert. The element allowlist is ordinary structural/phrasing HTML through
+tables; the only global attributes are `class`, `id`, `title`, `lang`, `dir`,
+`role`, and `aria-*`. Tag-specific attributes are limited to `a[href]`,
+`img[src,alt,width,height]`, `col`/`colgroup[span]`,
+`ol[start,reversed,type]`, `li[value]`,
+`td`/`th[colspan,rowspan,headers,scope,abbr]`, `time[datetime]`, and
+`del`/`ins[datetime]`. Qualified attributes, `on*`, `style`, `srcdoc`, custom or
+namespaced elements, and every unreviewed element or attribute fail closed to a
+visible listing. `href` and `src` decisions use the scanner's decoded value:
+hosted HTTP(S) absolute URLs and scheme-less references are safe; explicit
+non-HTTP(S) schemes and malformed absolute URLs are not. A `ScanError` also
+selects the untouched listing; never guess or serialize a safety DOM.
+
+Every generated block delimiter is chosen with one pass over `content.lines()`:
+inspect each line once, remember the longest line made only of the delimiter
+character, and emit one more character than that length (with four characters
+as the minimum). Do not restore a candidate-by-candidate rescan ladder.
 
 The composed document ends with exactly one newline **by construction**, not a post-hoc trim: each block ends with a single `\n` (`push_body`) and the blank-line separator is inserted *before* each block (`render_post`, `render_comment`). Do not switch to per-block `\n\n` plus a trailing trim.
 
