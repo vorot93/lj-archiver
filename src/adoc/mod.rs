@@ -930,6 +930,18 @@ mod tests {
     }
 
     #[test]
+    fn bogus_declaration_tags_do_not_shift_passthrough_source_spans() {
+        let html = "<!foo <div><div>real</div>";
+        assert_eq!(html_to_adoc(html), "++++\n<div>real</div>\n++++\n\n");
+    }
+
+    #[test]
+    fn processing_instruction_tags_do_not_shift_passthrough_source_spans() {
+        let html = "<?foo <div><div>real</div>";
+        assert_eq!(html_to_adoc(html), "++++\n<div>real</div>\n++++\n\n");
+    }
+
+    #[test]
     fn malformed_space_after_tag_open_does_not_shift_real_div_source() {
         assert_eq!(
             html_to_adoc("< div>fake</div><div data-real='yes'>real</div>"),

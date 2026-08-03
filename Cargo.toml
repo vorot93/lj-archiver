@@ -18,6 +18,7 @@ clap = { version = "4", features = ["derive"] }
 ego-tree = "0.11"
 futures = "0.3"
 hex = "0.4"
+html5ever = "0.39.0"
 indicatif = "0.18"
 reqwest = { version = "0.13", default-features = false, features = ["charset", "cookies", "gzip", "http2", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

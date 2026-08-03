@@ -4,6 +4,7 @@ pub mod cli;
 pub mod client;
 pub mod discover;
 pub mod error;
+mod html_scan;
 mod links;
 pub mod media;
 pub mod models;
