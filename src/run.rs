@@ -12,7 +12,7 @@ use crate::{
         validate_pending_links,
     },
     media::rewrite_inline_media,
-    models::{ArchiveTarget, ArchivedPost, Post, PostFailure, RunOptions},
+    models::{ArchiveTarget, ArchivedPost, ArchivedTitle, Post, PostFailure, RunOptions},
     parser::parse_post_page,
     progress::Progress,
     target::{journals_alias, parse_target, post_ref_from_url, post_url},
@@ -359,7 +359,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
                         post.archived.path = publication.path;
                         posts.insert(post.archived.id, post.archived.clone());
                         archived += 1;
-                        progress.post_done(post.archived.id, &post.archived.title);
+                        progress.post_done(post.archived.id, post.archived.title.as_str());
                         finalized.push(post);
                     }
                     Err(error) => {
@@ -534,7 +534,7 @@ async fn archive_journal_post(
                 Result::Ok(PreparedPost {
                     archived: ArchivedPost {
                         id,
-                        title: post.title,
+                        title: ArchivedTitle::authored(post.title),
                         path: destination,
                     },
                     delivered_url: delivered_url.clone(),
@@ -762,7 +762,7 @@ async fn fetch_and_write_post(
     Ok((
         ArchivedPost {
             id: requested_id,
-            title: post.title.clone(),
+            title: ArchivedTitle::authored(post.title.clone()),
             path: publication.path,
         },
         warnings,
@@ -1326,7 +1326,7 @@ mod tests {
         match outcome {
             JournalPostOutcome::Prepared(post) => {
                 assert_eq!(post.archived.id, 1);
-                assert_eq!(post.archived.title, "Post Title");
+                assert_eq!(post.archived.title, ArchivedTitle::authored("Post Title"));
             }
             JournalPostOutcome::Skipped(post) => {
                 panic!("late unverified post {} was incorrectly skipped", post.id)
@@ -3803,7 +3803,7 @@ mod tests {
             .iter()
             .map(|&(id, title, contents)| ArchivedPost {
                 id,
-                title: title.to_string(),
+                title: ArchivedTitle::authored(title),
                 path: archive.write_post(id, contents).unwrap(),
             })
             .collect::<Vec<_>>();
@@ -3828,7 +3828,7 @@ mod tests {
                 std::fs::write(&path, contents).unwrap();
                 ArchivedPost {
                     id,
-                    title: title.to_string(),
+                    title: ArchivedTitle::authored(title),
                     path,
                 }
             })

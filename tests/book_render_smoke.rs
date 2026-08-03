@@ -1,4 +1,7 @@
-use lj_archiver::{archive::Archive, models::ArchivedPost};
+use lj_archiver::{
+    archive::Archive,
+    models::{ArchivedPost, ArchivedTitle},
+};
 use std::{fs, process::Command};
 use tempfile::tempdir;
 
@@ -41,7 +44,7 @@ fn book_media_resolves_to_archive_root_asset() {
         .unwrap();
     let posts = [ArchivedPost {
         id: 1,
-        title: "Post".to_string(),
+        title: ArchivedTitle::authored("Post"),
         path: post_path,
     }];
     archive.write_index(&posts).unwrap();
@@ -99,12 +102,12 @@ fn linked_post_image_href_resolves_in_standalone_and_book_contexts() {
     let posts = [
         ArchivedPost {
             id: 1,
-            title: "First".to_string(),
+            title: ArchivedTitle::authored("First"),
             path: first_path,
         },
         ArchivedPost {
             id: 2,
-            title: "Second".to_string(),
+            title: ArchivedTitle::authored("Second"),
             path: second_path,
         },
     ];

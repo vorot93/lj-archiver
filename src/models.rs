@@ -51,9 +51,31 @@ pub struct Comment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchivedTitle {
+    Authored(String),
+    RenderedHeading(String),
+}
+
+impl ArchivedTitle {
+    pub fn authored(value: impl Into<String>) -> Self {
+        Self::Authored(value.into())
+    }
+
+    pub fn rendered_heading(value: impl Into<String>) -> Self {
+        Self::RenderedHeading(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Authored(value) | Self::RenderedHeading(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchivedPost {
     pub id: u64,
-    pub title: String,
+    pub title: ArchivedTitle,
     pub path: PathBuf,
 }
 

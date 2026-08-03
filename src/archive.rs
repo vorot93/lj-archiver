@@ -3,7 +3,7 @@ use crate::{
     error::{LjError, Result},
     link_metadata::serialize_link_metadata,
     links::{POST_LINK_PREFIX_ATTRIBUTE, ResolvedLinks},
-    models::ArchivedPost,
+    models::{ArchivedPost, ArchivedTitle},
     storage,
     target::{is_valid_journal_name, journals_alias},
 };
@@ -11,6 +11,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -83,8 +84,8 @@ impl Archive {
         if !index.file_type.is_file() {
             return Err(invalid_archive(&index.path, "index is not a regular file"));
         }
-        let index_contents = read_existing_file(&index.path)?;
-        let journal = index_contents
+        let index_title = read_controlled_title_line(&index.path)?;
+        let journal = index_title
             .lines()
             .next()
             .and_then(|line| line.strip_prefix("= "))
@@ -232,7 +233,10 @@ impl Archive {
         contents.push_str("|===\n|Post ID |Title\n\n");
         for post in posts {
             let path = self.index_path(&post.path);
-            let title = adoc::sanitize_xref_label(&post.title);
+            let title = match &post.title {
+                ArchivedTitle::Authored(title) => adoc::sanitize_authored_xref_label(title),
+                ArchivedTitle::RenderedHeading(title) => adoc::sanitize_rendered_xref_label(title),
+            };
             contents.push_str(&format!(
                 "|{} |xref:{}[{}]\n",
                 post.id,
@@ -355,8 +359,8 @@ fn inspect_posts(posts_entry: &ExistingEntry) -> Result<Vec<ArchivedPost>> {
             .ok_or_else(|| invalid_archive(&entry.path, "post id is not valid UTF-8"))?;
         let id = numeric_post_filename_id(filename)
             .ok_or_else(|| invalid_archive(&entry.path, "post id must be a positive integer"))?;
-        let contents = read_existing_file(&entry.path)?;
-        let title = contents
+        let title_line = read_controlled_title_line(&entry.path)?;
+        let title = title_line
             .lines()
             .next()
             .and_then(|line| line.strip_prefix("= "))
@@ -367,7 +371,7 @@ fn inspect_posts(posts_entry: &ExistingEntry) -> Result<Vec<ArchivedPost>> {
             })?;
         let post = ArchivedPost {
             id,
-            title: title.to_string(),
+            title: ArchivedTitle::rendered_heading(title),
             path: entry.path.clone(),
         };
         if posts_by_id.insert(id, post).is_some() {
@@ -381,9 +385,29 @@ fn inspect_posts(posts_entry: &ExistingEntry) -> Result<Vec<ArchivedPost>> {
     Ok(posts_by_id.into_values().collect())
 }
 
-fn read_existing_file(path: &Path) -> Result<String> {
-    fs::read_to_string(path)
-        .map_err(|source| invalid_archive(path, format!("could not read regular file: {source}")))
+const MAX_CONTROLLED_TITLE_LINE_BYTES: u64 = 65_536;
+
+fn read_controlled_title_line(path: &Path) -> Result<String> {
+    let file = fs::File::open(path).map_err(|source| LjError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut bytes = Vec::new();
+    BufReader::new(file)
+        .take(MAX_CONTROLLED_TITLE_LINE_BYTES + 1)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|source| LjError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > MAX_CONTROLLED_TITLE_LINE_BYTES as usize || !bytes.ends_with(b"\n") {
+        return Err(invalid_archive(
+            path,
+            "controlled title line exceeds 64 KiB or is unterminated",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| invalid_archive(path, "controlled title line is not valid UTF-8"))
 }
 
 fn invalid_archive(path: &Path, reason: impl Into<String>) -> LjError {
@@ -407,7 +431,7 @@ mod tests {
     use super::*;
     use crate::{
         links::{ActiveLink, ActiveLinkContext, ResolvedLinks},
-        models::ArchivedPost,
+        models::{ArchivedPost, ArchivedTitle},
     };
     use sha2::{Digest, Sha256};
     use std::{fs, path::PathBuf};
@@ -797,12 +821,12 @@ mod tests {
             vec![
                 ArchivedPost {
                     id: 3,
-                    title: "Third title".to_string(),
+                    title: ArchivedTitle::rendered_heading("Third title"),
                     path: posts.join("3.adoc"),
                 },
                 ArchivedPost {
                     id: 20,
-                    title: "Twentieth title".to_string(),
+                    title: ArchivedTitle::rendered_heading("Twentieth title"),
                     path: posts.join("20.adoc"),
                 },
             ]
@@ -879,6 +903,59 @@ mod tests {
     }
 
     #[test]
+    fn inspection_marks_heading_source_as_rendered_and_ignores_invalid_body_utf8() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "news");
+        fs::create_dir(root.join("posts")).unwrap();
+        fs::write(root.join("posts/1.adoc"), b"= \\{secret}\n\xffbody").unwrap();
+
+        let existing = Archive::new(&root, "news")
+            .inspect_existing()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            existing.posts[0].title,
+            ArchivedTitle::RenderedHeading(r"\{secret}".to_string())
+        );
+    }
+
+    #[test]
+    fn inspection_rejects_a_title_line_over_sixty_four_kib() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        write_valid_index(&root, "news");
+        fs::create_dir(root.join("posts")).unwrap();
+        let post = root.join("posts/1.adoc");
+        fs::write(&post, format!("= {}\n", "x".repeat(65_536))).unwrap();
+
+        let error = Archive::new(&root, "news").inspect_existing().unwrap_err();
+        assert_invalid_archive(error, &post, "64 KiB");
+    }
+
+    #[test]
+    fn retained_title_provenance_keeps_two_index_generations_identical() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let post_path = archive.write_post(1, "= \\{secret}\n\nBody\n").unwrap();
+        let authored = ArchivedPost {
+            id: 1,
+            title: ArchivedTitle::authored("{secret}"),
+            path: post_path.clone(),
+        };
+        archive.write_index(&[authored]).unwrap();
+        let first_index = fs::read(root.join("index.adoc")).unwrap();
+        let first_post = fs::read(&post_path).unwrap();
+
+        let inspected = archive.inspect_existing().unwrap().unwrap();
+        archive.write_index(&inspected.posts).unwrap();
+
+        assert_eq!(fs::read(root.join("index.adoc")).unwrap(), first_index);
+        assert_eq!(fs::read(post_path).unwrap(), first_post);
+    }
+
+    #[test]
     fn inspection_rejects_posts_path_that_is_not_a_directory() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("archive");
@@ -918,7 +995,7 @@ mod tests {
         archive
             .write_index(&[ArchivedPost {
                 id: 166511,
-                title: "Title".to_string(),
+                title: ArchivedTitle::authored("Title"),
                 path: PathBuf::from("posts/166511.adoc"),
             }])
             .unwrap();
@@ -1012,7 +1089,7 @@ mod tests {
         archive
             .write_index(&[ArchivedPost {
                 id: 166511,
-                title: "A | tricky\n[title]".to_string(),
+                title: ArchivedTitle::authored("A | tricky\n[title]"),
                 path: PathBuf::from("posts/166511.adoc"),
             }])
             .unwrap();
@@ -1032,7 +1109,7 @@ mod tests {
         archive
             .write_index(&[ArchivedPost {
                 id: 1,
-                title: "+++<img src=x onerror=alert(1)>+++".to_string(),
+                title: ArchivedTitle::authored("+++<img src=x onerror=alert(1)>+++"),
                 path: PathBuf::from("posts/1.adoc"),
             }])
             .unwrap();
@@ -1053,7 +1130,7 @@ mod tests {
         archive
             .write_index(&[ArchivedPost {
                 id: 1,
-                title: "image:evil.png[] xref:1.adoc[x] {secret}".to_string(),
+                title: ArchivedTitle::authored("image:evil.png[] xref:1.adoc[x] {secret}"),
                 path: PathBuf::from("posts/1.adoc"),
             }])
             .unwrap();
@@ -1074,7 +1151,7 @@ mod tests {
         archive
             .write_index(&[ArchivedPost {
                 id: 166511,
-                title: "Title".to_string(),
+                title: ArchivedTitle::authored("Title"),
                 path,
             }])
             .unwrap();
@@ -1092,12 +1169,12 @@ mod tests {
             .write_book(&[
                 ArchivedPost {
                     id: 166511,
-                    title: "First".to_string(),
+                    title: ArchivedTitle::authored("First"),
                     path: PathBuf::from("posts/166511.adoc"),
                 },
                 ArchivedPost {
                     id: 166512,
-                    title: "Second".to_string(),
+                    title: ArchivedTitle::authored("Second"),
                     path: PathBuf::from("posts/166512.adoc"),
                 },
             ])
@@ -1130,14 +1207,14 @@ mod tests {
         archive
             .write_index(&[ArchivedPost {
                 id: 166511,
-                title: "First".to_string(),
+                title: ArchivedTitle::authored("First"),
                 path: PathBuf::from("posts/166511.adoc"),
             }])
             .unwrap();
         let path = archive
             .write_index(&[ArchivedPost {
                 id: 166512,
-                title: "Second".to_string(),
+                title: ArchivedTitle::authored("Second"),
                 path: PathBuf::from(r"posts\166512.adoc"),
             }])
             .unwrap();
@@ -1155,14 +1232,14 @@ mod tests {
         archive
             .write_book(&[ArchivedPost {
                 id: 166511,
-                title: "First".to_string(),
+                title: ArchivedTitle::authored("First"),
                 path: PathBuf::from("posts/166511.adoc"),
             }])
             .unwrap();
         let path = archive
             .write_book(&[ArchivedPost {
                 id: 166512,
-                title: "Second".to_string(),
+                title: ArchivedTitle::authored("Second"),
                 path: PathBuf::from(r"posts\166512.adoc"),
             }])
             .unwrap();

@@ -143,13 +143,20 @@ fn escape_title(value: &str) -> String {
     neutralize_plain_adoc_fragment_at_line_start(&encode_authored_backslashes(title.trim()), false)
 }
 
-pub(crate) fn sanitize_xref_label(value: &str) -> String {
-    let normalized = value
+fn normalize_xref_label(value: &str) -> String {
+    value
         .split(|ch: char| matches!(ch, '|' | '[' | ']' | '\n' | '\r') || ch.is_whitespace())
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
-        .join(" ");
-    sanitize_macro_label(&normalized)
+        .join(" ")
+}
+
+pub(crate) fn sanitize_authored_xref_label(value: &str) -> String {
+    sanitize_macro_label(&normalize_xref_label(value))
+}
+
+pub(crate) fn sanitize_rendered_xref_label(value: &str) -> String {
+    sanitize_rendered_macro_label(&normalize_xref_label(value))
 }
 
 fn escape_attribute_value(value: &str) -> String {
@@ -3347,7 +3354,7 @@ mod tests {
 
     #[test]
     fn encodes_authored_backslashes_in_xref_labels_before_the_closing_delimiter() {
-        assert_eq!(sanitize_xref_label(r"First\"), "First&#92;");
+        assert_eq!(sanitize_authored_xref_label(r"First\"), "First&#92;");
     }
 
     #[test]
@@ -3731,40 +3738,57 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let archive = crate::archive::Archive::new(dir.path(), "news");
+        let secret_path = archive.write_post(1, "= \\{secret}\n\nBody\n").unwrap();
+        let first_path = archive.write_post(2, "= First&#92;\n").unwrap();
+        let second_path = archive.write_post(3, "= Second\n").unwrap();
         archive
             .write_index(&[
                 crate::models::ArchivedPost {
                     id: 1,
-                    title: r"First\".to_string(),
-                    path: dir.path().join("posts/1.adoc"),
+                    title: crate::models::ArchivedTitle::authored("{secret}"),
+                    path: secret_path,
                 },
                 crate::models::ArchivedPost {
                     id: 2,
-                    title: "Second".to_string(),
-                    path: dir.path().join("posts/2.adoc"),
+                    title: crate::models::ArchivedTitle::authored(r"First\"),
+                    path: first_path,
+                },
+                crate::models::ArchivedPost {
+                    id: 3,
+                    title: crate::models::ArchivedTitle::authored("Second"),
+                    path: second_path,
                 },
             ])
             .unwrap();
-        let index = fs::read_to_string(dir.path().join("index.adoc")).unwrap();
-        let index_html = convert_with_asciidoctor(&index);
-        let index_document = Html::parse_document(&index_html);
-        let index_hrefs = index_document
-            .select(&Selector::parse("a[href]").unwrap())
-            .filter_map(|anchor| anchor.attr("href"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            index_hrefs,
-            ["posts/1.html", "posts/2.html"],
-            "one index label absorbed the next row: {index_html}"
-        );
-        assert!(
-            index_document
-                .root_element()
-                .text()
-                .collect::<String>()
-                .contains(r"First\"),
-            "authored index backslash was not visible: {index_html}"
-        );
+        let first_index = fs::read_to_string(dir.path().join("index.adoc")).unwrap();
+
+        let inspected = archive.inspect_existing().unwrap().unwrap();
+        archive.write_index(&inspected.posts).unwrap();
+        let second_index = fs::read_to_string(dir.path().join("index.adoc")).unwrap();
+
+        for index in [&first_index, &second_index] {
+            let index_html = convert_with_asciidoctor(index);
+            let index_document = Html::parse_document(&index_html);
+            let index_hrefs = index_document
+                .select(&Selector::parse("a[href]").unwrap())
+                .filter_map(|anchor| anchor.attr("href"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                index_hrefs,
+                ["posts/1.html", "posts/2.html", "posts/3.html"],
+                "one index label absorbed the next row: {index_html}"
+            );
+            let visible = index_document.root_element().text().collect::<String>();
+            assert!(visible.contains("{secret}"), "missing secret: {index_html}");
+            assert!(
+                !visible.contains(r"\{secret}"),
+                "retained index title exposed a protection slash: {index_html}"
+            );
+            assert!(
+                visible.contains(r"First\"),
+                "authored index backslash was not visible: {index_html}"
+            );
+        }
     }
 
     #[test]

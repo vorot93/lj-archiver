@@ -273,6 +273,12 @@ journal updates. Current successes replace/add; resume skips, failed refetches,
 and baseline posts omitted by partial rediscovery retain their trusted entry.
 Current-run archived/skipped/failure counters exclude entries that were merely
 retained. Index and book consume the same sorted final `ArchivedPost` values.
+`ArchivedTitle` preserves whether each title is fresh authored text or an
+already-rendered retained heading, so index regeneration applies the matching
+sanitizer without double-escaping renderer protection. Inspection reads only a
+maximum 64 KiB newline-terminated UTF-8 controlled title line from `index.adoc`
+and each public post; it never decodes an entire retained post body merely to
+recover its title.
 Existing validated positive numeric filename spellings are a public-path
 contract: replacement, repair, manifests/book, ordinary local xrefs, and linked
 image targets retain the actual inspected filename (for example `01.adoc` for
