@@ -420,8 +420,12 @@ fn scan_source(
                     if name == "plaintext" {
                         break;
                     }
-                    cursor = find_opaque_close(source, cursor, &name, source_steps)
-                        .unwrap_or(source.len());
+                    cursor = if name == "script" {
+                        find_script_data_close(source, cursor, source_steps)
+                    } else {
+                        find_opaque_close(source, cursor, &name, source_steps)
+                    }
+                    .unwrap_or(source.len());
                 }
             }
         }
@@ -716,6 +720,97 @@ fn find_opaque_close(
         cursor += 1;
     }
     None
+}
+
+#[derive(Clone, Copy)]
+enum ScriptDataState {
+    Data,
+    Escaped,
+    DoubleEscaped,
+}
+
+fn find_script_data_close(
+    source: &str,
+    content_start: usize,
+    source_steps: &mut Option<&mut usize>,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut cursor = content_start;
+    let mut state = ScriptDataState::Data;
+
+    while cursor < bytes.len() {
+        source_step(source_steps);
+        match state {
+            ScriptDataState::Data => {
+                if is_appropriate_raw_end_tag(bytes, cursor, b"script") {
+                    return Some(cursor);
+                }
+                if starts_with_at(bytes, cursor, b"<!--") {
+                    // Reconsume the two dashes in escaped mode: because the
+                    // tokenizer starts in escaped-dash-dash here, an immediate
+                    // `>` (and any longer dash run ending in `>`) returns to
+                    // ordinary ScriptData.
+                    source_step(source_steps);
+                    cursor += 2;
+                    state = ScriptDataState::Escaped;
+                } else {
+                    cursor += 1;
+                }
+            }
+            ScriptDataState::Escaped => {
+                if is_appropriate_raw_end_tag(bytes, cursor, b"script") {
+                    return Some(cursor);
+                }
+                if is_script_double_escape_start(bytes, cursor) {
+                    source_steps_add(source_steps, b"<script>".len() - 1);
+                    cursor += b"<script>".len();
+                    state = ScriptDataState::DoubleEscaped;
+                } else if starts_with_at(bytes, cursor, b"-->") {
+                    source_steps_add(source_steps, 2);
+                    cursor += 3;
+                    state = ScriptDataState::Data;
+                } else {
+                    cursor += 1;
+                }
+            }
+            ScriptDataState::DoubleEscaped => {
+                if is_appropriate_raw_end_tag(bytes, cursor, b"script") {
+                    source_steps_add(source_steps, b"</script>".len() - 1);
+                    cursor += b"</script>".len();
+                    state = ScriptDataState::Escaped;
+                } else if starts_with_at(bytes, cursor, b"-->") {
+                    source_steps_add(source_steps, 2);
+                    cursor += 3;
+                    state = ScriptDataState::Data;
+                } else {
+                    cursor += 1;
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn is_script_double_escape_start(bytes: &[u8], start: usize) -> bool {
+    let name_end = start + b"<script".len();
+    bytes
+        .get(start..name_end)
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(b"<script"))
+        && bytes
+            .get(name_end)
+            .is_some_and(|byte| is_html_whitespace(*byte) || matches!(byte, b'/' | b'>'))
+}
+
+fn is_appropriate_raw_end_tag(bytes: &[u8], start: usize, name: &[u8]) -> bool {
+    let name_end = start + 2 + name.len();
+    bytes.get(start..start + 2) == Some(b"</")
+        && bytes
+            .get(start + 2..name_end)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+        && bytes
+            .get(name_end)
+            .is_some_and(|byte| is_html_whitespace(*byte) || matches!(byte, b'/' | b'>'))
 }
 
 fn find_comment_end(
@@ -1019,6 +1114,15 @@ mod tests {
             images[0].attribute("src").unwrap().decoded_value(),
             "/real.jpg"
         );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn double_escaped_script_data_uses_the_real_closing_tag_span() {
+        let input = "<script><!--<script></script>--></script>";
+        let scanned = scan(input).unwrap();
+
+        assert_eq!(scanned.element_spans("script"), &[0..input.len()]);
     }
 
     #[test]
