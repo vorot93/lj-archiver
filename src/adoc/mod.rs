@@ -2101,6 +2101,27 @@ mod tests {
     }
 
     #[test]
+    fn sanitizes_leading_colon_in_image_macro_targets() {
+        // A leading `:` in the target composes a spurious colon run once
+        // spliced into the macro invocation: `image:` + `:evil.jpg` reads as
+        // the block-macro prefix `image::` (turning an inline linked image
+        // into a block, violating the "never a block macro inside link
+        // brackets" invariant), and `image::` + `:evil.jpg` reads as the
+        // malformed `image:::`. Predates this task; surfaced by the Task 1
+        // review (round 2).
+        assert_eq!(
+            html_to_adoc(
+                r#"<p><a href="https://example.test/"><img src=":evil.jpg" alt="x"></a></p>"#
+            ),
+            "image:%3Aevil.jpg[x,link=https://example.test/]\n\n"
+        );
+        assert_eq!(
+            html_to_adoc(r#"<p><img src=":evil.jpg" alt="x"></p>"#),
+            "image::%3Aevil.jpg[x]\n\n"
+        );
+    }
+
+    #[test]
     fn neutralizes_plain_text_that_looks_like_include_macro() {
         let adoc = html_to_adoc("<p>include::secret[]</p>");
 
@@ -3799,6 +3820,39 @@ mod tests {
                 .next()
                 .is_none(),
             "unexpected list in: {html}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn colon_leading_linked_image_target_converts_inline_not_as_a_block() {
+        let converted = convert_with_asciidoctor(&html_to_adoc(
+            r#"<p><a href="https://example.test/"><img src=":evil.jpg" alt="x"></a></p>"#,
+        ));
+        let document = Html::parse_document(&converted);
+
+        assert!(
+            document
+                .select(&Selector::parse("div.imageblock").unwrap())
+                .next()
+                .is_none(),
+            "leading colon turned an inline linked image into a block macro: {converted}"
+        );
+        let paragraph = document
+            .select(&Selector::parse("p").unwrap())
+            .next()
+            .expect("linked image stays inside a paragraph");
+        let anchor = paragraph
+            .select(&Selector::parse("a").unwrap())
+            .next()
+            .expect("linked image keeps its anchor");
+        assert_eq!(anchor.attr("href"), Some("https://example.test/"));
+        assert!(
+            anchor
+                .select(&Selector::parse("img").unwrap())
+                .next()
+                .is_some(),
+            "anchor should wrap the image: {converted}"
         );
     }
 

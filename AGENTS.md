@@ -212,6 +212,16 @@ an anchor whose sanitized target begins with `.` (`../other/page.html[x]`,
 as a block title that swallows the *following* block. Both behaviors are pinned
 by tests — widening the exemption to a blank-line check reopens the second one.
 
+`sanitize_macro_target` (`src/adoc/escape.rs`) is the shared function that makes
+any href/src safe to splice into a macro-target position (image link, xref,
+linked image). It percent-encodes a *leading* `:` to `%3A`: a target beginning
+with a colon otherwise composes a spurious colon run once spliced — a linked
+image's single-colon `image:` prefix plus a `:foo` target reads as the
+block-macro prefix `image::` (reopening the "never a block macro inside link
+brackets" invariant above), and a bare image's `image::` prefix plus the same
+target reads as the malformed `image:::`. Only the leading colon is encoded;
+every other colon in the target (a URL scheme, a port, …) stays untouched.
+
 Attribute-reference neutralization includes Asciidoctor's state-changing
 `{set:...}`, `{counter:...}`, and `{counter2:...}` forms, not only simple
 `{name}` references. Authored commas in image labels are numeric-reference

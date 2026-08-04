@@ -765,9 +765,26 @@ pub(crate) fn sanitize_macro_target(text: &str) -> String {
 
     neutralize_macro_target_inline_passthrough_prefix(
         &neutralize_macro_target_inline_passthrough_delimiters(
-            &neutralize_macro_target_block_macro_prefix(&output),
+            &neutralize_macro_target_block_macro_prefix(&neutralize_macro_target_leading_colon(
+                &output,
+            )),
         ),
     )
+}
+
+/// A target beginning with `:` composes a spurious colon run once spliced
+/// into a macro invocation: an inline image's single-colon `image:` prefix
+/// plus a `:foo` target reads as the block-macro prefix `image::`, and a
+/// bare image's `image::` prefix plus the same target reads as the malformed
+/// `image:::`. Percent-encoding only the leading colon breaks that
+/// composition while every other colon in the target — a URL scheme, a port,
+/// or anything past position zero — stays untouched, so ordinary absolute
+/// targets are unaffected.
+fn neutralize_macro_target_leading_colon(text: &str) -> String {
+    match text.strip_prefix(':') {
+        Some(rest) => format!("%3A{rest}"),
+        None => text.to_string(),
+    }
 }
 
 fn neutralize_macro_target_block_macro_prefix(text: &str) -> String {
