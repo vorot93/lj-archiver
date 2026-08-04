@@ -59,15 +59,72 @@ struct SiteEntry {
     eventtime: Option<i64>,
 }
 
+/// The `<script>` `type` attribute values (case-insensitive, after trimming
+/// ASCII whitespace) that the HTML classic-script-or-module determination
+/// treats as JavaScript: the JavaScript MIME type essence matches from the
+/// WHATWG MIME Sniffing Standard, plus `module`. An absent or empty `type`
+/// attribute is classic script too but is handled separately, since it is not
+/// a member of this list. Anything else — `application/json`, `importmap`,
+/// `text/template`, ... — is a data block a browser never executes.
+const JAVASCRIPT_SCRIPT_TYPES: &[&str] = &[
+    "text/javascript",
+    "application/javascript",
+    "application/ecmascript",
+    "application/x-ecmascript",
+    "application/x-javascript",
+    "text/ecmascript",
+    "text/javascript1.0",
+    "text/javascript1.1",
+    "text/javascript1.2",
+    "text/javascript1.3",
+    "text/javascript1.4",
+    "text/javascript1.5",
+    "text/jscript",
+    "text/livescript",
+    "text/x-ecmascript",
+    "text/x-javascript",
+    "module",
+];
+
+/// Whether a browser would run `script` as JavaScript: its `type` attribute is
+/// absent, empty, or one of [`JAVASCRIPT_SCRIPT_TYPES`] (ASCII case-insensitive,
+/// trimmed), and it is not nested inside a `<template>` element. A `<template>`'s
+/// content is an inert `DocumentFragment` that is never inserted into the
+/// rendered document, so scripts in it never run even though `scraper`'s
+/// `select` walks into them like any other descendant.
+fn is_executable_script(script: ElementRef<'_>) -> bool {
+    let script_type = script.attr("type").map(str::trim).unwrap_or("");
+    let is_javascript = script_type.is_empty()
+        || JAVASCRIPT_SCRIPT_TYPES
+            .iter()
+            .any(|candidate| script_type.eq_ignore_ascii_case(candidate));
+
+    is_javascript && !is_inside_template(script)
+}
+
+fn is_inside_template(script: ElementRef<'_>) -> bool {
+    script.ancestors().any(|ancestor| {
+        ancestor
+            .value()
+            .as_element()
+            .is_some_and(|element| element.name() == "template")
+    })
+}
+
 /// Extracts the server-rendered `Site.entry = {…}` JSON object from a post page.
 ///
-/// Candidate positions come from a focused JavaScript lexical scanner, so only
-/// an assignment in genuinely executable code qualifies; the object itself is
-/// still deserialized by `serde_json` and still trusted only when its `ditemid`
-/// equals the resolved post id. A malformed or wrong-id candidate does not stop
-/// the scan, so a later valid assignment is still found.
+/// Candidate scripts are narrowed to ones a browser would actually execute
+/// (see [`is_executable_script`]); within those, candidate positions come from
+/// a focused JavaScript lexical scanner, so only an assignment in genuinely
+/// executable code qualifies. The object itself is still deserialized by
+/// `serde_json` and still trusted only when its `ditemid` equals the resolved
+/// post id. A malformed or wrong-id candidate does not stop the scan, so a
+/// later valid assignment is still found.
 fn site_entry(document: &Html, expected_id: u64) -> Option<SiteEntry> {
-    for script in document.select(&SCRIPT) {
+    for script in document
+        .select(&SCRIPT)
+        .filter(|script| is_executable_script(*script))
+    {
         let text = script.text().collect::<String>();
 
         for object_start in crate::js_scan::site_entry_object_starts(&text) {
@@ -998,5 +1055,96 @@ Site.entry = {"ditemid":7,"poster":"real"};"#,
         ] {
             assert_eq!(parsed_poster(script), Some("real".to_string()), "{script}");
         }
+    }
+
+    fn page_with_raw_script_markup(script_markup: &str) -> String {
+        format!(
+            concat!(
+                r#"<html><body><article data-journal="news" data-itemid="7">"#,
+                r#"<div class="entry-content">body</div>"#,
+                r#"</article>{}</body></html>"#,
+            ),
+            script_markup
+        )
+    }
+
+    fn parsed_poster_from_markup(script_markup: &str) -> Option<String> {
+        let url = Url::parse("https://news.livejournal.com/7.html").unwrap();
+        parse_post_page(&page_with_raw_script_markup(script_markup), &url)
+            .unwrap()
+            .poster
+    }
+
+    const EVIL_ENTRY: &str = r#"Site.entry = {"ditemid":7,"poster":"evil"};"#;
+    const REAL_ENTRY: &str = r#"Site.entry = {"ditemid":7,"poster":"real"};"#;
+
+    #[test]
+    fn ignores_scripts_a_browser_would_never_execute_as_javascript() {
+        for markup in [
+            // A non-JavaScript MIME type: the browser treats this as an inert
+            // data block and never runs it.
+            format!(r#"<script type="application/json">{EVIL_ENTRY}</script>"#),
+            // Not a JavaScript MIME type either, despite the "script"-ish name.
+            format!(r#"<script type="text/template">{EVIL_ENTRY}</script>"#),
+            // An import map is parsed as JSON configuration, not executed.
+            format!(r#"<script type="importmap">{EVIL_ENTRY}</script>"#),
+            // Case/whitespace variants of a non-JavaScript type still reject.
+            format!(r#"<script type=" APPLICATION/JSON ">{EVIL_ENTRY}</script>"#),
+            // `<template>` content is an inert DocumentFragment, never part of
+            // the rendered document, so a script inside one never runs -- even
+            // though scraper's `select` walks into it like any other element.
+            format!(r#"<template><script>{EVIL_ENTRY}</script></template>"#),
+            // Nested templates: still inert at any depth.
+            format!(
+                r#"<template><div><template><script>{EVIL_ENTRY}</script></template></div></template>"#
+            ),
+        ] {
+            assert_eq!(parsed_poster_from_markup(&markup), None, "{markup}");
+        }
+    }
+
+    #[test]
+    fn accepts_scripts_a_browser_would_execute_as_javascript() {
+        for markup in [
+            // No `type` attribute: the classic-script default.
+            format!(r#"<script>{REAL_ENTRY}</script>"#),
+            // Empty `type`: also the classic-script default.
+            format!(r#"<script type="">{REAL_ENTRY}</script>"#),
+            // A JavaScript MIME type, whitespace- and case-varied.
+            format!(r#"<script type=" TEXT/JAVASCRIPT ">{REAL_ENTRY}</script>"#),
+            format!(r#"<script type="application/ecmascript">{REAL_ENTRY}</script>"#),
+            // `module` scripts execute too (deferred, strict mode, but a plain
+            // property assignment like `Site.entry = {{...}}` behaves the same).
+            format!(r#"<script type="module">{REAL_ENTRY}</script>"#),
+            format!(r#"<script type="MODULE">{REAL_ENTRY}</script>"#),
+        ] {
+            assert_eq!(
+                parsed_poster_from_markup(&markup),
+                Some("real".to_string()),
+                "{markup}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_script_element_survives_inside_rendered_post_content() {
+        // A plain classic script positioned inside the post body still
+        // executes in a real browser exactly as one in page chrome would --
+        // DOM position doesn't gate script execution, only `type` and
+        // `<template>`/`<noscript>` nesting do. This is not a residual gap in
+        // the type/template fix above: excluding scripts by *where* they sit
+        // in the document would be a different, broader restriction than "is
+        // this browser-executable JavaScript", and isn't what was asked for.
+        let markup = format!(r#"<div class="entry-content"><script>{EVIL_ENTRY}</script></div>"#);
+        assert_eq!(parsed_poster_from_markup(&markup), Some("evil".to_string()));
+    }
+
+    #[test]
+    fn noscript_wrapped_script_is_still_ignored() {
+        // Pre-existing, unaffected by this fix: with scripting considered
+        // enabled (the default HTML parsing mode used here), `<noscript>`
+        // content is raw text, not a parsed `<script>` element.
+        let markup = format!(r#"<noscript><script>{EVIL_ENTRY}</script></noscript>"#);
+        assert_eq!(parsed_poster_from_markup(&markup), None);
     }
 }
