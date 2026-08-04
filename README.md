@@ -128,6 +128,12 @@ To run the GUI from source: `cargo run -p lj-archiver-gui`.
 | `@166511` with `--journal news` | Archive one post when the journal is provided separately |
 | `https://news.livejournal.com/166511.html` | Archive one post by URL |
 
+LiveJournal targets are always fetched over HTTPS. A bare journal name, a
+`*.livejournal.com` hostname, and the `journal/id` and `@id` shorthands all
+generate `https://` URLs, and an explicit `http://` LiveJournal URL is rejected
+rather than silently upgraded, so a copied plaintext link can never send a
+request in the clear.
+
 Journal names that differ only by underscores and hyphens refer to the same
 public journal.
 

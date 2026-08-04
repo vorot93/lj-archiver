@@ -139,6 +139,14 @@ fn parse_url_target(input: &str) -> Result<ArchiveTarget> {
     }
     let host = crate::net::normalized_domain_host(&url).map(str::to_owned);
 
+    // Fail closed on plaintext production traffic. Bare-name, bare-host, and
+    // shorthand targets are generated as HTTPS, so only an explicit `http://`
+    // URL can reach here; the loopback test-server seam below is unaffected
+    // because its host is never a LiveJournal production form.
+    if url.scheme() == "http" && host.as_deref().is_some_and(is_production_livejournal_host) {
+        return invalid(input, "LiveJournal targets must use https://");
+    }
+
     if host
         .as_deref()
         .is_some_and(|host| host.eq_ignore_ascii_case("users.livejournal.com"))
@@ -273,6 +281,14 @@ fn is_livejournal_host(input: &str) -> bool {
         .ends_with(".livejournal.com")
 }
 
+/// Either LiveJournal production host form: the apex `livejournal.com` and every
+/// subdomain of it. `host` must already be the DNS-normalized host (no trailing
+/// root-label dot) from `net::normalized_domain_host`.
+fn is_production_livejournal_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("livejournal.com")
+        || host.to_ascii_lowercase().ends_with(".livejournal.com")
+}
+
 fn invalid<T>(input: &str, reason: &str) -> Result<T> {
     Err(LjError::InvalidTarget {
         input: input.to_string(),
@@ -283,6 +299,74 @@ fn invalid<T>(input: &str, reason: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_plaintext_production_livejournal_targets() {
+        for input in [
+            "http://news.livejournal.com/166511.html",
+            "http://news.livejournal.com./166511.html",
+            "http://news.livejournal.com:80/166511.html",
+            "http://news.livejournal.com:8080/166511.html",
+            "http://users.livejournal.com/example_user/166511.html",
+            "http://users.livejournal.com./example_user/166511.html",
+            "http://livejournal.com/166511.html",
+            "http://news.livejournal.com/",
+            "http://users.livejournal.com/example_user/",
+        ] {
+            let error = parse_target(input, None).unwrap_err().to_string();
+            assert!(error.contains("https"), "{input}: {error}");
+        }
+    }
+
+    #[test]
+    fn keeps_generated_and_explicit_https_production_targets() {
+        assert_eq!(
+            parse_target("news", None).unwrap(),
+            ArchiveTarget::Journal {
+                journal: "news".to_string()
+            }
+        );
+        assert_post(
+            parse_target("news/166511", None).unwrap(),
+            "news",
+            166511,
+            "https://news.livejournal.com/166511.html",
+        );
+        assert_post(
+            parse_target("news.livejournal.com/166511.html", None).unwrap(),
+            "news",
+            166511,
+            "https://news.livejournal.com/166511.html",
+        );
+        assert_post(
+            parse_target("@166511", Some("example_user")).unwrap(),
+            "example_user",
+            166511,
+            "https://users.livejournal.com/example_user/166511.html",
+        );
+        assert_post(
+            parse_target("https://news.livejournal.com:443/166511.html", None).unwrap(),
+            "news",
+            166511,
+            "https://news.livejournal.com/166511.html",
+        );
+    }
+
+    #[test]
+    fn keeps_plaintext_loopback_test_server_targets() {
+        assert_post(
+            parse_target("http://127.0.0.1:37185/news/166511.html", None).unwrap(),
+            "news",
+            166511,
+            "http://127.0.0.1:37185/news/166511.html",
+        );
+        assert_post(
+            parse_target("http://localhost:37185/news/166511.html", None).unwrap(),
+            "news",
+            166511,
+            "http://localhost:37185/news/166511.html",
+        );
+    }
 
     #[test]
     fn journal_aliases_fold_case_and_hyphen_underscore() {
