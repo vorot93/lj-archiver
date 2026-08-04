@@ -155,6 +155,13 @@ pub(crate) fn site_entry_object_starts(script: &str) -> Vec<usize> {
                 b'`' => {
                     templates = templates.saturating_sub(1);
                     state = Lexical::Code;
+                    // The template just closed is a complete value, exactly
+                    // like a closing string or regex literal, so `/` right
+                    // after divides. Without this, an interpolation's `}`
+                    // (which sets this true, since `}` could also end a
+                    // block) would otherwise leak past the template's own
+                    // close.
+                    regex_allowed = false;
                     cursor += 1;
                 }
                 b'$' if bytes.get(cursor + 1) == Some(&b'{') => {
@@ -208,24 +215,44 @@ fn decode(script: &str, cursor: usize) -> char {
         .expect("cursor stays on a character boundary")
 }
 
-/// Whether a `/` immediately after `character` starts a regex literal. Values
-/// and closing brackets end an expression, so a following `/` divides;
-/// everything else (operators and punctuators) is a regex position.
+/// Whether a `/` immediately after `character` starts a regex literal. A
+/// value, or a `)`/`]` that closes a call, grouping, or index expression,
+/// ends an expression, so a following `/` divides; everything else
+/// (operators, punctuators, and keywords) is a regex position.
 ///
-/// This is a character-class heuristic, not a real tokenizer, so it has two
-/// known, narrow blind spots. It cannot tell a keyword like `return`,
-/// `typeof`, `case`, `new`, `delete`, or `throw` (after which `/` always opens
-/// a regex) from a plain identifier (after which `/` divides) — both end in
-/// an alphanumeric byte, so a keyword-followed regex is misread as code,
-/// risking a false accept if that regex body happens to contain literal
-/// `Site.entry = {` text. Conversely it cannot tell a postfix `++`/`--` (which
-/// ends a value, so `/` divides) from an operator expecting an operand (after
-/// which `/` opens a regex) — both end in a non-alphanumeric, non-`)`/`]`
-/// byte — so a division there is misread as a regex, risking a false reject
-/// if it swallows a real assignment before the next `/` or line end. Neither
-/// is reachable on real LiveJournal pages: `Site.entry` is always its own
-/// top-level statement, never preceded on the same line by a keyword-fronted
-/// regex or a postfix operator.
+/// This is a character-class heuristic, not a real tokenizer: it classifies a
+/// byte, not the token or construct it belongs to, so it has two known,
+/// narrow blind spots.
+///
+/// False accept — a regex literal is misread as code, so its contents
+/// (which never execute) could contain false `Site.entry = {` text:
+/// - After a keyword that ends in an alphanumeric byte but expects an operand
+///   next (`return`, `typeof`, `case`, `new`, `delete`, `throw`, `else`,
+///   `do`, `in`, `of`, `instanceof`, `yield`, ...), this heuristic treats it
+///   like a plain identifier — a value — so `/` divides instead of opening a
+///   regex.
+/// - After the `)` that closes an `if`/`while`/`for` header, a regex is
+///   valid (a fresh statement follows), but this heuristic treats every
+///   closing `)` alike, as if it closed a call or grouping, where `/` really
+///   does divide (`f(1) / 2`). `if (a) /Site.entry = {"ditemid":N,"poster":
+///   "evil"}/.test(s);` reports a candidate as a result.
+///
+/// False reject — code is misread as a regex, which can swallow a real
+/// assignment up to the next `/` or line end:
+/// - After a postfix `++`/`--`, which ends a value so `/` should divide, this
+///   heuristic sees the same trailing non-alphanumeric, non-`)`/`]` byte as
+///   an operator awaiting an operand, and opens a regex instead.
+///
+/// Neither is a viable attack on this tool. The only thing an attacker
+/// actually controls on an archived page is *data* — a post's title, body,
+/// or similar — and data only ever reaches a script as the contents of a
+/// string or template literal, which this lexer handles correctly (fuzz
+/// tested extensively: there is no route from inside a quoted literal back
+/// out to bare code). Triggering either blind spot above needs raw, unquoted
+/// source with a regex or postfix operator in just the wrong place, which is
+/// a strictly more powerful capability than directly writing `Site.entry =
+/// {...}` as real code — so it adds no exposure beyond what arbitrary script
+/// injection already grants.
 fn regex_allowed_after(character: char, previous: bool) -> bool {
     match character {
         character if character.is_whitespace() => previous,
@@ -274,20 +301,16 @@ fn site_entry_assignment_at(script: &str, cursor: usize) -> Option<usize> {
     }
 
     position = skip_whitespace(bytes, position);
+    // Must be exactly `=` here. This also rejects every compound-assignment
+    // and comparison operator (`!=`, `<=`, `>=`, `+=`, `-=`, `*=`, `/=`,
+    // `%=`, `&=`, `|=`, `^=`, ...): each has its own operator byte at this
+    // exact position instead of `=`, so none of them ever reach this check
+    // as a bare `=` at all.
     if bytes.get(position) != Some(&b'=') {
         return None;
     }
-    // `==`, `===`, and `=>` are not assignments; `!=`, `>=`, `+=`, … are not
-    // plain assignments either.
+    // `==`, `===`, and `=>` are not assignments.
     if matches!(bytes.get(position + 1), Some(b'=' | b'>')) {
-        return None;
-    }
-    if position > 0
-        && matches!(
-            bytes[position - 1],
-            b'!' | b'<' | b'>' | b'=' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^'
-        )
-    {
         return None;
     }
 
@@ -302,12 +325,15 @@ fn skip_whitespace(bytes: &[u8], mut position: usize) -> usize {
     position
 }
 
-/// ASCII-only by design: real JS identifiers may also continue with Unicode
-/// letters, so `caféSite.entry` would not be recognized as one longer
-/// identifier and `Site` would wrongly be read as a fresh anchor. LiveJournal
-/// serves ASCII identifiers, and recognizing Unicode identifier continuations
-/// correctly would need Unicode identifier tables, pushing this from a
-/// focused lexer toward a general one.
+/// ASCII-only by design: this looks back exactly one *byte*, so a real JS
+/// identifier that continues with a Unicode letter (e.g. `caféSite.entry`) is
+/// not recognized as one longer identifier, and `Site` is wrongly read as a
+/// fresh anchor. This isn't for lack of a Unicode-aware primitive —
+/// `char::is_alphanumeric` (used in `regex_allowed_after` above) already
+/// classifies a *character* correctly; what a one-byte lookback lacks is
+/// knowing where the *previous character* starts, since UTF-8 is
+/// variable-width and this cursor only ever looks forward. LiveJournal serves
+/// ASCII identifiers, so this gap is not reachable in practice.
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
 }
@@ -346,8 +372,30 @@ mod tests {
     fn distinguishes_division_from_a_regex_literal() {
         assert_eq!(starts(r#"var q = a / b; Site.entry = {};"#).len(), 1);
         assert_eq!(starts(r#"var r = /a/g; Site.entry = {};"#).len(), 1);
-        // The `/` after `)` divides, so the following `Site.entry` is code.
+        // A call's closing `)` ends a value, so `/` divides here — unlike
+        // the `)` that closes an `if`/`while`/`for` header, which this
+        // heuristic cannot distinguish (see the blind spots documented on
+        // `regex_allowed_after`).
         assert_eq!(starts(r#"f(1) / 2; Site.entry = {};"#).len(), 1);
+    }
+
+    #[test]
+    fn documents_known_regex_heuristic_false_accept_fronts() {
+        // Pins today's behavior for the two false-accept blind spots
+        // documented on `regex_allowed_after`, so a future change to that
+        // heuristic can't silently swap which class of false positive exists
+        // without a test noticing. Neither is reachable by an attacker (see
+        // that doc comment); both are accepted here, not rejected.
+        for script in [
+            // Keyword-fronted: `return` is misread as a value, so `/` is
+            // read as division and the regex body as code.
+            r#"function f(){ return /Site.entry = {"a":1}/; }"#,
+            // Bracket-fronted: the `)` closing an `if` header is misread the
+            // same way a call's closing `)` would be.
+            r#"if (a) /Site.entry = {"a":1}/.test(s);"#,
+        ] {
+            assert_eq!(starts(script).len(), 1, "{script}");
+        }
     }
 
     #[test]
@@ -388,6 +436,18 @@ mod tests {
         );
         assert_eq!(starts(&ok).len(), 1);
 
+        // The boundary is exact, not just "somewhere at or beyond 256": one
+        // repetition more than the 128 that just succeeded already fails
+        // closed, since each `` `${ `` repetition costs 2 units of nesting
+        // (one template, one interpolation) and 128 * 2 = 256 == the limit.
+        let first_to_fail = inside + 1;
+        let just_over = format!(
+            "{}Site.entry = {{}}{}",
+            "`${".repeat(first_to_fail),
+            "}`".repeat(first_to_fail)
+        );
+        assert!(starts(&just_over).is_empty());
+
         let too_deep = MAX_LEXICAL_NESTING + 1;
         let over = format!(
             "{}Site.entry = {{}}{}",
@@ -395,6 +455,18 @@ mod tests {
             "}`".repeat(too_deep)
         );
         assert!(starts(&over).is_empty());
+    }
+
+    #[test]
+    fn resets_regex_allowed_when_a_closed_template_contained_an_interpolation() {
+        // A template literal, once closed, is a complete value, so `/` right
+        // after should divide — matching how closing a string or regex
+        // literal already resets regex_allowed to false. The interpolation's
+        // `}` sets regex_allowed to true (a `}` could also end a block), and
+        // without also resetting on the closing backtick, that leaks through:
+        // the `/` here would be wrongly read as opening a regex, swallowing
+        // the rest of the line and hiding the real Site.entry after it.
+        assert_eq!(starts("`x${1}y` / 2; Site.entry = {};").len(), 1);
     }
 
     #[test]
