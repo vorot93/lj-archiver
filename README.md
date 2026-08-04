@@ -276,10 +276,13 @@ a different journal, or malformed public post files cause the run to fail
 before networking or writes. A missing or truly empty directory can start a new
 archive.
 
-Before writing a fetched post, `lj-archiver` requires its parsed post ID to
-match the requested ID. Any recognizable post ID and journal in the delivered
-final URL must agree as well, preventing a redirect or returned page from being
-archived under the wrong identity.
+Every archived post must prove it is the post that was asked for. After fetching
+and parsing, the final URL must identify the same LiveJournal journal (allowing
+LiveJournal's `-`/`_` spellings of one name), any post ID the final URL carries
+must match, the page's own post ID must match, and the page's canonical journal
+must match. A page that fails any of these is reported as a parse failure and
+nothing is written for it — a redirect to somewhere else cannot put foreign
+content in your archive just by looking like a LiveJournal page.
 
 Validated existing posts seed an additive archive set for both single-post and
 full-journal updates. A successful current fetch replaces or adds its post;

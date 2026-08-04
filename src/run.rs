@@ -786,20 +786,34 @@ async fn fetch_requested_post(
     Ok(post)
 }
 
+/// Every archived post must prove it is the post that was requested.
+///
+/// A production destination earns no exception for returning parseable
+/// LiveJournal-shaped markup: the final URL must itself identify a LiveJournal
+/// journal aliasing the request. A same-journal landing URL may omit the post
+/// ID, because the parsed page identity still supplies it, but a *recognizable*
+/// final ID must match. The loopback test seam may omit final journal identity
+/// (its host is never a LiveJournal form), yet a recognizable final numeric ID
+/// must still match and the parsed journal must still alias the request.
 fn validate_requested_post_identity(
     requested_journal: &str,
     requested_id: u64,
     post: &Post,
 ) -> Result<()> {
     let final_identity = final_post_identity(&post.url);
-    let final_matches = final_identity.id.is_none_or(|id| id == requested_id)
-        && final_identity
+    let final_journal_matches = if crate::net::is_loopback_test_server(&post.url) {
+        true
+    } else {
+        final_identity
             .journal
             .as_deref()
-            .is_none_or(|journal| journals_alias(journal, requested_journal));
-    let returned_matches = post.id == requested_id;
+            .is_some_and(|journal| journals_alias(journal, requested_journal))
+    };
+    let final_id_matches = final_identity.id.is_none_or(|id| id == requested_id);
+    let returned_id_matches = post.id == requested_id;
+    let parsed_journal_matches = journals_alias(&post.journal, requested_journal);
 
-    if final_matches && returned_matches {
+    if final_journal_matches && final_id_matches && returned_id_matches && parsed_journal_matches {
         return Ok(());
     }
 
@@ -1833,7 +1847,7 @@ mod tests {
             "https://evo-lutio.livejournal.com./240331.html",
             "https://users.livejournal.com./evo_lutio/240331.html",
         ] {
-            let post = parsed_post(url, "canonical_metadata", 240331);
+            let post = parsed_post(url, "evo_lutio", 240331);
 
             validate_requested_post_identity("evo_lutio", 240331, &post).unwrap();
         }
@@ -1843,11 +1857,74 @@ mod tests {
     fn final_users_livejournal_journal_alias_is_accepted_on_non_post_path() {
         let post = parsed_post(
             "https://users.livejournal.com/evo-lutio/landing?source=redirect",
-            "canonical_metadata",
+            "evo_lutio",
             240331,
         );
 
         validate_requested_post_identity("evo_lutio", 240331, &post).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_final_destination_that_is_not_the_requested_livejournal_journal() {
+        for (final_url, parsed_journal) in [
+            ("https://evil.example/166511.html", "news"),
+            ("https://evil.example/166511.html", "evil"),
+            ("https://other.livejournal.com/166511.html", "news"),
+            ("https://www.livejournal.com/166511.html", "news"),
+            ("https://news.livejournal.com/166511.html", "other"),
+        ] {
+            let post = parsed_post(final_url, parsed_journal, 166511);
+            let error = validate_requested_post_identity("news", 166511, &post)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("post identity mismatch"),
+                "{final_url} / {parsed_journal}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_aliasing_final_and_parsed_journals() {
+        for (final_url, parsed_journal, requested) in [
+            ("https://news.livejournal.com/166511.html", "news", "news"),
+            // Same-journal landing URL with no post ID: the parsed page supplies it.
+            ("https://news.livejournal.com/", "news", "news"),
+            (
+                "https://evo-lutio.livejournal.com/166511.html",
+                "evo_lutio",
+                "evo_lutio",
+            ),
+            (
+                "https://users.livejournal.com/evo_lutio/166511.html",
+                "evo_lutio",
+                "evo-lutio",
+            ),
+        ] {
+            let post = parsed_post(final_url, parsed_journal, 166511);
+            assert!(
+                validate_requested_post_identity(requested, 166511, &post).is_ok(),
+                "{final_url} / {parsed_journal} / {requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_may_omit_final_journal_identity_but_not_parsed_journal_identity() {
+        let ok = parsed_post("http://127.0.0.1:37185/news/166511.html", "news", 166511);
+        assert!(validate_requested_post_identity("news", 166511, &ok).is_ok());
+
+        let wrong_journal = parsed_post("http://127.0.0.1:37185/news/166511.html", "other", 166511);
+        assert!(validate_requested_post_identity("news", 166511, &wrong_journal).is_err());
+
+        let wrong_final_id = parsed_post("http://127.0.0.1:37185/news/999.html", "news", 166511);
+        assert!(validate_requested_post_identity("news", 166511, &wrong_final_id).is_err());
+    }
+
+    #[test]
+    fn rejects_a_returned_id_that_is_not_the_requested_id() {
+        let post = parsed_post("https://news.livejournal.com/166511.html", "news", 999);
+        assert!(validate_requested_post_identity("news", 166511, &post).is_err());
     }
 
     #[tokio::test]

@@ -125,7 +125,7 @@ fn cli_reports_invalid_bare_id() {
 async fn cli_archives_correct_output_for_images_mentions_and_author() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/news/166511.html"))
+        .and(path("/canonical-lj/166511.html"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(include_str!("fixtures/post_output_correctness.html")),
@@ -140,13 +140,18 @@ async fn cli_archives_correct_output_for_images_mentions_and_author() {
         .arg("--output-dir")
         .arg(dir.path().join("out"))
         .arg("--no-media")
-        .arg(format!("{}/news/166511.html", server.uri()))
+        .arg(format!("{}/canonical-lj/166511.html", server.uri()))
         .assert()
         .success();
 
     let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
 
-    // Fix 3: author is the canonical Site.entry.journal, not the request path "news".
+    // Fix 3: author is the canonical Site.entry.journal, not the request path.
+    // The request spells the journal `canonical-lj` and Site.entry spells it
+    // `canonical_lj`; LiveJournal serves an underscore username at the hyphen
+    // subdomain, so the two alias, which is what lets delivered-post identity
+    // validation accept the page while `:lj-author:` still records the
+    // canonical spelling.
     assert!(post.contains(":lj-author: canonical_lj"), "author: {post}");
     // Fix 1b: user mention is the clean linked username; userhead glyph dropped.
     assert!(
@@ -171,6 +176,38 @@ async fn cli_archives_correct_output_for_images_mentions_and_author() {
     assert!(post.contains("Trailing text."), "body text: {post}");
     assert!(!post.contains("Trailing text. +"), "dangling +: {post}");
     assert!(!post.contains("+\n+"), "double hard break: {post}");
+}
+
+#[tokio::test]
+async fn cli_writes_nothing_when_the_delivered_post_identity_does_not_match() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+            r#"<html><body><article data-journal="other" data-itemid="166511">"#,
+            r#"<div class="entry-content">body</div>"#,
+            r#"</article></body></html>"#,
+        )))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("out");
+    let mut cmd = Command::cargo_bin("lj-archiver").unwrap();
+    cmd.arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(&out)
+        .arg("--no-media")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("post identity mismatch"));
+
+    assert!(
+        !out.join("posts/166511.adoc").exists(),
+        "a mismatched post must not be published"
+    );
 }
 
 #[tokio::test]

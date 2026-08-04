@@ -585,6 +585,21 @@ Do not weaken redirect validation or address blocking in `src/media.rs`.
 
 Media fetching must continue to reject non-HTTP(S) URLs, URLs without hosts, literal `localhost` hosts, and every IP literal that is not public-routable unicast. The literal policy follows the current IANA-style standard-library classifications: it rejects unspecified, loopback, private, link-local, shared/CGNAT, special-use, documentation, benchmarking, multicast, reserved, broadcast, IPv6 unique-local, IPv6 site-local, discard-only, local-use translation, IETF protocol-assignment, and SRv6 ranges, plus IPv6-embedded IPv4 forms (IPv4-mapped, NAT64, 6to4, and IPv4-compatible) whose decoded IPv4 address is not public-routable unicast. Redirects are re-validated through `media_url_is_allowed` per hop, so a blocked redirect is never dispatched. The only test seam is its final explicit `loopback_page_mode && net::is_loopback_test_server(url)` branch, which permits individually scoped loopback test-server URLs; it does not relax the production policy.
 
+`run::validate_requested_post_identity` runs before media rewriting and before
+any archive publication, and it requires *all* of: a final URL that identifies a
+LiveJournal journal aliasing the request (not merely one that fails to
+contradict it), a matching final post ID when the final URL carries a
+recognizable one, `post.id` equal to the requested ID, and a parsed
+`post.journal` aliasing the request. Two seams are deliberate and must not be
+widened: a same-journal landing URL may omit the post ID, because the parsed
+page supplies it; and the loopback test server may omit *final journal* identity
+because its host is never a LiveJournal form — but its numeric ID and the parsed
+journal are still checked. Using `is_none_or` for the final journal (the former
+behavior) let any unrecognized production destination through, which is exactly
+the hole this closes. `tests/fixtures/post_output_correctness.html` is fetched
+under the hyphen spelling `canonical-lj` precisely so its canonical
+`Site.entry.journal` of `canonical_lj` aliases the request.
+
 Hermetic fixture downloads enable a loopback-page mode only when the delivered
 page is an explicit-port loopback HTTP URL. That mode does not bypass the media
 policy globally: each initial candidate and redirect is allowed through the
