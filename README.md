@@ -196,6 +196,11 @@ being emitted as raw HTML. Preserved HTML is always the post's original bytes,
 never a re-serialization of the parsed document, so markup the archive cannot
 delimit in the original — an element the post never closes — also stays a
 visible source listing rather than being emitted with parser-invented tags.
+Post text that would read as an AsciiDoc preprocessor directive — a line
+starting with `include::`, `ifdef::`, `ifndef::`, `ifeval::`, or `endif::` — is
+escaped everywhere it is preserved, in source listings and raw HTML alike;
+otherwise converting an archive would let a post read a local file into the
+output, or silently discard the rest of the document.
 Inline code and preserved source may use deliberate inert AsciiDoc encodings;
 when converted, the visible result retains the text authored in the post.
 Archive paths written into AsciiDoc always use portable forward slashes.

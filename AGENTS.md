@@ -281,7 +281,10 @@ node outside it — content escaping an inner owner lands inside the outer one a
 is already `inside_owner`. Fenced by `coverage_classifies_nothing_inside_an_owner`;
 nested `<div>`/`<span>` cannot fence it, as they short-circuit before the probe.
 
-Reviewed raw passthrough HTML stays byte-identical for every non-URL byte. Only
+Reviewed raw passthrough HTML stays byte-identical for every non-URL byte, with
+exactly one further deviation: the escape character inserted at the start of a
+preprocessor directive line (see below), which Asciidoctor consumes, so the raw
+HTML it emits is still the original bytes exactly. Beyond that escape, only
 the exact `href`/`src` **value ranges** the scanner recovered are replaced, the
 replacements are HTML-attribute encoded through
 `html_scan::escaped_attribute_value` (shared with `media`'s own splice), and both
@@ -298,27 +301,43 @@ per variant. `book.adoc` defines `lj-archiver-book`; standalone posts do not, so
 exactly one variant reaches converter output. AsciiDoc attribute *substitutions*
 are deliberately not enabled inside raw HTML — authored raw text would then
 activate attribute references — which is why context is selected with outer
-conditionals instead. One hard-won constraint: Asciidoctor evaluates
-`ifdef`/`ifndef`/`ifeval`/`endif` lines **inside** `++++` blocks (verified on
-2.0.26 — an `endif::[]` inside a passthrough raises "unmatched preprocessor
-directive", and an unmatched `ifdef::` discards the rest of the document at exit
-status 0), so raw HTML containing such a line fails closed to a listing.
+conditionals instead.
 
-**That fallback does not neutralize the directive**, and no note here should
-claim it does. The preprocessor runs inside `[subs=specialcharacters]\n----`
-blocks exactly as it does inside `++++`: an unmatched `ifdef::` truncates the
-*listing* and still discards everything after it, and an `endif::[]` is dropped
-from the listing's own content — a content loss in the very path that exists to
-preserve content inertly. Both verified on 2.0.26; see "Known Limitations" for
-the reproductions and for the `include::` disclosure of the same family, which
-is likewise **not** covered. The check's real and only guarantee is narrower:
-no *generated* conditional can be closed by authored bytes. It is nevertheless
-applied to every emitted fragment rather than only to the ones a conditional
-wraps, on a different ground — a truncated `++++` splices unbalanced raw markup
-into the document as live HTML, while a truncated listing stays escaped and
-inert. Actually neutralizing authored directive lines is a separate, approved
-piece of work covering both directive families across listings *and*
-passthrough.
+**Asciidoctor's preprocessor runs inside every block** — `++++` passthrough and
+`[subs=specialcharacters]\n----` listings alike — so a column-zero directive line
+in an archived post body is live when the reader converts the archive, and
+degrading to a listing is no defence at all. `escape.rs`'s
+`neutralize_preprocessor_directive_lines` therefore escapes those lines in the
+emitted *content* of every listing, and `neutralize_include_directive_lines`
+does the same for `include::` in every `++++` fragment. Both mirror Asciidoctor's
+own `IncludeDirectiveRx` / `ConditionalDirectiveRx` exactly, so a line is escaped
+only when it really is a directive: leading whitespace deactivates one, trailing
+whitespace does not (source lines are `String#rstrip`ped), the `[...]` argument
+must close the line, an include target may hold internal whitespace, and a line
+already carrying the escape is left alone — a second backslash would become
+visible output. Mind that those patterns are *Ruby* regexes, so their `\s` is
+ASCII-only and includes the vertical tab: a no-break space is an ordinary target
+character, which makes `include::&nbsp;secret[]` — and period LiveJournal HTML is
+full of `&nbsp;` — a live directive that Rust's `char::is_whitespace` would wave
+through. The escape is Asciidoctor's own and is *consumed* on conversion,
+so the converted text is unchanged; the whole table is fenced by
+`escapes_exactly_the_lines_asciidoctor_reads_as_directives` and its inert twin,
+and each was checked against 2.0.26 directly.
+
+The escape applies to content, never to the renderer's generated conditional
+wrapper, which is composed after it. **One family cannot be escaped inside a
+passthrough**: `Reader#process_line` tests a conditional's escape *before* it
+tests whether the reader is skipping, so an escaped `\endif::[]` inside a
+generated `ifdef::lj-archiver-book[]` wrapper survives the skip and emits one
+line of the *non-selected* variant as a stray paragraph — while an escaped
+`include::` is dropped correctly, its branch sitting after the skip test. That is
+why `contains_conditional_directive_line` still fails a conditional-carrying
+fragment closed to a listing: a listing is never inside a generated conditional,
+so escaping is sound there. The check stays deliberately broader than
+Asciidoctor's rule and covers every emitted fragment, not only the ones a
+conditional would wrap — which shape a fragment takes depends on its URLs, and a
+rule that moved with the content would be far harder to keep true than "no `++++`
+block ever carries one".
 
 Direct conversion without a `LinkRewriter` invents no archive context at all:
 references stay exactly as delivered.
@@ -637,26 +656,13 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   the image macro) and retain only the sanitized visible label. Do not add a
   per-call-site fallback that sanitizes an href without consulting this policy —
   that is exactly the regression these helpers exist to prevent.
-- **Authored AsciiDoc preprocessor lines inside archived content are not
-  neutralized anywhere.** Asciidoctor's preprocessor runs inside `++++`
-  passthrough blocks *and* inside `[subs=specialcharacters]\n----` listings, so
-  the renderer's fail-closed listing is not an escape hatch — it merely trades a
-  truncated passthrough for a truncated listing. All verified on 2.0.26, every
-  one exiting 0:
-  - `printf 'x\n++++\n<p>a</p>\ninclude::secret.adoc[]\n++++\n' | asciidoctor --embedded -`
-    splices the file in. A `../` path outside the base directory works too,
-    confirming the CLI's default safe mode is `unsafe`.
-  - `printf 'before\n[subs=specialcharacters]\n----\n<td>\nifdef::never-defined[]\n</td>\n----\n\nAFTER\n' | asciidoctor --embedded -`
-    truncates the listing *and* discards `AFTER`.
-  - The same listing with `endif::[]` instead keeps the surrounding lines but
-    silently drops the `endif::[]` line from the listing's own content.
-
-  Reviewed passthrough fails closed on the four *conditional* directives, which
-  guarantees only that a generated `ifndef::lj-archiver-book[]` conditional
-  cannot be closed by authored bytes (see "Implementation Guidance"). A
-  dedicated task is approved to actually neutralize these, covering both
-  directive families across listings and passthrough; do not patch it piecemeal
-  here.
+- An authored line that *already* carries the preprocessor escape — a post body
+  containing the literal text `\include::x[]` — is archived unchanged and
+  converts to `include::x[]`, one backslash short. Escaping it again would
+  convert to `\\include::x[]`, one backslash too many; Asciidoctor offers no
+  spelling that renders exactly one. The line is inert either way, so fidelity
+  loses and safety does not. Pinned by
+  `listings_leave_non_directive_and_already_escaped_lines_alone`.
 - A link inside reviewed raw HTML that points at a post the run then *fails* to
   archive stays a relative `<id>.html` / `posts/<id>.html` and dangles, where
   the equivalent `xref:` degrades to the hosted URL through the pending-link

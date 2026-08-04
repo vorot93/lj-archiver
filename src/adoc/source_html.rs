@@ -1,4 +1,7 @@
-use super::{RenderCtx, classify::is_stripped_chrome, render_specialcharacters_listing};
+use super::{
+    RenderCtx, classify::is_stripped_chrome, escape::neutralize_include_directive_lines,
+    render_specialcharacters_listing,
+};
 use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
 use std::{
@@ -148,10 +151,13 @@ pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) ->
         return render_source_listing(html);
     }
 
-    // Every emitted fragment is checked for a preprocessor directive line, not
-    // just the ones a generated conditional would wrap: Asciidoctor evaluates
-    // those lines inside `++++` too, so an authored `ifdef::` swallows the rest
-    // of the document even standing alone.
+    // Conditional directive lines are the one thing escaping cannot make safe
+    // inside a passthrough (see `neutralize_include_directive_lines`), so they
+    // still fail closed to a listing. The check covers every emitted fragment,
+    // not only the ones a generated conditional would wrap, because which shape
+    // a fragment takes depends on its URLs — a rule that changed with the
+    // content would be far harder to keep true than "no `++++` block ever
+    // carries one".
     match localized_passthrough_variants(html, &scanned, ctx) {
         Some(variants)
             if !variants
@@ -200,11 +206,19 @@ impl PassthroughVariants {
 }
 
 /// True when a line would be read as an AsciiDoc preprocessor conditional.
-/// Asciidoctor evaluates these *inside* `++++` blocks (verified on 2.0.26), so
-/// such a line either closes a generated conditional early or, unmatched,
-/// discards everything after it. Deliberately broader than Asciidoctor's own
-/// rule — which anchors at column zero and demands a `[...]` argument — because
-/// the cost of a false positive is one inert listing.
+///
+/// Unlike `include::`, this family cannot simply be escaped in place here.
+/// Asciidoctor's `Reader#process_line` tests a conditional's escape *before* it
+/// tests whether the reader is skipping (verified on 2.0.26), so an escaped
+/// `\endif::[]` inside a generated `ifdef::lj-archiver-book[]` wrapper survives
+/// the skip and emits one line of the *non-selected* variant as a stray
+/// paragraph. Failing closed to a listing avoids that: a listing is never inside
+/// a generated conditional, so escaping is sound there and both families are
+/// escaped.
+///
+/// Deliberately broader than Asciidoctor's own rule — which anchors at column
+/// zero and demands a `[...]` argument — because the cost of a false positive is
+/// one inert listing.
 fn contains_conditional_directive_line(html: &str) -> bool {
     html.lines().any(|line| {
         let trimmed = line.trim_start();
@@ -358,17 +372,28 @@ fn localized_passthrough_variants(
     Some(PassthroughVariants::Conditional { standalone, book })
 }
 
+/// Composes the emitted block(s). Every fragment's `include::` lines are escaped
+/// first: Asciidoctor's preprocessor reads them inside `++++` too, and would
+/// otherwise splice a local file into the reader's converted archive. The escape
+/// is the *only* byte a reviewed fragment gains — and Asciidoctor consumes it,
+/// so the raw HTML it emits is the original bytes exactly.
+///
+/// The generated conditional wrapper is the renderer's own and is composed after
+/// the escaping, so it is never itself escaped.
 fn render_passthrough_variants(variants: &PassthroughVariants) -> String {
     match variants {
         PassthroughVariants::Single(html) => {
-            let delimiter = safe_block_delimiter(html, '+');
+            let html = neutralize_include_directive_lines(html);
+            let delimiter = safe_block_delimiter(&html, '+');
 
             format!("{delimiter}\n{html}\n{delimiter}\n\n")
         }
         PassthroughVariants::Conditional { standalone, book } => {
             let attribute = crate::links::BOOK_ATTRIBUTE;
-            let standalone_delimiter = safe_block_delimiter(standalone, '+');
-            let book_delimiter = safe_block_delimiter(book, '+');
+            let standalone = neutralize_include_directive_lines(standalone);
+            let book = neutralize_include_directive_lines(book);
+            let standalone_delimiter = safe_block_delimiter(&standalone, '+');
+            let book_delimiter = safe_block_delimiter(&book, '+');
 
             format!(
                 "ifndef::{attribute}[]\n\

@@ -599,8 +599,14 @@ fn render_blockquote(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     format!("[quote]\n{delimiter}\n{content}\n{delimiter}\n\n")
 }
 
+/// The renderer's universal fail-closed response, and the rendering of every
+/// raw-text element. `specialcharacters` keeps the content inert against
+/// *substitutions*, but Asciidoctor's preprocessor still reads the block's own
+/// lines, so directive lines are escaped before the block is composed — see
+/// [`neutralize_preprocessor_directive_lines`].
 pub(super) fn render_specialcharacters_listing(content: &str) -> String {
-    let delimiter = safe_block_delimiter(content, '-');
+    let content = neutralize_preprocessor_directive_lines(content);
+    let delimiter = safe_block_delimiter(&content, '-');
     let mut output = format!("[subs=specialcharacters]\n{delimiter}\n{content}");
     if !content.ends_with('\n') {
         output.push('\n');
@@ -1141,6 +1147,90 @@ mod tests {
         }
     }
 
+    /// Asciidoctor's preprocessor reads column-zero directive lines *inside*
+    /// `[subs=specialcharacters]` listings, so every listing path must escape
+    /// them. The backslash is consumed on conversion, so the rendered text is
+    /// unchanged.
+    #[test]
+    fn preprocessor_directive_lines_are_escaped_in_every_listing_path() {
+        for directive in [
+            "include::/etc/hostname[]",
+            "ifdef::never-defined[]",
+            "ifndef::never-defined[]",
+            "ifeval::[1==1]",
+            "endif::[]",
+        ] {
+            assert_eq!(
+                html_to_adoc(&format!("<pre>a\n{directive}\nb</pre>")),
+                format!("[subs=specialcharacters]\n----\na\n\\{directive}\nb\n----\n\n"),
+                "<pre> did not escape {directive}"
+            );
+            assert_eq!(
+                html_to_adoc(&format!("<script>a\n{directive}\nb</script>")),
+                format!("[subs=specialcharacters]\n----\na\n\\{directive}\nb\n----\n\n"),
+                "<script> did not escape {directive}"
+            );
+            assert_eq!(
+                html_to_adoc(&format!("<style>a\n{directive}\nb</style>")),
+                format!("[subs=specialcharacters]\n----\na\n\\{directive}\nb\n----\n\n"),
+                "<style> did not escape {directive}"
+            );
+
+            // A fail-closed listing: the `style` attribute is never reviewed, so
+            // the whole element degrades to its original source bytes.
+            let source = format!("<section style=\"x\">\n{directive}\n</section>");
+            assert_eq!(
+                html_to_adoc(&source),
+                format!(
+                    "[subs=specialcharacters]\n----\n<section style=\"x\">\n\\{directive}\n</section>\n----\n\n"
+                ),
+                "the fail-closed listing did not escape {directive}"
+            );
+        }
+    }
+
+    /// The same for the reviewed-passthrough path: Asciidoctor evaluates
+    /// directive lines inside `++++` too, and consumes the escaping backslash
+    /// there as well.
+    #[test]
+    fn include_directive_lines_are_escaped_in_raw_passthrough() {
+        let html = "<table><tr><td>\ninclude::/etc/hostname[]\n</td></tr></table>";
+
+        assert_eq!(
+            html_to_adoc(html),
+            concat!(
+                "++++\n",
+                "<table><tr><td>\n\\include::/etc/hostname[]\n</td></tr></table>",
+                "\n++++\n\n",
+            )
+        );
+    }
+
+    /// Only a real directive is escaped. A `#ifdef` in a C listing, a mention of
+    /// `include::` inside a sentence, a directive-shaped line that leading
+    /// whitespace has already deactivated, and one already carrying its own
+    /// backslash all stay byte-identical — a second backslash would become
+    /// visible in the converted output.
+    #[test]
+    fn listings_leave_non_directive_and_already_escaped_lines_alone() {
+        for content in [
+            "#ifdef _WIN32\n#include \"windows.h\"\n#endif",
+            "the include::secret[] macro reads a file",
+            "include::secret[] and more",
+            " include::secret[]",
+            "\tifdef::never[]",
+            "include::secret",
+            "\\include::secret[]",
+            "\\endif::[]",
+        ] {
+            assert_eq!(
+                html_to_adoc(&format!("<pre>{content}</pre>")),
+                format!("[subs=specialcharacters]\n----\n{content}\n----\n\n"),
+                "{content:?} was rewritten"
+            );
+        }
+    }
+
     #[test]
     fn authored_block_metadata_lines_are_visibly_escaped() {
         for line in ["[subs=normal]", "[source,ruby]", "[#owned]", "[[owned]]"] {
@@ -1218,7 +1308,7 @@ mod tests {
         let adoc = html_to_adoc("<blockquote><pre>____\ninclude::secret[]</pre></blockquote>");
 
         assert!(adoc.starts_with(
-            "[quote]\n_____\n[subs=specialcharacters]\n----\n____\ninclude::secret[]\n----"
+            "[quote]\n_____\n[subs=specialcharacters]\n----\n____\n\\include::secret[]\n----"
         ));
         assert!(adoc.ends_with("\n_____\n\n"));
 
@@ -2273,7 +2363,7 @@ mod tests {
 
         assert!(adoc.lines().any(|line| line == "----"));
         assert!(!adoc.lines().any(|line| line == "*----" || line == "----*"));
-        assert!(adoc.contains("[subs=specialcharacters]\n----\ninclude::x[]\n----"));
+        assert!(adoc.contains("[subs=specialcharacters]\n----\n\\include::x[]\n----"));
     }
 
     #[test]
@@ -2306,7 +2396,7 @@ mod tests {
 
         assert_eq!(
             adoc,
-            "[subs=specialcharacters]\n----\ninclude::x[]\n----\n\n"
+            "[subs=specialcharacters]\n----\n\\include::x[]\n----\n\n"
         );
         assert!(!adoc.contains("x[----"));
     }
@@ -4731,6 +4821,38 @@ mod tests {
         assert!(!rendered.contains("ifndef::"), "{rendered}");
     }
 
+    /// Escaping runs on the *content* of each variant, never on the generated
+    /// wrapper: those `ifndef::` / `ifdef::` / `endif::` lines are the
+    /// renderer's own and must keep selecting exactly one variant.
+    #[test]
+    fn conditional_raw_passthrough_escapes_include_lines_in_both_variants() {
+        let rewriter = archived_post_rewriter();
+        let html = concat!(
+            "<table><tr><td>\n",
+            "include::secret.txt[]\n",
+            r#"<a href="/166512.html">post</a>"#,
+            "\n</td></tr></table>",
+        );
+
+        assert_eq!(
+            html_to_adoc_with_links(html, Some(&rewriter)),
+            concat!(
+                "ifndef::lj-archiver-book[]\n",
+                "++++\n",
+                "<table><tr><td>\n\\include::secret.txt[]\n",
+                r#"<a href="166512.html">post</a>"#,
+                "\n</td></tr></table>\n",
+                "++++\nendif::[]\n",
+                "ifdef::lj-archiver-book[]\n",
+                "++++\n",
+                "<table><tr><td>\n\\include::secret.txt[]\n",
+                r#"<a href="posts/166512.html">post</a>"#,
+                "\n</td></tr></table>\n",
+                "++++\nendif::[]\n\n",
+            )
+        );
+    }
+
     #[test]
     fn raw_passthrough_localizes_unquoted_attribute_values() {
         let rewriter = archived_post_rewriter();
@@ -4861,6 +4983,9 @@ mod tests {
         );
     }
 
+    /// A conditional in reviewed HTML degrades to a listing even standing alone,
+    /// and the listing then escapes it. Escaping it *in place* is not an option:
+    /// see `source_html::contains_conditional_directive_line`.
     #[test]
     fn unconditional_raw_passthrough_with_a_directive_line_fails_closed() {
         let html = concat!(
@@ -4872,7 +4997,11 @@ mod tests {
 
         assert_eq!(
             rendered,
-            format!("[subs=specialcharacters]\n----\n{html}\n----\n\n"),
+            concat!(
+                "[subs=specialcharacters]\n----\n",
+                "<table><tr><td>\n\\ifdef::never-defined[]\n</td></tr></table>",
+                "\n----\n\n",
+            ),
             "an authored directive would swallow the rest of the document"
         );
     }
@@ -5408,9 +5537,106 @@ mod tests {
         );
     }
 
+    /// An `include::` line reaching the preprocessor embeds the named file into
+    /// the reader's converted archive. The target is created *inside* the
+    /// conversion directory, so a regression splices recognizable content into
+    /// the output rather than failing silently on a missing path.
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn include_directives_in_archived_content_read_no_file_after_conversion() {
+        let html = concat!(
+            "<pre>include::secret.txt[]</pre>",
+            "<script>include::secret.txt[]</script>",
+            "<style>include::secret.txt[]</style>",
+            "<table><tr><td>\ninclude::secret.txt[]\n</td></tr></table>",
+            "<section style=\"x\">\ninclude::secret.txt[]\n</section>",
+        );
+        let (converted, stderr) = convert_with_asciidoctor_beside(
+            &html_to_adoc(html),
+            &[("secret.txt", "LEAKED-FILE-CONTENTS\n")],
+        );
+
+        assert!(
+            !converted.contains("LEAKED-FILE-CONTENTS"),
+            "the preprocessor read a local file: {converted}"
+        );
+        assert_eq!(
+            converted.matches("include::secret.txt[]").count(),
+            5,
+            "every directive must survive as inert text: {converted}"
+        );
+        assert!(
+            !converted.contains('\\'),
+            "the protective backslash was visible: {converted}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "asciidoctor diagnosed the archive: {stderr}"
+        );
+    }
+
+    /// An unmatched conditional truncates the document at exit status 0 —
+    /// everything after it is discarded — and a bare `endif::[]` is dropped from
+    /// a listing's own content. Both are silent losses in the path that exists to
+    /// preserve content inertly.
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn conditional_directives_in_archived_content_lose_nothing_after_conversion() {
+        let directives = [
+            "ifdef::never-defined[]",
+            "ifndef::never-defined[]",
+            "ifeval::[1==1]",
+            "endif::[]",
+        ];
+        let html = format!(
+            "<p>BEFORE-MARKER</p>{}<table><tr><td>\nendif::[]\n</td></tr></table>\
+             <p>AFTER-MARKER</p>",
+            directives
+                .iter()
+                .map(|directive| format!("<pre>{directive}</pre>"))
+                .collect::<String>(),
+        );
+        let (converted, stderr) = convert_with_asciidoctor_beside(&html_to_adoc(&html), &[]);
+        let visible = Html::parse_document(&converted)
+            .root_element()
+            .text()
+            .collect::<String>();
+
+        assert!(
+            visible.contains("AFTER-MARKER"),
+            "the document was truncated: {converted}"
+        );
+        for directive in directives {
+            assert!(
+                visible.contains(directive),
+                "{directive} was dropped from the listing: {converted}"
+            );
+        }
+        assert!(
+            !visible.contains('\\'),
+            "the protective backslash was visible: {converted}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "asciidoctor diagnosed the archive: {stderr}"
+        );
+    }
+
     fn convert_with_asciidoctor(adoc: &str) -> String {
+        convert_with_asciidoctor_beside(adoc, &[]).0
+    }
+
+    /// Converts `adoc` in a temp directory seeded with `files`, returning the
+    /// generated HTML and Asciidoctor's own diagnostics. Nothing outside that
+    /// directory is readable by the conversion, and a preprocessor complaint is
+    /// only ever an `ERROR` line — the process still exits zero — so stderr, not
+    /// the exit status, is what proves the document survived intact.
+    fn convert_with_asciidoctor_beside(adoc: &str, files: &[(&str, &str)]) -> (String, String) {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("input.adoc"), adoc).unwrap();
+        for (name, contents) in files {
+            fs::write(dir.path().join(name), contents).unwrap();
+        }
         let output = Command::new("asciidoctor")
             .arg("--embedded")
             .arg("input.adoc")
@@ -5422,6 +5648,10 @@ mod tests {
             "asciidoctor failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        fs::read_to_string(dir.path().join("input.html")).unwrap()
+
+        (
+            fs::read_to_string(dir.path().join("input.html")).unwrap(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
     }
 }

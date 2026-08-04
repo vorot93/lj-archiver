@@ -30,6 +30,121 @@ pub(crate) fn neutralize_plain_adoc_fragment_at_line_start(
     }
 }
 
+/// Escapes every line of emitted *content* that Asciidoctor's preprocessor
+/// would read as a live directive, in both directive families.
+///
+/// The preprocessor runs inside every block, `[subs=specialcharacters]\n----`
+/// listings and `++++` passthrough alike, so a line at column zero in an
+/// archived post body is a live directive when the reader converts the archive:
+/// `include::` embeds a local file into the output, and an unmatched conditional
+/// discards the rest of the document at exit status 0. Degrading to a listing is
+/// *not* a defence — the listing's own content is preprocessed too.
+///
+/// A leading backslash is Asciidoctor's own escape and is **consumed** on
+/// conversion, so the rendered text is unchanged. (A leading space deactivates a
+/// directive as well, but stays visible in the output.)
+pub(crate) fn neutralize_preprocessor_directive_lines(text: &str) -> String {
+    neutralize_directive_lines(text, is_preprocessor_directive_line)
+}
+
+/// [`neutralize_preprocessor_directive_lines`] restricted to `include::`, for
+/// content emitted inside a `++++` passthrough.
+///
+/// The conditional family is deliberately **not** escaped here. `Reader#process_line`
+/// tests a conditional's escape *before* it tests whether the reader is skipping
+/// (verified on 2.0.26), so an escaped `endif::[]` inside a generated
+/// `ifdef::lj-archiver-book[]` wrapper survives the skip and emits one line of
+/// the *non-selected* variant as a stray paragraph. An escaped `include::` is
+/// dropped by the skip correctly, because its branch sits after the skip test.
+/// Conditional lines therefore keep failing closed to a listing, where nothing
+/// is ever skipped and both families are escaped.
+pub(crate) fn neutralize_include_directive_lines(text: &str) -> String {
+    neutralize_directive_lines(text, is_include_directive_line)
+}
+
+fn neutralize_directive_lines(text: &str, is_directive: fn(&str) -> bool) -> String {
+    let mut output = String::with_capacity(text.len());
+
+    for line in text.split_inclusive('\n') {
+        if is_directive(line.trim_end_matches(is_asciidoctor_line_padding)) {
+            output.push('\\');
+        }
+        output.push_str(line);
+    }
+
+    output
+}
+
+fn is_preprocessor_directive_line(line: &str) -> bool {
+    is_include_directive_line(line) || is_conditional_directive_line(line)
+}
+
+/// Asciidoctor reads a source line through Ruby's `String#rstrip` — regex `\s`
+/// plus the NUL — so trailing whitespace never saves a directive line from being
+/// recognized. A *bare* carriage return is not a line terminator there and is
+/// left alone, which is why lines are split on `\n` only.
+fn is_asciidoctor_line_padding(character: char) -> bool {
+    character == '\0' || is_directive_regex_space(character)
+}
+
+/// Ruby's regex `\s`, which the directive patterns are written in: ASCII only,
+/// and it includes the vertical tab but not the NUL. Neither Rust's
+/// `char::is_whitespace` (Unicode) nor `char::is_ascii_whitespace` (no vertical
+/// tab) is this set, and the difference is load-bearing rather than pedantic: a
+/// no-break space is an ordinary target character to Asciidoctor, so
+/// `include::&nbsp;secret[]` — period LiveJournal HTML is full of `&nbsp;` — is
+/// a live directive that a Unicode-whitespace test would wave through.
+fn is_directive_regex_space(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ')
+}
+
+/// Asciidoctor's `IncludeDirectiveRx`:
+/// `^(\\)?include::([^\s\[](?:[^\[]*[^\s\[])?)\[(.+)?\]$`. The target is
+/// non-empty, holds no `[`, and neither starts nor ends with whitespace —
+/// though it may contain some.
+///
+/// The regex's optional leading backslash is the escape this module inserts, so
+/// a line that already carries one simply does not match here. That is also what
+/// keeps an already-escaped line from being escaped a second time, which would
+/// put a visible backslash into the converted output.
+fn is_include_directive_line(line: &str) -> bool {
+    let Some(target) = line
+        .strip_prefix("include::")
+        .and_then(directive_argument_target)
+    else {
+        return false;
+    };
+
+    !target.is_empty()
+        && !target.starts_with(is_directive_regex_space)
+        && !target.ends_with(is_directive_regex_space)
+}
+
+/// Asciidoctor's `ConditionalDirectiveRx`:
+/// `^(\\)?(ifdef|ifndef|ifeval|endif)::(\S*?(?:([,+])\S*?)?)\[(.+)?\]$`. The
+/// target alternation accepts exactly a run of non-whitespace, the empty run
+/// included — `endif::[]` and `ifeval::[expr]` carry no target at all.
+fn is_conditional_directive_line(line: &str) -> bool {
+    const NAMES: [&str; 4] = ["ifdef", "ifndef", "ifeval", "endif"];
+
+    NAMES.iter().any(|name| {
+        line.strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix("::"))
+            .and_then(directive_argument_target)
+            .is_some_and(|target| !target.contains(is_directive_regex_space))
+    })
+}
+
+/// The directive target: everything before the `[` opening the trailing
+/// `[...]` argument, or `None` when the line carries no such argument. Both
+/// directive shapes exclude `[` from the target and anchor the closing `]` at
+/// the end of the line, so the *first* `[` is the only candidate opener.
+fn directive_argument_target(rest: &str) -> Option<&str> {
+    let open = rest.find('[')?;
+
+    (rest.ends_with(']') && open + 1 < rest.len()).then(|| &rest[..open])
+}
+
 pub(crate) fn neutralize_active_adoc_lines(text: &str) -> String {
     let mut output = String::new();
 
@@ -936,6 +1051,116 @@ fn ends_with_inline_passthrough_macro_prefix(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every case here was checked against Asciidoctor 2.0.26 by putting the
+    /// line inside a `[subs=specialcharacters]` listing and seeing whether the
+    /// directive fired. The matcher mirrors `IncludeDirectiveRx` and
+    /// `ConditionalDirectiveRx`, so a target may hold internal whitespace and
+    /// even a `[`, and trailing whitespace does not save a line — Asciidoctor
+    /// reads its source through `String#rstrip`.
+    #[test]
+    fn escapes_exactly_the_lines_asciidoctor_reads_as_directives() {
+        for directive in [
+            "include::secret.txt[]",
+            "include::/etc/hostname[]",
+            "include::secret.txt[leveloffset=+1]",
+            "include::my file.txt[]",
+            "include::sec[ret.txt[]",
+            "include::secret.txt[]]",
+            "include::secret.txt[]   ",
+            "include::secret.txt[]\t",
+            "ifdef::never[]",
+            "ifndef::never[]",
+            "ifeval::[1==1]",
+            "endif::[]",
+            "ifdef::a,b[]",
+            "ifdef::a+b[]",
+            // Ruby's `\s` is ASCII-only, so a no-break space is an ordinary
+            // target character — and `&nbsp;` is everywhere in period HTML.
+            "include::\u{a0}secret.txt[]",
+            "include::secret.txt\u{a0}[]",
+            "ifdef::a\u{a0}b[]",
+            "endif::\u{a0}[]",
+        ] {
+            assert_eq!(
+                neutralize_preprocessor_directive_lines(directive),
+                format!("\\{directive}"),
+                "{directive:?} was left live"
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_every_line_asciidoctor_does_not_read_as_a_directive_alone() {
+        for inert in [
+            // Leading whitespace deactivates both families outright.
+            " include::secret.txt[]",
+            "\tinclude::secret.txt[]",
+            "\tifdef::never[]",
+            // The target may not begin or end with whitespace.
+            "include:: secret.txt[]",
+            "include::secret.txt []",
+            // The `[...]` argument must close the line.
+            "include::secret.txt[] tail",
+            "include::secret.txt[]x",
+            "include::secret.txt",
+            "endif::[",
+            // A conditional target is a run of non-whitespace — and the
+            // vertical tab counts, where the no-break space above does not.
+            "ifdef::a b[]",
+            "ifdef::a\u{b}b[]",
+            "include::\u{b}secret.txt[]",
+            // An include target is never empty; a directive name is exact.
+            "include::[]",
+            "INCLUDE::secret.txt[]",
+            "ifdefx::a[]",
+            "xinclude::secret.txt[]",
+            "the include::secret.txt[] macro reads a file",
+            "#ifdef _WIN32",
+            // Already inert: a second backslash would become visible output.
+            "\\include::secret.txt[]",
+            "\\endif::[]",
+            "\\\\include::secret.txt[]",
+        ] {
+            assert_eq!(
+                neutralize_preprocessor_directive_lines(inert),
+                inert,
+                "{inert:?} was rewritten"
+            );
+        }
+    }
+
+    /// Line structure is preserved exactly: the escape goes at column zero of
+    /// the offending line and nothing else moves. A CRLF pair is one line break
+    /// to Asciidoctor, while a bare carriage return is ordinary content.
+    #[test]
+    fn escapes_in_place_without_disturbing_line_structure() {
+        assert_eq!(
+            neutralize_preprocessor_directive_lines("a\ninclude::x[]\nb\n"),
+            "a\n\\include::x[]\nb\n"
+        );
+        assert_eq!(
+            neutralize_preprocessor_directive_lines("a\r\ninclude::x[]\r\nb"),
+            "a\r\n\\include::x[]\r\nb"
+        );
+        assert_eq!(
+            neutralize_preprocessor_directive_lines("a\rinclude::x[]\rb"),
+            "a\rinclude::x[]\rb"
+        );
+        assert_eq!(neutralize_preprocessor_directive_lines(""), "");
+    }
+
+    /// The passthrough entry point covers `include::` only; the conditional
+    /// family fails closed to a listing instead, because an escaped conditional
+    /// survives a skipped region and would leak a line of the non-selected
+    /// variant out of a generated conditional.
+    #[test]
+    fn passthrough_escaping_covers_includes_only() {
+        assert_eq!(
+            neutralize_include_directive_lines("include::x[]\nendif::[]\nifdef::never[]"),
+            "\\include::x[]\nendif::[]\nifdef::never[]"
+        );
+    }
 
     #[test]
     fn neutralizes_page_theme_title_open_and_table_block_lines() {

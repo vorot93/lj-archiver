@@ -222,6 +222,78 @@ fn raw_media_resolves_in_both_standalone_and_book_contexts() {
     assert!(root.join("assets/sample.svg").is_file());
 }
 
+/// A directive line inside a conditional raw block must stay inert in both
+/// reading contexts, and the escape must not disturb variant selection. The
+/// include target is created inside the archive root, so a regression splices
+/// recognizable content into the reader's converted archive.
+#[test]
+#[ignore = "requires asciidoctor; exercised explicitly by CI"]
+fn raw_passthrough_include_directive_reads_no_file_in_either_context() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("archive");
+    let archive = Archive::new(&root, "news");
+
+    // Byte-for-byte the renderer's own output for a reviewed table carrying an
+    // authored `include::` line beside a context-dependent link; see
+    // `adoc::tests::conditional_raw_passthrough_escapes_include_lines_in_both_variants`.
+    let body = concat!(
+        "= Post\n\n",
+        "ifndef::lj-archiver-book[]\n",
+        "++++\n",
+        "<table><tr><td>\n\\include::secret.txt[]\n",
+        r#"<a href="2.html">post</a>"#,
+        "\n</td></tr></table>\n",
+        "++++\nendif::[]\n",
+        "ifdef::lj-archiver-book[]\n",
+        "++++\n",
+        "<table><tr><td>\n\\include::secret.txt[]\n",
+        r#"<a href="posts/2.html">post</a>"#,
+        "\n</td></tr></table>\n",
+        "++++\nendif::[]\n",
+    );
+    let post_path = archive.write_post(1, body).unwrap();
+    let posts = [ArchivedPost {
+        id: 1,
+        title: ArchivedTitle::authored("Post"),
+        path: post_path,
+    }];
+    archive.write_index(&posts).unwrap();
+    archive.write_book(&posts).unwrap();
+    for directory in [&root, &root.join("posts")] {
+        fs::write(directory.join("secret.txt"), "LEAKED-FILE-CONTENTS\n").unwrap();
+    }
+
+    for (input, output, expected_href) in [
+        ("posts/1.adoc", "posts/1.html", "2.html"),
+        ("book.adoc", "book.html", "posts/2.html"),
+    ] {
+        convert(&root, input);
+        let html = fs::read_to_string(root.join(output)).unwrap();
+
+        assert!(
+            !html.contains("LEAKED-FILE-CONTENTS"),
+            "the preprocessor read a local file converting {input}:\n{}",
+            bounded_diagnostic(html.as_bytes())
+        );
+        assert_eq!(
+            html.matches("include::secret.txt[]").count(),
+            1,
+            "exactly one variant may survive, with the directive inert:\n{}",
+            bounded_diagnostic(html.as_bytes())
+        );
+        assert!(
+            !html.contains("\\include::"),
+            "the protective backslash was visible converting {input}:\n{}",
+            bounded_diagnostic(html.as_bytes())
+        );
+        assert!(
+            html.contains(&format!(r#"href="{expected_href}""#)),
+            "{input} selected the wrong variant:\n{}",
+            bounded_diagnostic(html.as_bytes())
+        );
+    }
+}
+
 /// Converts `input` inside `root`, asserting Asciidoctor said nothing at all. A
 /// preprocessor complaint about a generated conditional is only ever reported as
 /// an `ERROR` line — the process still exits zero — so an empty stderr, not the
