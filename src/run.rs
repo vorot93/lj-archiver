@@ -1,7 +1,9 @@
 use crate::{
     Result,
     adoc::render_post,
-    archive::{Archive, ExistingArchive, PostPublication, numeric_post_filename_id},
+    archive::{
+        Archive, ArchiveUpdateGuard, ExistingArchive, PostPublication, numeric_post_filename_id,
+    },
     cli::Cli,
     client::LjClient,
     discover::discover_post_ids,
@@ -175,6 +177,23 @@ pub async fn run_archive(
     }
 }
 
+/// Takes the archive-wide update lock and reads the archive state under it.
+///
+/// Inspection runs **first**, unlocked, because taking the lock is itself a
+/// write: it creates the archive root and the lock file. A directory that is not
+/// this archive has to be rejected without anything of ours appearing in it, so
+/// the run fails closed before networking and before any write. That first
+/// inspection is only a gate; the state the run acts on is the one read again
+/// under the lock, so a process that finished in between cannot leave this run
+/// working from a stale snapshot.
+fn lock_and_inspect(archive: &Archive) -> Result<(ArchiveUpdateGuard, Option<ExistingArchive>)> {
+    archive.inspect_existing()?;
+    let guard = archive.acquire_update_lock()?;
+    let existing = archive.inspect_existing()?;
+
+    Ok((guard, existing))
+}
+
 async fn archive_post(
     options: &RunOptions,
     progress: &Progress,
@@ -186,8 +205,7 @@ async fn archive_post(
     let archive = Archive::new(root.clone(), &journal);
     // Held until this function returns, so inspection, post publication, the
     // sidecar write, and manifest generation are one archive update.
-    let _update_lock = archive.acquire_update_lock()?;
-    let existing = archive.inspect_existing()?;
+    let (_update_lock, existing) = lock_and_inspect(&archive)?;
     let generate_book =
         options.generate_book || existing.as_ref().is_some_and(|existing| existing.has_book);
     let mut posts = posts_by_id(existing.as_ref());
@@ -290,8 +308,7 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     let archive = Archive::new(root.clone(), journal.clone());
     // Held for the whole run. The within-run `buffer_unordered` post pipeline is
     // unchanged and runs entirely under this one guard.
-    let _update_lock = archive.acquire_update_lock()?;
-    let existing = archive.inspect_existing()?;
+    let (_update_lock, existing) = lock_and_inspect(&archive)?;
     let generate_book =
         options.generate_book || existing.as_ref().is_some_and(|existing| existing.has_book);
     let mut posts = posts_by_id(existing.as_ref());
@@ -1184,6 +1201,49 @@ mod tests {
                 );
             }
             other => panic!("expected link integrity error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_output_directory_is_left_byte_for_byte_unchanged() {
+        // The run fails closed before it writes anything, so pointing
+        // `--output-dir` at somebody else's directory cannot litter it — not even
+        // with the update lock file, which is created by taking the lock.
+        let server = MockServer::start().await;
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(out.join("notes")).unwrap();
+        std::fs::write(out.join("thesis.txt"), b"unrelated bytes").unwrap();
+        std::fs::write(out.join("notes/todo.md"), b"more unrelated bytes").unwrap();
+        let before = directory_snapshot(&out);
+
+        for target in [
+            "news".to_string(),
+            format!("{}/news/166511.html", server.uri()),
+        ] {
+            let cli = Cli {
+                target: target.clone(),
+                output_dir: Some(out.clone()),
+                no_comments: false,
+                no_media: true,
+                concurrency: 2,
+                resume: false,
+                book: false,
+                journal: None,
+                verbose: false,
+                quiet: false,
+                user_agent: None,
+                base_url: Url::parse(&server.uri()).unwrap(),
+            };
+
+            let error = run(cli).await.unwrap_err();
+
+            assert!(
+                matches!(&error, LjError::InvalidArchive { reason, .. }
+                    if reason == "missing controlled index"),
+                "{target}: {error}"
+            );
+            assert_eq!(directory_snapshot(&out), before, "{target}");
         }
     }
 
@@ -3998,6 +4058,27 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect()
+    }
+
+    /// Every path under `root`, with file contents, so a comparison catches an
+    /// added, removed, or rewritten entry anywhere in the tree.
+    fn directory_snapshot(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        let mut snapshot = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    snapshot.insert(path.clone(), None);
+                    pending.push(path);
+                } else {
+                    snapshot.insert(path.clone(), Some(std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+
+        snapshot
     }
 
     #[derive(Clone)]

@@ -522,10 +522,18 @@ outside-root paths into a manifest — never reintroduce that fallback; every
 production caller already passes root-joined paths.
 
 `Archive::acquire_update_lock` returns an `ArchiveUpdateGuard` that both run
-paths (`archive_post`, `archive_journal_with_writer`) take **before**
-`inspect_existing` and keep alive through post, sidecar, index, and optional
-book publication; the within-run `buffer_unordered` pipeline runs unchanged
-under that single guard. It uses the standard-library file lock stabilized in
+paths (`archive_post`, `archive_journal_with_writer`) take through the shared
+`lock_and_inspect` helper in `src/run.rs` and keep alive through post, sidecar,
+index, and optional book publication; the within-run `buffer_unordered` pipeline
+runs unchanged under that single guard. `lock_and_inspect` inspects, locks, then
+inspects **again**, and the order is load-bearing in both directions. Taking the
+lock is itself a write — `prepare_controlled_file` creates the archive root and
+the lock file — so locking first left `.lj-archiver.lock` behind in a directory
+the very next step rejected, falsifying the "fails closed before networking or
+writes" contract this file and `README.md` both state. The unlocked inspection
+is only a gate, never the snapshot the run acts on: that comes from the second
+inspection, under the lock, so a process that finished between the two cannot
+leave this run working from stale state. Do not collapse the two calls. It uses the standard-library file lock stabilized in
 Rust 1.89 (hence `rust-version = "1.89"` in `[workspace.package]`) and adds no
 locking dependency. `try_lock` rather than `lock` is deliberate: an async worker
 or GUI thread must never block on another process, so contention is the typed
