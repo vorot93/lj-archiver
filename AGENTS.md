@@ -200,13 +200,17 @@ start. The guard is renderer-only — authored `pass:` macros are neutralized by
 the authored-text pass, so post content cannot forge it. Never append generated
 inline output with a bare `append_inline_fragment`; that reintroduces
 line-completion attacks that the authored-text neutralizer cannot see, because
-the authored run alone is inert. The guard also requires nonblank authored
-content already on the line: when `before` is empty or whitespace-only, the
-composed line's active shape comes entirely from the generated fragment itself
-— for example a bare (unwrapped) `<img>` renders its own complete
-`image::target[alt]` block macro — which is deliberate, self-contained renderer
-output, not authored prose newly activated by appended delimiters, and must
-convert as a real block macro rather than being guarded inert.
+the authored run alone is inert.
+
+There is exactly one exemption, and it is deliberately narrow. A bare `<img>`
+renders to a real block macro (`image::src[alt]`), so when *that fragment*
+stands alone on its line it is the renderer's intended output and must not be
+guarded — a `pass:[]` in front of it renders the image as literal text instead.
+The exemption keys on the fragment, never on "the line was previously empty":
+an anchor whose sanitized target begins with `.` (`../other/page.html[x]`,
+`./page.html[x]`) also starts its line, and left unguarded Asciidoctor parses it
+as a block title that swallows the *following* block. Both behaviors are pinned
+by tests — widening the exemption to a blank-line check reopens the second one.
 
 Attribute-reference neutralization includes Asciidoctor's state-changing
 `{set:...}`, `{counter:...}`, and `{counter2:...}` forms, not only simple

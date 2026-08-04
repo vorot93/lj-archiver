@@ -765,7 +765,7 @@ fn append_generated_inline(output: &mut String, fragment: &str) {
     let line_start = output.rfind('\n').map_or(0, |index| index + 1);
     let before = output[line_start..].to_string();
     append_inline_fragment(output, fragment);
-    if generated_inline_completes_active_line(&before, &output[line_start..]) {
+    if generated_inline_completes_active_line(&before, &output[line_start..], fragment) {
         output.insert_str(line_start, GENERATED_INLINE_LINE_GUARD);
     }
 }
@@ -2813,11 +2813,43 @@ mod tests {
         for (html, expected) in [
             ("<p>Hello <strong>world</strong></p>", "Hello *world*\n\n"),
             ("<p><strong>Lead</strong> text</p>", "*Lead* text\n\n"),
+            // `". "` is unconditionally an ordered-list marker, so the authored run
+            // is already escaped by the plain-text neutralizer before the append.
             ("<p>. <strong>spaced</strong></p>", "\\. *spaced*\n\n"),
             ("<p>C++ <em>and</em> more</p>", "C++ _and_ more\n\n"),
         ] {
             assert_eq!(html_to_adoc(html), expected, "{html}");
         }
+    }
+
+    #[test]
+    fn guards_a_dot_leading_generated_target_but_not_a_lone_block_image() {
+        // A renderer-owned target that starts the line with `.` completes
+        // block-title syntax. Unguarded, Asciidoctor turns the line into a title
+        // and absorbs the *following* block into it.
+        for (html, expected) in [
+            (
+                r#"<p><a href="../other/page.html">x</a></p>"#,
+                "pass:[]../other/page.html[x]\n\n",
+            ),
+            (
+                r#"<p><a href="./page.html">x</a></p>"#,
+                "pass:[]./page.html[x]\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+
+        // The renderer's own block image macro alone on its line is deliberate
+        // output; guarding it would render the image as literal text.
+        assert_eq!(
+            html_to_adoc(r#"<p><img src="x.jpg" alt="x"></p>"#),
+            "image::x.jpg[x]\n\n"
+        );
+        assert_eq!(
+            html_to_adoc(r#"<img src="x.jpg" alt="x">"#),
+            "image::x.jpg[x]"
+        );
     }
 
     #[test]

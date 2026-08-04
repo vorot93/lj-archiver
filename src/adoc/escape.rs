@@ -831,17 +831,23 @@ pub(crate) const GENERATED_INLINE_LINE_GUARD: &str = "pass:[]";
 /// `before` is the current logical line as it stood before the append;
 /// `composed` is the same line afterwards. A line that was *already* active
 /// keeps whatever protection it already carries — only a newly completed
-/// construct earns a guard, so safe prose never gains one. A blank `before`
-/// (no authored content yet on this line, ignoring leading whitespace) is
-/// also exempt: the composed line's active shape then comes entirely from
-/// the generated fragment itself — for example a bare `<img>` renders its
-/// own complete `image::target[alt]` block macro — which is the renderer's
-/// deliberate, self-contained output rather than authored prose newly
-/// activated by appended delimiters.
-pub(crate) fn generated_inline_completes_active_line(before: &str, composed: &str) -> bool {
-    !before.trim_start().is_empty()
-        && !line_is_active_adoc_syntax(before)
-        && line_is_active_adoc_syntax(composed)
+/// construct earns a guard, so safe prose never gains one.
+pub(crate) fn generated_inline_completes_active_line(
+    before: &str,
+    composed: &str,
+    fragment: &str,
+) -> bool {
+    // A bare `<img>` renders to a genuine block macro (`image::src[alt]`).
+    // Standing alone on its line that is the renderer's own deliberate output,
+    // not an authored prefix activating generated delimiters — guarding it
+    // would convert a working image into literal text. This is the *only*
+    // exemption: a generated fragment that merely happens to start a line
+    // (an anchor whose target begins with `.`, say) still earns its guard.
+    if before.trim().is_empty() && fragment.trim_start().starts_with("image::") {
+        return false;
+    }
+
+    !line_is_active_adoc_syntax(before) && line_is_active_adoc_syntax(composed)
 }
 
 /// The full active-line vocabulary: headings, ordered/unordered/hyphen/
