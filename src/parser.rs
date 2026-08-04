@@ -1091,7 +1091,7 @@ Site.entry = {"ditemid":7,"poster":"real"};"#,
             // Case/whitespace variants of a non-JavaScript type still reject.
             format!(r#"<script type=" APPLICATION/JSON ">{EVIL_ENTRY}</script>"#),
             // `<template>` content is an inert DocumentFragment, never part of
-            // the rendered document, so a script inside one never runs -- even
+            // the rendered document, so a script inside one never runs — even
             // though scraper's `select` walks into it like any other element.
             format!(r#"<template><script>{EVIL_ENTRY}</script></template>"#),
             // Nested templates: still inert at any depth.
@@ -1129,7 +1129,7 @@ Site.entry = {"ditemid":7,"poster":"real"};"#,
     #[test]
     fn a_script_element_survives_inside_rendered_post_content() {
         // A plain classic script positioned inside the post body still
-        // executes in a real browser exactly as one in page chrome would --
+        // executes in a real browser exactly as one in page chrome would —
         // DOM position doesn't gate script execution, only `type` and
         // `<template>`/`<noscript>` nesting do. This is not a residual gap in
         // the type/template fix above: excluding scripts by *where* they sit
