@@ -793,41 +793,6 @@ fn is_active_delimiter_only(text: &str) -> bool {
         && is_delimiter_only(text, delimiter)
 }
 
-pub(crate) fn render_inline_wrapper(text: &str, prefix: &str, suffix: &str) -> String {
-    if should_preserve_unwrapped_inline_output(text) {
-        return text.to_string();
-    }
-
-    render_inline_wrapper_with_label(text, text.trim(), prefix, suffix)
-}
-
-pub(crate) fn render_inline_wrapper_with_label(
-    text: &str,
-    label: &str,
-    prefix: &str,
-    suffix: &str,
-) -> String {
-    let mut output = String::new();
-
-    if label.is_empty() {
-        return output;
-    }
-
-    if text.starts_with(' ') {
-        output.push(' ');
-    }
-
-    output.push_str(prefix);
-    output.push_str(label);
-    output.push_str(suffix);
-
-    if text.ends_with(' ') {
-        output.push(' ');
-    }
-
-    output
-}
-
 pub(crate) fn should_preserve_unwrapped_inline_output(text: &str) -> bool {
     let trimmed = text.trim();
 
@@ -1109,16 +1074,22 @@ fn is_block_macro_prefix(text: &str) -> bool {
         })
 }
 
-/// The byte offsets in `text[window]` that need a `\` so that no inline
-/// AsciiDoc construct composed out of more than one emitted fragment stays
-/// live.
+/// The byte offsets that need a `\` so that no inline AsciiDoc construct
+/// composed out of more than one emitted span stays live.
 ///
-/// `contained` answers "does one single emitted fragment hold this whole byte
-/// range?". A construct one fragment holds keeps exactly the meaning its
-/// producer gave it: a renderer-generated `image:`, `xref:` or `` `pass:c[]` ``
-/// stays live, and an authored run stays as the run neutralizer left it. A
-/// construct no single fragment holds belongs to no producer, and that — and
-/// only that — is what gets escaped.
+/// Two predicates decide every escape, and both must allow it:
+///
+/// * `is_authored` answers "did the post's HTML supply this byte?". Only an
+///   authored offset may ever receive an escape, so the renderer's own bytes —
+///   a macro name, a sanitized target, a `link=` attribute value, a guard — are
+///   never rewritten however the authored text around them composes. This is a
+///   guarantee about *where* an escape may land; it says nothing about which
+///   constructs get recognized, which is entirely the four scanners' job.
+/// * `contained` answers "does one single emitted span hold this whole byte
+///   range?". A construct one span holds keeps exactly the meaning its producer
+///   gave it, which is what stops an authored run's already-neutralized output
+///   — and the `pass:[:]` a description-list rewrite leaves inside it — from
+///   being escaped a second time.
 ///
 /// Coverage is by vocabulary rather than by case: this walks exactly the four
 /// scanners of [`neutralize_inline_adoc_syntax`], so an authored construct is
@@ -1126,24 +1097,81 @@ fn is_block_macro_prefix(text: &str) -> bool {
 /// generated then authored, or authored around a generated fragment, including
 /// the empty one an `<i></i>` renders to).
 ///
-/// The window is the current block. Everything before it is finished, verbatim
-/// block bytes; inside it, the three line-scoped scanners restrict themselves
-/// (an attribute reference needs its `}` before the line break, a macro target
-/// stops at whitespace), while an inline `+++` pair legitimately spans the hard
-/// breaks within one paragraph and so is scanned across them.
+/// Two windows, because the scanners have two scopes. `line` is the current
+/// logical line, which is all an attribute reference (its `}` must precede the
+/// line break) or a macro (its target stops at whitespace) can reach. `pairs`
+/// is where the `+++` pair scan resumes, which spans the hard breaks inside one
+/// paragraph but never a finished block.
 pub(crate) fn composed_inline_escape_offsets(
+    text: &str,
+    line: Range<usize>,
+    pairs: Range<usize>,
+    contained: &dyn Fn(Range<usize>) -> bool,
+    is_authored: &dyn Fn(usize) -> bool,
+) -> ComposedInlineEscapes {
+    let mut offsets = Vec::new();
+
+    scan_window(
+        text,
+        line,
+        contained,
+        is_authored,
+        &mut offsets,
+        |window, record, holds| {
+            composed_attribute_reference_escapes(window, record);
+            composed_inline_passthrough_macro_escapes(window, record);
+            composed_inline_macro_escapes(window, holds, record);
+            0
+        },
+    );
+    let pairs_start = pairs.start;
+    let resume = pairs_start
+        + scan_window(
+            text,
+            pairs,
+            contained,
+            is_authored,
+            &mut offsets,
+            |window, record, _| composed_inline_passthrough_delimiter_escapes(window, record),
+        );
+
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    ComposedInlineEscapes {
+        offsets,
+        pairs_resume_from: resume,
+    }
+}
+
+pub(crate) struct ComposedInlineEscapes {
+    /// Byte offsets that need a `\`, ascending.
+    pub(crate) offsets: Vec<usize>,
+    /// Where the `+++` pair scan may resume next time: the position of an
+    /// unmatched opening delimiter, or the end of everything already paired.
+    pub(crate) pairs_resume_from: usize,
+}
+
+fn scan_window(
     text: &str,
     window: Range<usize>,
     contained: &dyn Fn(Range<usize>) -> bool,
-) -> Vec<usize> {
+    is_authored: &dyn Fn(usize) -> bool,
+    offsets: &mut Vec<usize>,
+    scan: impl FnOnce(&str, &mut dyn FnMut(usize, usize), &dyn Fn(Range<usize>) -> bool) -> usize,
+) -> usize {
+    if window.is_empty() {
+        return 0;
+    }
+
     let start = window.start;
     let window = &text[window];
     let bytes = window.as_bytes();
     let holds = |range: Range<usize>| contained(start + range.start..start + range.end);
     let passthroughs = contained_passthrough_macros(window, &holds);
-    let mut offsets = Vec::new();
     let mut record = |escape_at: usize, end: usize| {
         if !is_immediately_escaped(bytes, escape_at)
+            && is_authored(start + escape_at)
             && !holds(escape_at..end)
             && !is_inside(&passthroughs, escape_at)
         {
@@ -1151,14 +1179,7 @@ pub(crate) fn composed_inline_escape_offsets(
         }
     };
 
-    composed_attribute_reference_escapes(window, &mut record);
-    composed_inline_passthrough_macro_escapes(window, &mut record);
-    composed_inline_macro_escapes(window, &holds, &mut record);
-    composed_inline_passthrough_delimiter_escapes(window, &mut record);
-
-    offsets.sort_unstable();
-    offsets.dedup();
-    offsets
+    scan(window, &mut record, &holds)
 }
 
 /// The inline passthrough macros one fragment holds outright — the code
@@ -1214,7 +1235,7 @@ fn is_inside(regions: &[Range<usize>], offset: usize) -> bool {
         .any(|region| region.start < offset && offset < region.end)
 }
 
-fn composed_attribute_reference_escapes(text: &str, record: &mut impl FnMut(usize, usize)) {
+fn composed_attribute_reference_escapes(text: &str, record: &mut dyn FnMut(usize, usize)) {
     let bytes = text.as_bytes();
     let mut scan_steps = AttributeScanSteps::default();
     let closing_brace_before_line_break = closing_brace_before_line_break(bytes, &mut scan_steps);
@@ -1243,7 +1264,7 @@ fn composed_attribute_reference_escapes(text: &str, record: &mut impl FnMut(usiz
     }
 }
 
-fn composed_inline_passthrough_macro_escapes(text: &str, record: &mut impl FnMut(usize, usize)) {
+fn composed_inline_passthrough_macro_escapes(text: &str, record: &mut dyn FnMut(usize, usize)) {
     let mut cursor = 0;
 
     while let Some(relative_start) = text[cursor..].find("pass:") {
@@ -1260,7 +1281,7 @@ fn composed_inline_passthrough_macro_escapes(text: &str, record: &mut impl FnMut
 fn composed_inline_macro_escapes(
     text: &str,
     holds: &dyn Fn(Range<usize>) -> bool,
-    record: &mut impl FnMut(usize, usize),
+    record: &mut dyn FnMut(usize, usize),
 ) {
     let bytes = text.as_bytes();
     let mut scan_steps = MacroScanSteps::default();
@@ -1305,23 +1326,31 @@ fn composed_inline_macro_escapes(
     }
 }
 
+/// Pairs `+++` delimiters left to right, returning where a later pass may
+/// resume: the position of a delimiter still waiting for its partner, or the
+/// end of everything already paired.
 fn composed_inline_passthrough_delimiter_escapes(
     text: &str,
-    record: &mut impl FnMut(usize, usize),
-) {
+    record: &mut dyn FnMut(usize, usize),
+) -> usize {
     let mut cursor = 0;
 
     while let Some(relative_start) = text[cursor..].find("+++") {
         let start = cursor + relative_start;
         let content_start = start + 3;
         let Some(relative_end) = text[content_start..].find("+++") else {
-            break;
+            // Still open: a later append may close it, so it stays in scope.
+            return start;
         };
         let end = content_start + relative_end + 3;
 
         record(start, end);
         cursor = end;
     }
+
+    // Nothing open. Keep the last two bytes in scope so a `+++` straddling the
+    // next append is still seen.
+    cursor.max(text.len().saturating_sub(2))
 }
 
 #[cfg(test)]
@@ -1514,18 +1543,36 @@ mod tests {
             ("+++raw+++", 6, 0),
         ] {
             let whole = 0..text.len();
+            let escapes = |contained: &dyn Fn(Range<usize>) -> bool,
+                           is_authored: &dyn Fn(usize) -> bool| {
+                composed_inline_escape_offsets(
+                    text,
+                    whole.clone(),
+                    whole.clone(),
+                    contained,
+                    is_authored,
+                )
+                .offsets
+            };
+            let split_spans = |range: Range<usize>| range.end <= split || split <= range.start;
+
             assert_eq!(
-                composed_inline_escape_offsets(text, whole.clone(), &|_| true),
+                escapes(&|_| true, &|_| true),
                 Vec::<usize>::new(),
-                "one fragment holding {text:?} must escape nothing"
+                "one span holding {text:?} must escape nothing"
             );
 
-            let offsets = composed_inline_escape_offsets(text, whole, &|range: Range<usize>| {
-                range.end <= split || split <= range.start
-            });
+            let offsets = escapes(&split_spans, &|_| true);
             assert!(
                 offsets.contains(&escape_at),
                 "{text:?} split at {split} escaped {offsets:?}, wanted {escape_at}"
+            );
+
+            // Generated bytes are never rewritten, whatever the split.
+            assert_eq!(
+                escapes(&split_spans, &|_| false),
+                Vec::<usize>::new(),
+                "{text:?} was escaped inside renderer-generated bytes"
             );
         }
     }

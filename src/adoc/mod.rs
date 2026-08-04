@@ -287,33 +287,33 @@ impl RenderCtx<'_> {
     }
 }
 
-fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> Spanned {
     if ctx.depth >= MAX_RENDER_DEPTH {
-        return render_passthrough(element, ctx);
+        return Spanned::generated(render_passthrough(element, ctx));
     }
 
     if is_stripped_chrome(element) {
-        return String::new();
+        return Spanned::default();
     }
 
     // The single passthrough decision, shared with the source-coverage pass so
     // the two can never disagree about who owns an element's source bytes.
     if renders_as_source_preserving_passthrough(element) {
-        return render_passthrough(element, ctx);
+        return Spanned::generated(render_passthrough(element, ctx));
     }
 
     let name = element.value().name();
 
     match name {
         "p" => render_paragraph(element, ctx),
-        "br" => " +\n".to_string(),
+        "br" => Spanned::generated(" +\n"),
         "a" => render_link(element, ctx),
         "img" => render_image(element, ctx),
         "strong" | "b" => render_inline_wrapper(&render_inline_children(element, ctx), "*", "*"),
         "em" | "i" => render_inline_wrapper(&render_inline_children(element, ctx), "_", "_"),
-        "code" => render_inline_code(element),
-        "pre" => render_listing(element),
-        "script" | "style" => render_safe_listing(element),
+        "code" => Spanned::generated(render_inline_code(element)),
+        "pre" => Spanned::generated(render_listing(element)),
+        "script" | "style" => Spanned::generated(render_safe_listing(element)),
         "blockquote" => render_blockquote(element, ctx),
         "ul" => render_list(element, "*", ctx),
         "ol" => render_list(element, ".", ctx),
@@ -329,18 +329,21 @@ fn has_unreviewed_element_descendant(element: ElementRef<'_>) -> bool {
     })
 }
 
-fn render_paragraph(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+/// A paragraph is a finished block: its bytes sit behind the blank line that
+/// ends it, so nothing inside it is ever rewritten and it needs no interior
+/// origins. Every block renderer answers `Spanned::generated` for that reason.
+fn render_paragraph(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> Spanned {
     let content = render_inline_children(element, ctx);
     let trimmed = trim_trailing_hard_breaks(content.trim_start());
 
     if trimmed.is_empty() {
-        String::new()
+        Spanned::default()
     } else {
-        format!("{trimmed}\n\n")
+        Spanned::generated(format!("{trimmed}\n\n"))
     }
 }
 
-fn render_inline_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+fn render_inline_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> Spanned {
     render_inline_children_with_options(element, ctx, false)
 }
 
@@ -348,7 +351,7 @@ fn render_inline_children_with_options(
     element: ElementRef<'_>,
     ctx: RenderCtx<'_>,
     skip_direct_lists: bool,
-) -> String {
+) -> Spanned {
     let mut output = InlineBuffer::new();
     let mut plain_text = String::new();
     let mut pending_breaks: usize = 0;
@@ -420,10 +423,10 @@ fn render_inline_children_with_options(
 
     flush_plain_text_run(&mut output, &mut plain_text);
 
-    output.into_string()
+    output.into_spanned()
 }
 
-fn render_block_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+fn render_block_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> Spanned {
     let mut output = InlineBuffer::new();
 
     for child in element.children() {
@@ -446,10 +449,10 @@ fn render_block_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String 
         }
     }
 
-    output.into_string()
+    output.into_spanned()
 }
 
-fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> Spanned {
     if let Some(href) = element.attr("href")
         && let Some(image) = lone_image_child(element)
     {
@@ -465,12 +468,16 @@ fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
             }
 
             let Some(macro_target) = link_macro_target(href, LinkTargetKind::Anchor, ctx) else {
-                return sanitize_rendered_macro_label(&text);
+                return Spanned::authored(sanitize_rendered_macro_label(&text));
             };
 
+            // The target is the renderer's: it went through the URL policy and
+            // `sanitize_macro_target`, and an escape inside it would corrupt a
+            // working link — or, for a same-journal post, a pending-link token.
+            // The label is the post's, so it stays escapable.
             render_inline_wrapper_with_label(
                 &text,
-                &sanitize_rendered_macro_label(&text),
+                &Spanned::authored(sanitize_rendered_macro_label(&text)),
                 &format!("{macro_target}["),
                 "]",
             )
@@ -479,18 +486,28 @@ fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     }
 }
 
-fn render_image(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+fn render_image(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> Spanned {
     match element.attr("src") {
         Some(src) => {
             let alt = sanitize_macro_label(element.attr("alt").unwrap_or_default());
             match image_macro_target(src, ctx) {
-                Some(target) => format!("image::{target}[{alt}]"),
-                None if !alt.is_empty() => alt,
-                None => sanitize_macro_label(src),
+                Some(target) => macro_with_label(&format!("image::{target}["), &alt, "]"),
+                None if !alt.is_empty() => Spanned::authored(alt),
+                None => Spanned::authored(sanitize_macro_label(src)),
             }
         }
-        None => String::new(),
+        None => Spanned::default(),
     }
+}
+
+/// A macro whose delimiters and target are the renderer's and whose label is
+/// the post's.
+fn macro_with_label(prefix: &str, label: &str, suffix: &str) -> Spanned {
+    let mut output = Spanned::default();
+    output.push_generated(prefix);
+    output.push_authored(label);
+    output.push_generated(suffix);
+    output
 }
 
 /// Which click target an anchor or a linked image resolves to. Anchors resolve
@@ -574,31 +591,31 @@ fn lone_image_child(element: ElementRef<'_>) -> Option<ElementRef<'_>> {
 /// Renders a link that wraps a single image as an inline image with a `link=`
 /// attribute (`image:target[alt,link=href]`). The link target additionally
 /// percent-encodes commas so the URL cannot split the macro's attribute list.
-fn render_linked_image(image: ElementRef<'_>, href: &str, ctx: RenderCtx<'_>) -> String {
+fn render_linked_image(image: ElementRef<'_>, href: &str, ctx: RenderCtx<'_>) -> Spanned {
     let src = image.value().attr("src").unwrap_or_default();
     let alt = sanitize_macro_label(image.value().attr("alt").unwrap_or_default());
     let Some(target) = image_macro_target(src, ctx) else {
-        return if alt.is_empty() {
+        return Spanned::authored(if alt.is_empty() {
             sanitize_macro_label(src)
         } else {
             alt
-        };
+        });
     };
 
     let Some(link) = link_macro_target(href, LinkTargetKind::ImageLink, ctx) else {
-        return format!("image:{target}[{alt}]");
+        return macro_with_label(&format!("image:{target}["), &alt, "]");
     };
     let link = link.replace(',', "%2C");
 
-    format!("image:{target}[{alt},link={link}]")
+    macro_with_label(&format!("image:{target}["), &alt, &format!(",link={link}]"))
 }
 
-fn render_blockquote(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+fn render_blockquote(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> Spanned {
     let children = render_block_children(element, ctx);
     let content = trim_trailing_hard_breaks(&trim_leading_hard_breaks(&children));
     let delimiter = safe_block_delimiter(&content, '_');
 
-    format!("[quote]\n{delimiter}\n{content}\n{delimiter}\n\n")
+    Spanned::generated(format!("[quote]\n{delimiter}\n{content}\n{delimiter}\n\n"))
 }
 
 /// The renderer's universal fail-closed response, and the rendering of every
@@ -674,7 +691,7 @@ fn render_inline_code(element: ElementRef<'_>) -> String {
     encode_inline_code(content.trim_matches('\n'))
 }
 
-fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> String {
+fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> Spanned {
     let mut output = String::new();
     let marker = marker.repeat(ctx.list_depth + 1);
 
@@ -707,8 +724,9 @@ fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> Str
                 }
 
                 match list_element.value().name() {
-                    "ul" => output.push_str(&render_element(list_element, ctx.in_list().deeper())),
-                    "ol" => output.push_str(&render_element(list_element, ctx.in_list().deeper())),
+                    "ul" | "ol" => {
+                        output.push_str(&render_element(list_element, ctx.in_list().deeper()));
+                    }
                     _ => {}
                 }
             }
@@ -719,21 +737,21 @@ fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> Str
         output.push('\n');
     }
 
-    output
+    Spanned::generated(output)
 }
 
-fn render_heading(element: ElementRef<'_>, name: &str, ctx: RenderCtx<'_>) -> String {
+fn render_heading(element: ElementRef<'_>, name: &str, ctx: RenderCtx<'_>) -> Spanned {
     let level = name
         .strip_prefix('h')
         .and_then(|level| level.parse::<usize>().ok())
         .unwrap_or(1)
         + 1;
 
-    format!(
+    Spanned::generated(format!(
         "{} {}\n\n",
         "=".repeat(level),
         trim_trailing_hard_breaks(render_inline_children(element, ctx).trim_start())
-    )
+    ))
 }
 
 fn plain_text_inline_content(element: ElementRef<'_>) -> Option<String> {
@@ -813,7 +831,7 @@ fn skip_suppressed(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> bool {
 /// appends, and then guards the composed logical line when the generated
 /// delimiters newly completed active block syntax. Every generated-inline
 /// append must go through here — appending directly reopens finding 1.
-fn append_generated_inline(output: &mut InlineBuffer, fragment: &str) {
+fn append_generated_inline(output: &mut InlineBuffer, fragment: &Spanned) {
     if let Some(pending) =
         neutralize_pending_plain_text_before_generated_inline(output.line(), fragment)
     {
@@ -853,7 +871,7 @@ fn flush_plain_text_run(output: &mut InlineBuffer, plain_text: &mut String) {
     if is_line_start {
         // The run *is* the logical line, and the neutralizer just handled it as
         // one.
-        output.push(&fragment);
+        output.push_authored(&fragment);
         return;
     }
 
@@ -864,7 +882,7 @@ fn flush_plain_text_run(output: &mut InlineBuffer, plain_text: &mut String) {
     // reopens that hole.
     let line_start = output.line_start();
     let before = output.line().to_string();
-    output.push(&fragment);
+    output.push_authored(&fragment);
 
     if let Some(neutralized) = neutralize_line_completed_by_authored_text(&before, output.line()) {
         output.replace_from(line_start, &neutralized);
@@ -897,11 +915,11 @@ fn flush_pending_line_breaks(
         // content still lands at a line start, so block-macro neutralization
         // (which keys off the same line-start condition) is unaffected.
         if !output.is_empty() && !output.ends_with('\n') {
-            output.push(" +\n");
+            output.push_generated(" +\n");
         }
     } else {
         output.trim_end_in_place();
-        output.push("\n\n");
+        output.push_generated("\n\n");
     }
 
     *pending_breaks = 0;
@@ -961,7 +979,7 @@ fn append_inline_block(output: &mut InlineBuffer, block: &str) {
     fragment.push_str(block);
     fragment.push_str("\n\n");
 
-    output.push_verbatim(&fragment);
+    output.push_verbatim(&Spanned::generated(fragment));
 }
 
 #[cfg(test)]
@@ -3960,8 +3978,41 @@ mod tests {
         }
     }
 
-    /// The other half of the rule: a construct one emitted fragment owns
-    /// outright keeps the meaning its producer gave it. Every row here is
+    /// The scan is bounded to the current logical line, plus the resumable
+    /// `+++` pair window. Pin that as a byte budget, because the suite's own
+    /// fixtures are far too small for wall-clock timing to bound anything.
+    #[test]
+    fn composed_scanning_stays_linear_in_body_size() {
+        // A paragraph of `<br>`-separated sentences is the dominant LiveJournal
+        // body shape, and it is the shape a block-wide rescan on every append
+        // makes quadratic. The scan window is the current *line* — plus the
+        // resumable `+++` pair window — so total scanned bytes must stay a
+        // constant multiple of the body, not a multiple of body × fragments.
+        let sentence = "Some ordinary sentence of archived prose. ";
+        let mut ratios = Vec::new();
+
+        for sentences in [200usize, 400, 800] {
+            let body = format!("<p>{}</p>", vec![sentence; sentences].join("<br>"));
+
+            take_scanned_bytes();
+            let rendered = html_to_adoc(&body);
+            let scanned = take_scanned_bytes();
+
+            assert!(rendered.contains("ordinary sentence"));
+            ratios.push(scanned as f64 / body.len() as f64);
+        }
+
+        // Quadratic growth would double the ratio each time the body doubles.
+        let worst = ratios.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(
+            worst <= 8.0,
+            "composed scanning read {worst:.1}x the body; ratios were {ratios:?}"
+        );
+    }
+
+    /// The other clause of the rule: a construct one emitted span holds
+    /// outright keeps the meaning its producer gave it, and no byte the
+    /// renderer composed is ever rewritten. Every row here is
     /// renderer-generated output that must convert exactly as before —
     /// escaping any of it breaks working links, images and code spans.
     #[test]
@@ -3995,21 +4046,77 @@ mod tests {
             ("<p>C++ and +++ alone</p>", "C++ and +++ alone\n\n"),
             ("<p>a<i></i>b</p>", "ab\n\n"),
             ("<p>1 + 2 <b>=</b> 3</p>", "1 + 2 *=* 3\n\n"),
+            // The rows above all separate the macro from the authored text with
+            // a space, which stops a macro target before it can reach past the
+            // macro's own bracket. These do not: authored `[…]` abutting a
+            // generated macro is what reaches into the renderer's attribute
+            // list, and `link=` is the value that must survive it intact.
+            (
+                concat!(
+                    r#"<p><a href="https://e.example/p">"#,
+                    r#"<img src="https://e.example/i.png" alt="a"></a>[1]</p>"#,
+                ),
+                "image:https://e.example/i.png[a,link=https://e.example/p][1]\n\n",
+            ),
+            (
+                concat!(
+                    r#"<p>x<a href="https://e.example/p">"#,
+                    r#"<img src="https://e.example/i.png" alt="a"></a>[1]y</p>"#,
+                ),
+                "ximage:https://e.example/i.png[a,link=https://e.example/p][1]y\n\n",
+            ),
+            (
+                r#"<p><a href="https://e.example/x">t</a>[1]</p>"#,
+                "https://e.example/x[t][1]\n\n",
+            ),
+            (
+                r#"<p><img src="https://e.example/i.png" alt="a">[1]</p>"#,
+                "image::https://e.example/i.png[a][1]\n\n",
+            ),
         ] {
             assert_eq!(html_to_adoc(html), expected, "{html}");
         }
     }
 
+    /// The cost of the rule, pinned rather than discovered later: authored text
+    /// that composes a construct across a boundary gains the escape its
+    /// single-run spelling has always had, even where the text is benign and
+    /// the construct was never live. Inertness wins over fidelity; what must
+    /// never happen is the renderer's own bytes gaining one, which the rows in
+    /// `generated_inline_constructs_are_never_escaped_by_composition` pin.
+    #[test]
+    fn authored_text_gains_the_escape_its_single_run_spelling_has() {
+        for (split, control, expected) in [
+            (
+                "<p>See <b>foo:bar</b>[1]</p>",
+                "<p>See foo:bar[1]</p>",
+                ("See *\\foo:bar*[1]\n\n", "See \\foo:bar[1]\n\n"),
+            ),
+            (
+                "<p>See <i></i>foo:bar[1]</p>",
+                "<p>See foo:bar[1]</p>",
+                ("See \\foo:bar[1]\n\n", "See \\foo:bar[1]\n\n"),
+            ),
+        ] {
+            assert_eq!(html_to_adoc(split), expected.0, "{split}");
+            assert_eq!(html_to_adoc(control), expected.1, "{control}");
+        }
+    }
+
     /// Link localization emits generated attribute references and `xref:`
     /// macros. They must stay live, whatever authored text sits beside them.
+    ///
+    /// The abutting text has to contain a `[`: a macro target runs only as far
+    /// as the next whitespace, so plain words beside a macro can never reach
+    /// past its own bracket and the scan is never even tempted.
     #[test]
     fn localized_cross_post_links_survive_beside_authored_text() {
         let rewriter = news_rewriter();
         let adoc = html_to_adoc_with_links(
             concat!(
-                r#"<p>before<a href="https://news.livejournal.com/166512.html">other</a>after</p>"#,
+                r#"<p>[b]<a href="https://news.livejournal.com/166512.html">other</a>[1]</p>"#,
                 r#"<p>x<a href="https://news.livejournal.com/166512.html">"#,
-                r#"<img src="https://cdn.example.test/p.jpg" alt="a"></a>y</p>"#,
+                r#"<img src="https://cdn.example.test/p.jpg" alt="a"></a>[1]</p>"#,
             ),
             Some(&rewriter),
         );
@@ -4019,6 +4126,42 @@ mod tests {
             adoc.contains("link={lj-archiver-post-link-prefix}166512.adoc]"),
             "{adoc:?}"
         );
+        assert!(!adoc.contains(r"\https"), "{adoc:?}");
+        assert!(!adoc.contains(r"\xref"), "{adoc:?}");
+        assert!(
+            !adoc.contains(r"{lj-archiver-post-link-prefix}\"),
+            "{adoc:?}"
+        );
+    }
+
+    /// A linked image's `link=` value is a *pending-link token* when the target
+    /// is a same-journal post. An escape spliced into it stops the token
+    /// matching what the renderer recorded, `validate_pending_links` fails on
+    /// every namespace, and the post is dropped from the archive — content loss
+    /// on ordinary gallery markup.
+    #[test]
+    fn a_pending_link_token_survives_authored_text_that_abuts_it() {
+        for tail in ["[1]", "tail[1]", "<b>x[y]</b>", "<code>x</code>"] {
+            let rewriter = LinkRewriter::pending(
+                "news",
+                HashSet::from([166512u64]),
+                Url::parse("https://news.livejournal.com/1.html").unwrap(),
+                "00112233445566778899aabbccddeeff",
+            );
+            let adoc = html_to_adoc_with_links(
+                &format!(
+                    concat!(
+                        r#"<p><a href="https://news.livejournal.com/166512.html">"#,
+                        r#"<img src="https://cdn.example.test/p.jpg" alt="a"></a>{}</p>"#,
+                    ),
+                    tail
+                ),
+                Some(&rewriter),
+            );
+
+            crate::links::validate_pending_links(&adoc, &rewriter.pending_links())
+                .unwrap_or_else(|error| panic!("{tail}: {error:?} in {adoc:?}"));
+        }
     }
 
     #[test]
@@ -4096,11 +4239,14 @@ mod tests {
     #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
     fn localized_cross_post_links_still_resolve_beside_authored_text() {
         let rewriter = news_rewriter();
+        // The abutting text carries a `[`: plain words beside a macro stop the
+        // target at the next space and never reach past the macro's own
+        // bracket, so they cannot exercise the bound at all.
         let adoc = html_to_adoc_with_links(
             concat!(
-                r#"<p>before<a href="https://news.livejournal.com/166512.html">other</a>after</p>"#,
+                r#"<p>[b]<a href="https://news.livejournal.com/166512.html">other</a>[1]</p>"#,
                 r#"<p>x<a href="https://news.livejournal.com/166512.html">"#,
-                r#"<img src="https://cdn.example.test/p.jpg" alt="a"></a>y</p>"#,
+                r#"<img src="https://cdn.example.test/p.jpg" alt="a"></a>[1]y</p>"#,
             ),
             Some(&rewriter),
         );
@@ -4115,10 +4261,9 @@ mod tests {
 
         // The anchor resolves through `xref:`, the linked image through the
         // `link=` attribute prefix — one localized `.html`, one localized
-        // `.adoc` the book resolves — and both survive the authored words that
-        // abut them with no separating space.
+        // `.adoc` the book resolves — and both survive the authored `[…]` that
+        // abuts them with no separating space.
         assert_eq!(hrefs, ["166512.html", "166512.adoc"], "got: {converted}");
-        assert!(!converted.contains('\\'), "got: {converted}");
         assert!(
             document
                 .select(&Selector::parse("img").unwrap())
