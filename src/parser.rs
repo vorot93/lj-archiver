@@ -59,47 +59,19 @@ struct SiteEntry {
     eventtime: Option<i64>,
 }
 
+/// Extracts the server-rendered `Site.entry = {…}` JSON object from a post page.
+///
+/// Candidate positions come from a focused JavaScript lexical scanner, so only
+/// an assignment in genuinely executable code qualifies; the object itself is
+/// still deserialized by `serde_json` and still trusted only when its `ditemid`
+/// equals the resolved post id. A malformed or wrong-id candidate does not stop
+/// the scan, so a later valid assignment is still found.
 fn site_entry(document: &Html, expected_id: u64) -> Option<SiteEntry> {
-    const ANCHOR: &str = "Site.entry";
-
     for script in document.select(&SCRIPT) {
         let text = script.text().collect::<String>();
-        let bytes = text.as_bytes();
-        let mut search_start = 0;
 
-        while let Some(relative_anchor) = text[search_start..].find(ANCHOR) {
-            let anchor = search_start + relative_anchor;
-            let after_anchor = anchor + ANCHOR.len();
-            search_start = after_anchor;
-
-            if anchor
-                .checked_sub(1)
-                .and_then(|index| bytes.get(index))
-                .is_some_and(|byte| is_js_identifier_byte(*byte))
-                || bytes
-                    .get(after_anchor)
-                    .is_some_and(|byte| is_js_identifier_byte(*byte))
-            {
-                continue;
-            }
-
-            let mut cursor = after_anchor;
-            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-                cursor += 1;
-            }
-            if bytes.get(cursor) != Some(&b'=') {
-                continue;
-            }
-
-            cursor += 1;
-            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-                cursor += 1;
-            }
-            if bytes.get(cursor) != Some(&b'{') {
-                continue;
-            }
-
-            let entry = serde_json::Deserializer::from_str(&text[cursor..])
+        for object_start in crate::js_scan::site_entry_object_starts(&text) {
+            let entry = serde_json::Deserializer::from_str(&text[object_start..])
                 .into_iter::<SiteEntry>()
                 .next()
                 .and_then(std::result::Result::ok);
@@ -110,10 +82,6 @@ fn site_entry(document: &Html, expected_id: u64) -> Option<SiteEntry> {
     }
 
     None
-}
-
-fn is_js_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
 }
 
 fn is_age_gate(document: &Html, page_url: &Url) -> bool {
@@ -962,6 +930,73 @@ mod tests {
                 assert_eq!(url, "https://evo-lutio.livejournal.com/47545.html");
             }
             other => panic!("got {other:?}"),
+        }
+    }
+
+    fn page_with_script(script: &str) -> String {
+        format!(
+            concat!(
+                r#"<html><body><article data-journal="news" data-itemid="7">"#,
+                r#"<div class="entry-content">body</div>"#,
+                r#"</article><script>{}</script></body></html>"#,
+            ),
+            script
+        )
+    }
+
+    fn parsed_poster(script: &str) -> Option<String> {
+        let url = Url::parse("https://news.livejournal.com/7.html").unwrap();
+        parse_post_page(&page_with_script(script), &url)
+            .unwrap()
+            .poster
+    }
+
+    #[test]
+    fn site_entry_is_ignored_in_non_executing_javascript_text() {
+        for script in [
+            r#"// Site.entry = {"ditemid":7,"poster":"ghost"};"#,
+            r#"/* Site.entry = {"ditemid":7,"poster":"ghost"}; */"#,
+            r#"var s = 'Site.entry = {"ditemid":7,"poster":"ghost"}';"#,
+            r#"var s = "Site.entry = {\"ditemid\":7,\"poster\":\"ghost\"}";"#,
+            r#"var s = `Site.entry = {"ditemid":7,"poster":"ghost"}`;"#,
+            r#"var s = `outer ${`inner Site.entry = {"ditemid":7,"poster":"ghost"}`} end`;"#,
+            r#"var r = /Site.entry = \{"ditemid":7,"poster":"ghost"\}/;"#,
+            r#"var r = /[Site.entry = {"ditemid":7,"poster":"ghost"}]/;"#,
+            r#"Other.Site.entry = {"ditemid":7,"poster":"ghost"};"#,
+            r#"window?.Site.entry = {"ditemid":7,"poster":"ghost"};"#,
+            r#"MySite.entry = {"ditemid":7,"poster":"ghost"};"#,
+            r#"Site.entryPoint = {"ditemid":7,"poster":"ghost"};"#,
+            r#"if (Site.entry == {"ditemid":7,"poster":"ghost"}) {}"#,
+            r#"if (Site.entry === {"ditemid":7,"poster":"ghost"}) {}"#,
+            r#"var f = Site.entry => {"ditemid":7,"poster":"ghost"};"#,
+            r#"var o = {"Site.entry = {\"ditemid\":7,\"poster\":\"ghost\"}": 1};"#,
+        ] {
+            assert_eq!(parsed_poster(script), None, "{script}");
+        }
+    }
+
+    #[test]
+    fn site_entry_is_accepted_in_executable_positions() {
+        for script in [
+            r#"Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"Site . entry  =  {"ditemid":7,"poster":"real"};"#,
+            r#"// comment
+Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"var q = a / b; Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"var r = /x/g; Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"var t = `x ${1 + 1} y`; Site.entry = {"ditemid":7,"poster":"real"};"#,
+        ] {
+            assert_eq!(parsed_poster(script), Some("real".to_string()), "{script}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_or_wrong_id_candidate_does_not_stop_the_scan() {
+        for script in [
+            r#"Site.entry = {not json; Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"Site.entry = {"ditemid":9,"poster":"other"}; Site.entry = {"ditemid":7,"poster":"real"};"#,
+        ] {
+            assert_eq!(parsed_poster(script), Some("real".to_string()), "{script}");
         }
     }
 }

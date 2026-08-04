@@ -5,6 +5,7 @@ pub mod client;
 pub mod discover;
 pub mod error;
 mod html_scan;
+mod js_scan;
 mod link_metadata;
 mod links;
 pub mod media;
