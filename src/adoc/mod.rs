@@ -4594,7 +4594,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_url_attributes_keep_exact_raw_passthrough_control() {
+    fn safe_url_attributes_keep_raw_passthrough_control() {
         let source = concat!(
             r#"<section title='safe'><a href="/profile">safe link</a>"#,
             r#"<img src='photo.jpg' alt='safe image'></section>"#,
@@ -4607,7 +4607,258 @@ mod tests {
 
         let adoc = html_to_adoc_with_links(source, Some(&r));
 
-        assert_eq!(adoc, format!("++++\n{source}\n++++\n\n"));
+        assert_eq!(
+            adoc,
+            concat!(
+                "++++\n",
+                r#"<section title='safe'><a href="https://news.livejournal.com/profile">safe link</a>"#,
+                r#"<img src='https://news.livejournal.com/archive/photo.jpg' alt='safe image'></section>"#,
+                "\n++++\n\n",
+            ),
+            "only the recovered value ranges change: quoting, spacing and every \
+             other attribute stay byte-identical"
+        );
+    }
+
+    /// A rewriter as an archived post gets one: the delivered page is a post of
+    /// the journal, and one sibling post is in the export.
+    fn archived_post_rewriter() -> LinkRewriter {
+        LinkRewriter::new(
+            "news",
+            HashSet::from([166512u64]),
+            Url::parse("https://news.livejournal.com/166511.html").unwrap(),
+        )
+    }
+
+    #[test]
+    fn raw_passthrough_localizes_same_journal_links_per_context() {
+        let rewriter = archived_post_rewriter();
+        let html = r#"<table><tr><td><a href="/166512.html">post</a></td></tr></table>"#;
+
+        assert_eq!(
+            html_to_adoc_with_links(html, Some(&rewriter)),
+            concat!(
+                "ifndef::lj-archiver-book[]\n",
+                "++++\n",
+                r#"<table><tr><td><a href="166512.html">post</a></td></tr></table>"#,
+                "\n++++\nendif::[]\n",
+                "ifdef::lj-archiver-book[]\n",
+                "++++\n",
+                r#"<table><tr><td><a href="posts/166512.html">post</a></td></tr></table>"#,
+                "\n++++\nendif::[]\n\n",
+            )
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_localizes_downloaded_media_per_context() {
+        let rewriter = archived_post_rewriter();
+        let html = r#"<table><tr><td><img src="../assets/a.png" alt="a"></td></tr></table>"#;
+
+        assert_eq!(
+            html_to_adoc_with_links(html, Some(&rewriter)),
+            concat!(
+                "ifndef::lj-archiver-book[]\n",
+                "++++\n",
+                r#"<table><tr><td><img src="../assets/a.png" alt="a"></td></tr></table>"#,
+                "\n++++\nendif::[]\n",
+                "ifdef::lj-archiver-book[]\n",
+                "++++\n",
+                r#"<table><tr><td><img src="assets/a.png" alt="a"></td></tr></table>"#,
+                "\n++++\nendif::[]\n\n",
+            )
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_absolutizes_context_independent_remote_references() {
+        let rewriter = archived_post_rewriter();
+        let html = concat!(
+            r#"<table><tr><td>"#,
+            r#"<a href="//cdn.example.test/p">protocol</a>"#,
+            r#"<a href="/tag/x">root</a>"#,
+            r#"<a href="https://other.example.test/p">hosted</a>"#,
+            r#"</td></tr></table>"#,
+        );
+
+        assert_eq!(
+            html_to_adoc_with_links(html, Some(&rewriter)),
+            concat!(
+                "++++\n",
+                r#"<table><tr><td>"#,
+                r#"<a href="https://cdn.example.test/p">protocol</a>"#,
+                r#"<a href="https://news.livejournal.com/tag/x">root</a>"#,
+                r#"<a href="https://other.example.test/p">hosted</a>"#,
+                r#"</td></tr></table>"#,
+                "\n++++\n\n",
+            ),
+            "context-independent rewrites stay one block"
+        );
+    }
+
+    #[test]
+    fn direct_raw_passthrough_invents_no_archive_context() {
+        let html = concat!(
+            r#"<table><tr><td>"#,
+            r#"<a href="/tag/x">root</a>"#,
+            r#"<img src="../assets/a.png" alt="a">"#,
+            r#"</td></tr></table>"#,
+        );
+
+        assert_eq!(
+            html_to_adoc(html),
+            format!("++++\n{html}\n++++\n\n"),
+            "without a rewriter raw references stay exactly as delivered"
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_with_a_conditional_directive_line_fails_closed() {
+        let rewriter = archived_post_rewriter();
+        let html = concat!(
+            "<table><tr><td>\n",
+            "endif::[]\n",
+            r#"<a href="/166512.html">post</a>"#,
+            "\n</td></tr></table>",
+        );
+        let rendered = html_to_adoc_with_links(html, Some(&rewriter));
+
+        assert!(
+            rendered.starts_with("[subs=specialcharacters]\n----\n"),
+            "authored preprocessor directives must fail closed to a listing: {rendered}"
+        );
+        assert!(!rendered.contains("ifdef::"), "{rendered}");
+        assert!(!rendered.contains("ifndef::"), "{rendered}");
+    }
+
+    #[test]
+    fn raw_passthrough_localizes_unquoted_attribute_values() {
+        let rewriter = archived_post_rewriter();
+        let html = "<table><tr><td><a href=/166512.html>post</a></td></tr></table>";
+
+        assert_eq!(
+            html_to_adoc_with_links(html, Some(&rewriter)),
+            concat!(
+                "ifndef::lj-archiver-book[]\n",
+                "++++\n",
+                "<table><tr><td><a href=166512.html>post</a></td></tr></table>",
+                "\n++++\nendif::[]\n",
+                "ifdef::lj-archiver-book[]\n",
+                "++++\n",
+                "<table><tr><td><a href=posts/166512.html>post</a></td></tr></table>",
+                "\n++++\nendif::[]\n\n",
+            ),
+            "a replacement must stay a single unquoted token"
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_keeps_character_references_inside_localized_media() {
+        let rewriter = archived_post_rewriter();
+        let html = r#"<table><tr><td><img src="../assets/a&#38;b.png"></td></tr></table>"#;
+
+        assert_eq!(
+            html_to_adoc_with_links(html, Some(&rewriter)),
+            concat!(
+                "ifndef::lj-archiver-book[]\n",
+                "++++\n",
+                r#"<table><tr><td><img src="../assets/a&#38;b.png"></td></tr></table>"#,
+                "\n++++\nendif::[]\n",
+                "ifdef::lj-archiver-book[]\n",
+                "++++\n",
+                r#"<table><tr><td><img src="assets/a&#38;b.png"></td></tr></table>"#,
+                "\n++++\nendif::[]\n\n",
+            ),
+            "the asset spellings are the original bytes, so no character \
+             reference is decoded into the output"
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_absolutization_does_not_sanitize_macro_syntax() {
+        let rewriter = archived_post_rewriter();
+        let html = r#"<table><tr><td><a href="/p?q=[1]&amp;r=a::b">brackets</a></td></tr></table>"#;
+
+        assert_eq!(
+            html_to_adoc_with_links(html, Some(&rewriter)),
+            concat!(
+                "++++\n",
+                r#"<table><tr><td>"#,
+                r#"<a href="https://news.livejournal.com/p?q=[1]&amp;r=a::b">brackets</a>"#,
+                r#"</td></tr></table>"#,
+                "\n++++\n\n",
+            ),
+            "raw HTML is not a macro target: brackets and `::` stay literal, and \
+             only `&` is re-encoded for the attribute"
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_cannot_be_broken_out_of_by_a_hostile_post_filename() {
+        let rewriter = LinkRewriter::with_targets(
+            "news",
+            std::sync::Arc::new(std::collections::HashMap::from([(
+                166512u64,
+                r#"x" onerror="alert(1)"#.to_string() + ".adoc",
+            )])),
+            Url::parse("https://news.livejournal.com/166511.html").unwrap(),
+        );
+        let html = r#"<table><tr><td><img src="/166512.html" alt="a"></td></tr></table>"#;
+        let rendered = html_to_adoc_with_links(html, Some(&rewriter));
+
+        assert!(
+            rendered.contains(r#"src="x&quot; onerror=&quot;alert(1).html""#),
+            "the replacement must stay inside its quoting: {rendered}"
+        );
+        assert!(!rendered.contains("onerror=\""), "{rendered}");
+    }
+
+    #[test]
+    fn raw_passthrough_revalidation_rejects_a_replacement_with_an_active_scheme() {
+        let rewriter = LinkRewriter::with_targets(
+            "news",
+            std::sync::Arc::new(std::collections::HashMap::from([(
+                166512u64,
+                "javascript:alert(1).adoc".to_string(),
+            )])),
+            Url::parse("https://news.livejournal.com/166511.html").unwrap(),
+        );
+        let html = r#"<table><tr><td><a href="/166512.html">post</a></td></tr></table>"#;
+
+        assert_eq!(
+            html_to_adoc_with_links(html, Some(&rewriter)),
+            format!("[subs=specialcharacters]\n----\n{html}\n----\n\n"),
+            "a spliced variant is re-checked under the same URL policy the \
+             original passed"
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_without_a_recovered_value_range_fails_closed() {
+        let rewriter = archived_post_rewriter();
+        let html = "<table><tr><td><a href>valueless</a></td></tr></table>";
+
+        assert_eq!(
+            html_to_adoc_with_links(html, Some(&rewriter)),
+            format!("[subs=specialcharacters]\n----\n{html}\n----\n\n"),
+            "a reference with no recovered range is never guessed at"
+        );
+    }
+
+    #[test]
+    fn unconditional_raw_passthrough_with_a_directive_line_fails_closed() {
+        let html = concat!(
+            "<table><tr><td>\n",
+            "ifdef::never-defined[]\n",
+            "</td></tr></table>",
+        );
+        let rendered = html_to_adoc(html);
+
+        assert_eq!(
+            rendered,
+            format!("[subs=specialcharacters]\n----\n{html}\n----\n\n"),
+            "an authored directive would swallow the rest of the document"
+        );
     }
 
     #[test]

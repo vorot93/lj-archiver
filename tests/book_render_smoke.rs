@@ -2,7 +2,7 @@ use lj_archiver::{
     archive::Archive,
     models::{ArchivedPost, ArchivedTitle},
 };
-use std::{fs, process::Command};
+use std::{fs, path::Path, process::Command};
 use tempfile::tempdir;
 
 const DIAGNOSTIC_MAX_CHARS: usize = 2_000;
@@ -150,6 +150,94 @@ fn linked_post_image_href_resolves_in_standalone_and_book_contexts() {
     assert!(!book.contains("href=\"2.adoc\""));
     assert!(!book.contains("href=\"xref:2.adoc\""));
     assert!(root.join("posts/2.adoc").is_file());
+}
+
+#[test]
+#[ignore = "requires asciidoctor; exercised explicitly by CI"]
+fn raw_media_resolves_in_both_standalone_and_book_contexts() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("archive");
+    let archive = Archive::new(&root, "news");
+    fs::create_dir_all(archive.assets_dir()).unwrap();
+    fs::write(
+        archive.assets_dir().join("sample.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#,
+    )
+    .unwrap();
+
+    // Byte-for-byte the renderer's own output for a downloaded asset inside a
+    // reviewed table; see `adoc::tests::raw_passthrough_localizes_downloaded_media_per_context`.
+    let body = concat!(
+        "= Post\n\n",
+        "ifndef::lj-archiver-book[]\n",
+        "++++\n",
+        r#"<table><tr><td><img src="../assets/sample.svg" alt="a"></td></tr></table>"#,
+        "\n++++\nendif::[]\n",
+        "ifdef::lj-archiver-book[]\n",
+        "++++\n",
+        r#"<table><tr><td><img src="assets/sample.svg" alt="a"></td></tr></table>"#,
+        "\n++++\nendif::[]\n",
+    );
+    let post_path = archive.write_post(1, body).unwrap();
+    let posts = [ArchivedPost {
+        id: 1,
+        title: ArchivedTitle::authored("Post"),
+        path: post_path,
+    }];
+    archive.write_index(&posts).unwrap();
+    archive.write_book(&posts).unwrap();
+
+    // Standalone: converted next to posts/, so ../assets/ reaches the asset.
+    let standalone = convert(&root, "posts/1.adoc");
+    let standalone_html = fs::read_to_string(root.join("posts/1.html")).unwrap();
+    assert_eq!(
+        first_image_src(&standalone_html),
+        Some("../assets/sample.svg"),
+        "standalone conversion emitted the wrong raw <img src>:\n{standalone}\n{}",
+        bounded_diagnostic(standalone_html.as_bytes())
+    );
+    assert!(root.join("posts/../assets/sample.svg").is_file());
+
+    // Book: converted at the archive root, so the asset is a direct child.
+    let book = convert(&root, "book.adoc");
+    let book_html = fs::read_to_string(root.join("book.html")).unwrap();
+    assert_eq!(
+        first_image_src(&book_html),
+        Some("assets/sample.svg"),
+        "book conversion emitted the wrong raw <img src>:\n{book}\n{}",
+        bounded_diagnostic(book_html.as_bytes())
+    );
+    assert!(root.join("assets/sample.svg").is_file());
+    assert_eq!(
+        book_html.matches("<img").count(),
+        1,
+        "exactly one conditional variant may survive:\n{}",
+        bounded_diagnostic(book_html.as_bytes())
+    );
+}
+
+/// Converts `input` inside `root`, returning Asciidoctor's diagnostics. A
+/// preprocessor complaint about a generated conditional is only ever reported as
+/// an `ERROR` line — the process still exits zero — so an empty stderr is the
+/// assertion that matters.
+fn convert(root: &Path, input: &str) -> String {
+    let output = Command::new("asciidoctor")
+        .arg(input)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let diagnostics = bounded_diagnostic(&output.stderr);
+    assert!(
+        output.status.success(),
+        "asciidoctor failed for {input}:\nstdout excerpt: {}\nstderr excerpt: {diagnostics}",
+        bounded_diagnostic(&output.stdout),
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "asciidoctor diagnosed {input}: {diagnostics}"
+    );
+
+    diagnostics
 }
 
 #[test]

@@ -216,6 +216,7 @@ with a generated `:toc:`:
 = <journal> Archive
 :doctype: book
 :toc:
+:lj-archiver-book:
 :imagesdir: posts
 :lj-archiver-post-link-prefix: posts/
 
@@ -230,9 +231,20 @@ remains opt-in. A regenerated book (including during `--resume`) lists exactly
 the posts `index.adoc` lists. The `:imagesdir: posts` attribute preserves
 the `../assets/...` references used by included standalone posts. The internal
 post-link prefix similarly preserves click targets on images that link to
-other archived posts. To keep downloaded media and those post targets
-resolvable, run the converter from the archive root and leave its output beside
-`book.adoc`:
+other archived posts.
+
+Tables, embedded frames, and other structures the converter preserves as raw
+HTML have their links and image sources localized for wherever they are read.
+A link to another archived post of the same journal becomes `<id>.html` in a
+standalone post page and `posts/<id>.html` in the assembled book; a downloaded
+image stays `../assets/<name>` standalone and becomes `assets/<name>` in the
+book. Both variants are written into the post file and `book.adoc` selects
+between them with the `lj-archiver-book` attribute above, so converting either
+file resolves to the same asset on disk. Relative and protocol-relative links to
+anything not in the archive become absolute `https://` URLs.
+
+To keep downloaded media and those post targets resolvable, run the converter
+from the archive root and leave its output beside `book.adoc`:
 
 ```sh
 cd archive/news

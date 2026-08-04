@@ -2,6 +2,7 @@ use super::{RenderCtx, classify::is_stripped_chrome, render_specialcharacters_li
 use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     collections::{HashMap, HashSet},
     ops::Range,
@@ -140,20 +141,30 @@ pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) ->
         return render_source_listing(html);
     }
 
-    if !passthrough_is_safe(html) {
+    let Ok(scanned) = crate::html_scan::scan(html) else {
+        return render_source_listing(html);
+    };
+    if !passthrough_is_safe(&scanned) {
         return render_source_listing(html);
     }
 
-    let delimiter = safe_block_delimiter(html, '+');
-
-    format!("{delimiter}\n{html}\n{delimiter}\n\n")
+    // Every emitted fragment is checked for a preprocessor directive line, not
+    // just the ones a generated conditional would wrap: Asciidoctor evaluates
+    // those lines inside `++++` too, so an authored `ifdef::` swallows the rest
+    // of the document even standing alone.
+    match localized_passthrough_variants(html, &scanned, ctx) {
+        Some(variants)
+            if !variants
+                .emitted_html()
+                .any(contains_conditional_directive_line) =>
+        {
+            render_passthrough_variants(&variants)
+        }
+        _ => render_source_listing(html),
+    }
 }
 
-fn passthrough_is_safe(source_html: &str) -> bool {
-    let Ok(scanned) = crate::html_scan::scan(source_html) else {
-        return false;
-    };
-
+fn passthrough_is_safe(scanned: &crate::html_scan::ScannedHtml) -> bool {
     scanned.start_tags().iter().all(|tag| {
         SAFE_ELEMENTS.contains(&tag.name())
             && tag.attributes().iter().all(|attribute| {
@@ -165,6 +176,210 @@ fn passthrough_is_safe(source_html: &str) -> bool {
                     || has_safe_passthrough_url(attribute.decoded_value()))
             })
     })
+}
+
+/// How a reviewed passthrough's URLs came out. `Single` when every reference
+/// spells the same in a standalone post page and in the assembled book;
+/// `Conditional` when at least one does not, and both spellings must be emitted
+/// for `book.adoc` to select between.
+enum PassthroughVariants {
+    Single(String),
+    Conditional { standalone: String, book: String },
+}
+
+impl PassthroughVariants {
+    /// Every fragment this emits as raw HTML, in output order.
+    fn emitted_html(&self) -> impl Iterator<Item = &str> {
+        let (first, second) = match self {
+            Self::Single(html) => (html.as_str(), None),
+            Self::Conditional { standalone, book } => (standalone.as_str(), Some(book.as_str())),
+        };
+
+        std::iter::once(first).chain(second)
+    }
+}
+
+/// True when a line would be read as an AsciiDoc preprocessor conditional.
+/// Asciidoctor evaluates these *inside* `++++` blocks (verified on 2.0.26), so
+/// such a line either closes a generated conditional early or, unmatched,
+/// discards everything after it. Deliberately broader than Asciidoctor's own
+/// rule — which anchors at column zero and demands a `[...]` argument — because
+/// the cost of a false positive is one inert listing.
+fn contains_conditional_directive_line(html: &str) -> bool {
+    html.lines().any(|line| {
+        let trimmed = line.trim_start();
+        ["ifdef::", "ifndef::", "ifeval::", "endif::"]
+            .iter()
+            .any(|directive| trimmed.starts_with(directive))
+    })
+}
+
+/// Where the converted file that carries a raw reference will sit.
+#[derive(Clone, Copy)]
+enum ReadingContext {
+    /// A converted `posts/<id>.html`, one level below the archive root.
+    Standalone,
+    /// The assembled `book.html` at the archive root.
+    Book,
+}
+
+/// One reviewed URL value: the exact original bytes it occupies, and the
+/// attribute text replacing them in each reading context.
+struct ContextualReplacement<'a> {
+    range: Range<usize>,
+    standalone: Cow<'a, str>,
+    book: Cow<'a, str>,
+}
+
+impl ContextualReplacement<'_> {
+    fn text(&self, context: ReadingContext) -> &str {
+        match context {
+            ReadingContext::Standalone => &self.standalone,
+            ReadingContext::Book => &self.book,
+        }
+    }
+}
+
+/// The standalone and book *attribute text* for one reviewed raw URL value.
+/// `raw` is the value's original bytes and `decoded` its character-reference
+/// decoding; borrowed output is `raw` spliced back unchanged.
+fn contextual_replacements<'a>(
+    attribute: &str,
+    raw: &'a str,
+    decoded: &str,
+    rewriter: &crate::links::LinkRewriter,
+) -> Option<(Cow<'a, str>, Cow<'a, str>)> {
+    // A downloaded asset is addressed from `posts/<id>.html` standalone and from
+    // the archive root in the assembled book. Deciding on the *raw* bytes keeps
+    // both spellings original — the book's is the standalone's without its
+    // leading `../` — so no character reference in the value is disturbed. A
+    // decoded-only match cannot hide here: decoding never removes a literal
+    // `../` prefix, so raw agreement implies decoded agreement.
+    if attribute == "src"
+        && let Some(book) = raw.strip_prefix("../")
+        && book.starts_with("assets/")
+    {
+        return Some((Cow::Borrowed(raw), Cow::Borrowed(book)));
+    }
+
+    if let Some(filename) = rewriter.raw_post_html_filename(decoded) {
+        return Some((
+            Cow::Owned(crate::html_scan::escaped_attribute_value(&filename)),
+            Cow::Owned(crate::html_scan::escaped_attribute_value(&format!(
+                "posts/{filename}"
+            ))),
+        ));
+    }
+
+    let absolute =
+        crate::html_scan::escaped_attribute_value(&rewriter.absolute_raw_target(decoded)?);
+
+    Some((Cow::Owned(absolute.clone()), Cow::Owned(absolute)))
+}
+
+/// Rewrites only the exact `href`/`src` value ranges the scanner recovered,
+/// leaving every other byte of reviewed passthrough HTML untouched. Any missing
+/// range, unresolvable value, overlap, or ordering surprise returns `None`, and
+/// the caller degrades to one inert source listing.
+fn localized_passthrough_variants(
+    html: &str,
+    scanned: &crate::html_scan::ScannedHtml,
+    ctx: RenderCtx<'_>,
+) -> Option<PassthroughVariants> {
+    let Some(rewriter) = ctx.link_rewriter else {
+        // Direct conversion invents no archive context: safe scheme-less
+        // references stay source-relative and safe hosted references stay
+        // hosted, exactly as delivered.
+        return Some(PassthroughVariants::Single(html.to_string()));
+    };
+
+    let mut replacements: Vec<ContextualReplacement<'_>> = Vec::new();
+    for tag in scanned.start_tags() {
+        for attribute in tag.attributes() {
+            if !matches!(attribute.name(), "href" | "src") {
+                continue;
+            }
+            let range = attribute.value_range()?;
+            let (standalone, book) = contextual_replacements(
+                attribute.name(),
+                html.get(range.clone())?,
+                attribute.decoded_value(),
+                rewriter,
+            )?;
+            replacements.push(ContextualReplacement {
+                range,
+                standalone,
+                book,
+            });
+        }
+    }
+
+    // The scan reports tags in source order and a tag's own attributes in source
+    // order, so this only reorders across the two; sorting first makes the
+    // disjointness check below decide the splice's own iteration order.
+    replacements.sort_by_key(|replacement| (replacement.range.start, replacement.range.end));
+    let mut previous_end = 0;
+    for replacement in &replacements {
+        if replacement.range.start < previous_end || replacement.range.end > html.len() {
+            return None;
+        }
+        previous_end = replacement.range.end;
+    }
+
+    let splice = |context| {
+        let mut output = String::with_capacity(html.len());
+        let mut cursor = 0;
+        for replacement in &replacements {
+            output.push_str(&html[cursor..replacement.range.start]);
+            output.push_str(replacement.text(context));
+            cursor = replacement.range.end;
+        }
+        output.push_str(&html[cursor..]);
+        output
+    };
+
+    let standalone = splice(ReadingContext::Standalone);
+    let book = splice(ReadingContext::Book);
+
+    // Revalidate both variants under the same safe-element/attribute/URL policy
+    // the original passed. A replacement that produced anything unsafe, or that
+    // no longer scans, fails closed.
+    for variant in [&standalone, &book] {
+        let rescanned = crate::html_scan::scan(variant).ok()?;
+        if !passthrough_is_safe(&rescanned) {
+            return None;
+        }
+    }
+
+    if standalone == book {
+        return Some(PassthroughVariants::Single(standalone));
+    }
+
+    Some(PassthroughVariants::Conditional { standalone, book })
+}
+
+fn render_passthrough_variants(variants: &PassthroughVariants) -> String {
+    match variants {
+        PassthroughVariants::Single(html) => {
+            let delimiter = safe_block_delimiter(html, '+');
+
+            format!("{delimiter}\n{html}\n{delimiter}\n\n")
+        }
+        PassthroughVariants::Conditional { standalone, book } => {
+            let attribute = crate::links::BOOK_ATTRIBUTE;
+            let standalone_delimiter = safe_block_delimiter(standalone, '+');
+            let book_delimiter = safe_block_delimiter(book, '+');
+
+            format!(
+                "ifndef::{attribute}[]\n\
+                 {standalone_delimiter}\n{standalone}\n{standalone_delimiter}\n\
+                 endif::[]\n\
+                 ifdef::{attribute}[]\n\
+                 {book_delimiter}\n{book}\n{book_delimiter}\n\
+                 endif::[]\n\n"
+            )
+        }
+    }
 }
 
 pub(super) fn render_source_listing(content: &str) -> String {

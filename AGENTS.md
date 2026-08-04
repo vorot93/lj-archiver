@@ -281,6 +281,35 @@ node outside it — content escaping an inner owner lands inside the outer one a
 is already `inside_owner`. Fenced by `coverage_classifies_nothing_inside_an_owner`;
 nested `<div>`/`<span>` cannot fence it, as they short-circuit before the probe.
 
+Reviewed raw passthrough HTML stays byte-identical for every non-URL byte. Only
+the exact `href`/`src` **value ranges** the scanner recovered are replaced, the
+replacements are HTML-attribute encoded through
+`html_scan::escaped_attribute_value` (shared with `media`'s own splice), and both
+resulting variants are re-scanned and re-checked against the same
+safe-element/safe-attribute/safe-URL policy; a missing range, an unresolvable
+value, an overlap, or a failed revalidation degrades to one inert source listing.
+The downloaded-asset case is decided on the *raw* bytes, not the decoded value,
+so both spellings stay original — the book's is the standalone's minus its
+leading `../` — and no character reference in the value is disturbed. When a
+URL's correct spelling depends on where the converted file sits, the block is
+emitted twice under generated `ifndef::lj-archiver-book[]` /
+`ifdef::lj-archiver-book[]` conditionals, with delimiters chosen independently
+per variant. `book.adoc` defines `lj-archiver-book`; standalone posts do not, so
+exactly one variant reaches converter output. AsciiDoc attribute *substitutions*
+are deliberately not enabled inside raw HTML — authored raw text would then
+activate attribute references — which is why context is selected with outer
+conditionals instead. One hard-won constraint: Asciidoctor evaluates
+`ifdef`/`ifndef`/`ifeval`/`endif` lines **inside** `++++` blocks (verified on
+2.0.26 — an `endif::[]` inside a passthrough raises "unmatched preprocessor
+directive", and an unmatched `ifdef::` silently discards the rest of the
+document), so raw HTML containing such a line fails closed to a listing. That
+check covers *every* emitted fragment, not only the ones a generated conditional
+wraps, because the lone-block case loses content too. `include::` inside a
+passthrough is likewise honoured by Asciidoctor and is **not** yet covered —
+see the standing note in the security section. Direct conversion without a
+`LinkRewriter` invents no archive context at all: references stay exactly as
+delivered.
+
 The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
 Renderer-owned inline output (strong, emphasis, code, anchors, linked images) is
@@ -588,6 +617,14 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   the image macro) and retain only the sanitized visible label. Do not add a
   per-call-site fallback that sanitizes an href without consulting this policy —
   that is exactly the regression these helpers exist to prevent.
+- Asciidoctor's preprocessor also honours `include::` **inside** a `++++`
+  passthrough block, and the `asciidoctor` CLI's default safe mode is `unsafe`,
+  so an authored `include::<path>[]` line inside reviewed raw HTML would splice
+  a local file into the converted output. Reviewed passthrough currently fails
+  closed only on the four *conditional* directives (see "Implementation
+  Guidance"); extending that set to `include::` is a separate, wanted change
+  that needs its own test and README pass. Reproduce with
+  `printf 'x\n++++\n<p>a</p>\ninclude::secret.adoc[]\n++++\n' | asciidoctor --embedded -`.
 - Comments on modern LiveJournal are JavaScript-loaded and absent from static HTML, so a static fetch cannot archive comment threads.
 - `:lj-author:` is the journal name, not the poster — the canonical account name from `Site.entry.journal` when its `ditemid` matches (e.g. `evo_lutio`, not the `evo-lutio` subdomain spelling, and never `users` for `users.livejournal.com` posts). The real poster is captured separately as `:lj-poster:` from `Site.entry`; for personal journals the poster equals the journal name.
 

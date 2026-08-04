@@ -10,6 +10,11 @@ use url::Url;
 
 pub(crate) const POST_LINK_PREFIX_ATTRIBUTE: &str = "lj-archiver-post-link-prefix";
 pub(crate) const POST_LINK_PREFIX_REFERENCE: &str = "{lj-archiver-post-link-prefix}";
+/// Defined by `book.adoc` and by nothing else. Generated `ifdef`/`ifndef`
+/// conditionals select the book or standalone variant of a raw passthrough
+/// whose URLs depend on where the converted file sits. Reserved: never emit it
+/// from post content.
+pub(crate) const BOOK_ATTRIBUTE: &str = "lj-archiver-book";
 const PENDING_LINK_SEPARATOR: char = '\u{1f}';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +176,34 @@ impl LinkRewriter {
     pub fn absolute_target(&self, href: &str) -> Option<String> {
         let url = self.resolved_http_url(href)?;
         Some(sanitize_macro_target(url.as_str()))
+    }
+
+    /// The *converted-HTML* filename of an exported post this reference points
+    /// at, e.g. `166512.html`. Raw HTML is copied verbatim into the converted
+    /// document, so it must address the converter's output file, not the
+    /// `.adoc` source that [`Self::xref_target`] returns.
+    ///
+    /// Unlike the macro targets this records no pending link: a raw block whose
+    /// URL depends on context is emitted twice, and a pending token must occur
+    /// exactly once.
+    pub(crate) fn raw_post_html_filename(&self, href: &str) -> Option<String> {
+        let url = self.resolved_http_url(href)?;
+        let (journal, id) = post_ref_from_url(&url)?;
+        if !journals_alias(&journal, &self.journal) {
+            return None;
+        }
+        let filename = self.targets.get(&id)?;
+
+        Some(format!("{}.html", filename.strip_suffix(".adoc")?))
+    }
+
+    /// The hosted absolute URL `href` resolves to against the delivered page,
+    /// unsanitized. Raw HTML attribute values are HTML-encoded by the caller;
+    /// they are not AsciiDoc macro targets, so [`sanitize_macro_target`]'s
+    /// percent-encoding of `[`, `]`, a leading `:`, `::` and `+++` — all of
+    /// which are ordinary URL bytes — must not be applied here.
+    pub(crate) fn absolute_raw_target(&self, href: &str) -> Option<String> {
+        Some(self.resolved_http_url(href)?.to_string())
     }
 
     fn resolved_http_url(&self, href: &str) -> Option<Url> {
