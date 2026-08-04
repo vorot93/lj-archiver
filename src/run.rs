@@ -1115,8 +1115,20 @@ mod tests {
         );
     }
 
+    /// An authored token *prefix* that abuts the generated token also composes a
+    /// complete inline macro across that boundary — the authored
+    /// `lj-archiver-link:` reaches the `[Seven]` the generated fragment supplies
+    /// — so the renderer's composed-fragment scan neutralizes it before the
+    /// namespace is ever drawn a second time. The forged span then no longer
+    /// equals the recorded token, `validate_pending_links` counts one
+    /// occurrence, and the first namespace stands.
+    ///
+    /// This says nothing about whether a shared-boundary collision is reachable
+    /// by some other shape. Retry and exhaustion are pinned independently by
+    /// `pending_render_retries_collision_then_succeeds` and
+    /// `pending_render_exhausts_after_four_colliding_namespaces`.
     #[test]
-    fn pending_render_retries_shared_boundary_collision_without_generated_residual() {
+    fn pending_render_neutralizes_an_authored_shared_boundary_prefix() {
         let namespaces = [COLLIDING_NAMESPACE, SAFE_NAMESPACE];
         let mut calls = 0;
         let rendered = render_pending_post_with(
@@ -1132,11 +1144,20 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(calls, 2);
+        // Both halves matter. The escaped authored prefix is what makes the
+        // single draw correct; without asserting it, `calls == 1` would pass
+        // just as well if the renderer had stopped emitting the authored text
+        // at all.
+        assert!(
+            rendered.contents.contains(&format!(
+                "{PENDING_SEPARATOR}\\lj-archiver-link:{COLLIDING_NAMESPACE}:7:0"
+            )),
+            "authored prefix was not neutralized: {:?}",
+            rendered.contents
+        );
+        assert_eq!(calls, 1);
         validate_pending_links(&rendered.contents, &rendered.links).unwrap();
         let safe_token = rendered.links[0].token.clone();
-        let safe_body = &safe_token
-            [PENDING_SEPARATOR.len_utf8()..safe_token.len() - PENDING_SEPARATOR.len_utf8()];
         let resolved =
             resolve_pending_links(&rendered.contents, &rendered.links, &HashSet::from([7]))
                 .unwrap()
@@ -1144,9 +1165,17 @@ mod tests {
 
         assert!(resolved.contains("xref:7.adoc[Seven]"), "got: {resolved:?}");
         assert!(!resolved.contains(&safe_token), "got: {resolved:?}");
+        // The residual check used to compare against the *drawn* token's body,
+        // which could only ever differ from the authored forgery because a retry
+        // had changed the namespace. With the prefix neutralized there is no
+        // retry and the two bodies are the same string, so state the property
+        // the check was after directly and namespace-independently: nothing that
+        // reads as the opening of a pending token survives resolution. The
+        // escaped authored residue does not, because the escape sits between the
+        // separator and the marker.
         assert!(
-            !resolved.contains(&format!("{safe_body}{PENDING_SEPARATOR}")),
-            "got: {resolved:?}"
+            !resolved.contains(&format!("{PENDING_SEPARATOR}lj-archiver-link:")),
+            "a pending-token opening survived resolution: {resolved:?}"
         );
     }
 
