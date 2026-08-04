@@ -3625,6 +3625,417 @@ mod tests {
         }
     }
 
+    const SPLIT_SCRIPT: &str = "&lt;script&gt;alert(document.domain)&lt;/script&gt;";
+    const SPLIT_SCRIPT_TEXT: &str = "<script>alert(document.domain)</script>";
+
+    /// The five verified reproductions of the split-run inline injection class,
+    /// each with the single-run control that was always inert. A generated
+    /// inline fragment — very often the *empty* one `<i></i>` renders to —
+    /// split the authored run, so neither half held a whole construct and no
+    /// per-run scanner fired on either.
+    #[test]
+    fn split_authored_inline_constructs_are_escaped_like_their_single_run_controls() {
+        for (split, control, split_expected, control_expected) in [
+            // R1 — raw executable `<script>` through a split inline passthrough.
+            (
+                format!("<p>+++<i></i>{SPLIT_SCRIPT}+++</p>"),
+                format!("<p>+++{SPLIT_SCRIPT}+++</p>"),
+                format!("\\+++{SPLIT_SCRIPT_TEXT}+++\n\n"),
+                format!("\\+++{SPLIT_SCRIPT_TEXT}+++\n\n"),
+            ),
+            // R2 — `javascript:` anchor through a split inline macro.
+            (
+                "<p>link:javascript<i></i>:alert(1)[click]</p>".to_string(),
+                "<p>link:javascript:alert(1)[click]</p>".to_string(),
+                "\\link:\\javascript:alert(1)[click]\n\n".to_string(),
+                "\\link:\\javascript:alert(1)[click]\n\n".to_string(),
+            ),
+            // R3 — a remote fetch on every read, which `--no-media` never sees.
+            (
+                "<p>image:https://evil.example/track.png<i></i>[x]</p>".to_string(),
+                "<p>image:https://evil.example/track.png[x]</p>".to_string(),
+                "\\image:\\https://evil.example/track.png[x]\n\n".to_string(),
+                "\\image:\\https://evil.example/track.png[x]\n\n".to_string(),
+            ),
+            // R4 — hijacking the archive's own post-link prefix attribute.
+            (
+                "<p>{set:lj-archiver-post-link-prefix<i></i>:javascript:alert(1)//}</p>"
+                    .to_string(),
+                "<p>{set:lj-archiver-post-link-prefix:javascript:alert(1)//}</p>".to_string(),
+                "\\{set:lj-archiver-post-link-prefix:javascript:alert(1)//}\n\n".to_string(),
+                "\\{set:lj-archiver-post-link-prefix:javascript:alert(1)//}\n\n".to_string(),
+            ),
+            // R5 — the escape lands immediately before the dangling prefix, not
+            // at the logical line start, which left both a live macro and a
+            // visible stray backslash.
+            (
+                format!(r#"<p>hi pass:<a href="">{SPLIT_SCRIPT}</a></p>"#),
+                format!(r#"<p>pass:<a href="">{SPLIT_SCRIPT}</a></p>"#),
+                format!("hi \\pass:[{SPLIT_SCRIPT_TEXT}]\n\n"),
+                format!("\\pass:[{SPLIT_SCRIPT_TEXT}]\n\n"),
+            ),
+        ] {
+            assert_eq!(html_to_adoc(&split), split_expected, "split {split}");
+            assert_eq!(
+                html_to_adoc(&control),
+                control_expected,
+                "control {control}"
+            );
+        }
+    }
+
+    /// R5's other half. The same wrong insertion point served the block-macro
+    /// prefix family, and its correct mid-line answer is *not* the same one.
+    ///
+    /// An inline macro's escape belongs immediately before its name, which at a
+    /// line start happens to be the line start — that coincidence is why the old
+    /// insertion point looked right for as long as only line starts were tested.
+    /// A *block* macro has no mid-line reading at all (`BlockMacroRx` is
+    /// anchored at `^`, and every builtin inline macro excludes a leading `:`
+    /// from its target), so the answer there is that nothing needs deactivating:
+    /// the line-start case stays with the block-line guard that owns it, and the
+    /// second colon the description-list neutralizer already replaced stays
+    /// replaced.
+    #[test]
+    fn a_dangling_macro_prefix_is_escaped_before_the_name_not_the_line() {
+        for (html, expected) in [
+            // A macro name that starts the line: both answers coincide.
+            (r#"<p>pass:q<a href="">x</a></p>"#, "\\pass:q[x]\n\n"),
+            (
+                r#"<p>image:t.png<a href="">x</a></p>"#,
+                "\\image:t.png[x]\n\n",
+            ),
+            // Mid-line the escape moves to the name, not to column zero.
+            (r#"<p>hi pass:q<a href="">x</a></p>"#, "hi \\pass:q[x]\n\n"),
+            (
+                r#"<p>hi image:t.png<a href="">x</a></p>"#,
+                "hi \\image:t.png[x]\n\n",
+            ),
+            // A block-macro prefix keeps the line-start guard that owns it.
+            (
+                r#"<p>include::<a href="x">y</a></p>"#,
+                "\\include::x[y]\n\n",
+            ),
+            (
+                r#"<p>hi include::<a href="x">y</a></p>"#,
+                "hi include:pass:[:]x[y]\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    /// Coverage by vocabulary rather than by example: every scanner in
+    /// `neutralize_inline_adoc_syntax`, in all three split directions.
+    #[test]
+    fn every_inline_scanner_is_covered_in_every_split_direction() {
+        for (scanner, direction, html, expected) in [
+            // Attribute references.
+            (
+                "attribute reference",
+                "authored then generated",
+                "<p>{set:a:javascript:alert(1)//<b>}</b></p>",
+                "\\{set:a:javascript:alert(1)//*}*\n\n",
+            ),
+            (
+                "attribute reference",
+                "generated then authored",
+                "<p><b>{set:a:javascript:alert(1)//</b>}</p>",
+                "*\\{set:a:javascript:alert(1)//*}\n\n",
+            ),
+            (
+                "attribute reference",
+                "authored, generated, authored",
+                "<p>{set:a:javascript:alert(1)//<i></i>}</p>",
+                "\\{set:a:javascript:alert(1)//}\n\n",
+            ),
+            // Inline passthrough macros.
+            (
+                "passthrough macro",
+                "authored then generated",
+                r#"<p>hi pass:q<a href="">x</a></p>"#,
+                "hi \\pass:q[x]\n\n",
+            ),
+            (
+                "passthrough macro",
+                "generated then authored",
+                "<p><b>pass:</b>[&lt;script&gt;alert(1)&lt;/script&gt;]</p>",
+                "*\\pass:*[<script>alert(1)</script>]\n\n",
+            ),
+            (
+                "passthrough macro",
+                "authored, generated, authored",
+                "<p>pass<i></i>:[&lt;script&gt;alert(1)&lt;/script&gt;]</p>",
+                "\\pass:[<script>alert(1)</script>]\n\n",
+            ),
+            // Inline macros.
+            (
+                "inline macro",
+                "authored then generated",
+                r#"<p>image:https://evil.example/t.png<a href="">x</a></p>"#,
+                "\\image:\\https://evil.example/t.png[x]\n\n",
+            ),
+            (
+                "inline macro",
+                "generated then authored",
+                "<p><b>image:https://evil.example/t.png</b>[x]</p>",
+                "*\\image:\\https://evil.example/t.png*[x]\n\n",
+            ),
+            (
+                "inline macro",
+                "authored, generated, authored",
+                "<p>image:https://evil.example/t.png<i></i>[x]</p>",
+                "\\image:\\https://evil.example/t.png[x]\n\n",
+            ),
+            // Inline passthrough delimiters.
+            (
+                "passthrough delimiters",
+                "authored then generated",
+                "<p>+++&lt;script&gt;alert(1)&lt;/script&gt;<b>+++</b></p>",
+                "\\+++<script>alert(1)</script>*+++*\n\n",
+            ),
+            (
+                "passthrough delimiters",
+                "generated then authored",
+                "<p><b>+++</b>&lt;script&gt;alert(1)&lt;/script&gt;+++</p>",
+                "*\\+++*<script>alert(1)</script>+++\n\n",
+            ),
+            (
+                "passthrough delimiters",
+                "authored, generated, authored",
+                "<p>+++<i></i>&lt;script&gt;alert(1)&lt;/script&gt;+++</p>",
+                "\\+++<script>alert(1)</script>+++\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{scanner}, {direction}");
+        }
+    }
+
+    /// The macro half of the class is closed for the whole `name:target[...]`
+    /// vocabulary, not for the handful of names the reproductions happened to
+    /// use: the scanner keys on the shape, so every name behaves alike.
+    #[test]
+    fn the_whole_inline_macro_vocabulary_is_closed_against_splitting() {
+        for name in [
+            "link",
+            "mailto",
+            "image",
+            "icon",
+            "xref",
+            "kbd",
+            "btn",
+            "menu",
+            "footnote",
+            "footnoteref",
+            "stem",
+            "indexterm",
+            "pass",
+            "unregistered-extension",
+        ] {
+            let split = html_to_adoc(&format!("<p>{name}:evil.example/t<i></i>[x]</p>"));
+            let control = html_to_adoc(&format!("<p>{name}:evil.example/t[x]</p>"));
+
+            assert_eq!(split, control, "{name}");
+            assert!(split.starts_with('\\'), "{name} was left live in {split:?}");
+        }
+    }
+
+    /// A generated fragment splits an authored run across a hard break just as
+    /// well as within a line: an inline `+++` pair spans line breaks inside one
+    /// paragraph, so the composed-line scan has to as well.
+    #[test]
+    fn a_generated_hard_break_cannot_split_an_inline_passthrough_pair() {
+        assert_eq!(
+            html_to_adoc("<p>+++<br>&lt;script&gt;alert(1)&lt;/script&gt;<br>+++</p>"),
+            "\\+++ +\n<script>alert(1)</script> +\n+++\n\n"
+        );
+    }
+
+    /// The block-children path a blockquote renders through appends generated
+    /// inline output too, so it composes authored runs the same way.
+    #[test]
+    fn blockquote_block_children_cannot_split_an_authored_construct() {
+        for (html, expected) in [
+            (
+                "<blockquote>+++<b>x</b>&lt;script&gt;alert(1)&lt;/script&gt;+++</blockquote>",
+                "[quote]\n____\n\\+++*x*<script>alert(1)</script>+++\n____\n\n",
+            ),
+            (
+                "<blockquote>link:javascript<b>x</b>:alert(1)[c]</blockquote>",
+                "[quote]\n____\n\\link:javascript*x*:alert(1)[c]\n____\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    /// The other half of the rule: a construct one emitted fragment owns
+    /// outright keeps the meaning its producer gave it. Every row here is
+    /// renderer-generated output that must convert exactly as before —
+    /// escaping any of it breaks working links, images and code spans.
+    #[test]
+    fn generated_inline_constructs_are_never_escaped_by_composition() {
+        for (html, expected) in [
+            ("<p>a <code>x</code> y</p>", "a `pass:c[x]` y\n\n"),
+            (
+                r#"<p><a href="https://e.example/x">t</a></p>"#,
+                "https://e.example/x[t]\n\n",
+            ),
+            (
+                r#"<p>see <a href="https://e.example/x">t</a> now</p>"#,
+                "see https://e.example/x[t] now\n\n",
+            ),
+            (
+                r#"<p><img src="https://e.example/i.png" alt="a"></p>"#,
+                "image::https://e.example/i.png[a]\n\n",
+            ),
+            (
+                concat!(
+                    r#"<p>x <a href="https://e.example/p">"#,
+                    r#"<img src="https://e.example/i.png" alt="a"></a> y</p>"#,
+                ),
+                "x image:https://e.example/i.png[a,link=https://e.example/p] y\n\n",
+            ),
+            (
+                "<p>a <b>bold</b> b <em>it</em> c</p>",
+                "a *bold* b _it_ c\n\n",
+            ),
+            ("<p>{not-an-attr} plain</p>", "\\{not-an-attr} plain\n\n"),
+            ("<p>C++ and +++ alone</p>", "C++ and +++ alone\n\n"),
+            ("<p>a<i></i>b</p>", "ab\n\n"),
+            ("<p>1 + 2 <b>=</b> 3</p>", "1 + 2 *=* 3\n\n"),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    /// Link localization emits generated attribute references and `xref:`
+    /// macros. They must stay live, whatever authored text sits beside them.
+    #[test]
+    fn localized_cross_post_links_survive_beside_authored_text() {
+        let rewriter = news_rewriter();
+        let adoc = html_to_adoc_with_links(
+            concat!(
+                r#"<p>before<a href="https://news.livejournal.com/166512.html">other</a>after</p>"#,
+                r#"<p>x<a href="https://news.livejournal.com/166512.html">"#,
+                r#"<img src="https://cdn.example.test/p.jpg" alt="a"></a>y</p>"#,
+            ),
+            Some(&rewriter),
+        );
+
+        assert!(adoc.contains("xref:166512.adoc[other]"), "{adoc:?}");
+        assert!(
+            adoc.contains("link={lj-archiver-post-link-prefix}166512.adoc]"),
+            "{adoc:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn split_authored_inline_constructs_convert_inert() {
+        for html in [
+            format!("<p>+++<i></i>{SPLIT_SCRIPT}+++</p>"),
+            format!("<p><b>+++</b>{SPLIT_SCRIPT}+++</p>"),
+            format!("<p>+++<br>{SPLIT_SCRIPT}<br>+++</p>"),
+            format!("<blockquote>+++<b>x</b>{SPLIT_SCRIPT}+++</blockquote>"),
+            "<p>link:javascript<i></i>:alert(1)[click]</p>".to_string(),
+            "<p>link:javascript:alert(1)<i></i>[click]</p>".to_string(),
+            "<p><b>link:javascript</b>:alert(1)[click]</p>".to_string(),
+            "<p><a>link:javascript</a>:alert(1)[click]</p>".to_string(),
+            "<p>image:https://evil.example/track.png<i></i>[x]</p>".to_string(),
+            "<p><b>image:https://evil.example/track.png</b>[x]</p>".to_string(),
+            format!(r#"<p>hi pass:<a href="">{SPLIT_SCRIPT}</a></p>"#),
+            format!("<p><b>pass:</b>[{SPLIT_SCRIPT}]</p>"),
+        ] {
+            let converted = convert_with_asciidoctor(&html_to_adoc(&html));
+            let document = Html::parse_document(&converted);
+
+            assert!(
+                !converted.contains("<script"),
+                "raw script reached the converted output for {html}: {converted}"
+            );
+            assert!(
+                document
+                    .select(&Selector::parse("a").unwrap())
+                    .filter_map(|anchor| anchor.attr("href"))
+                    .all(|href| !href.to_ascii_lowercase().starts_with("javascript:")),
+                "a javascript: target reached the converted output for {html}: {converted}"
+            );
+            assert!(
+                document
+                    .select(&Selector::parse("img").unwrap())
+                    .filter_map(|image| image.attr("src"))
+                    .all(|src| !src.contains("evil.example")),
+                "a remote image fetch reached the converted output for {html}: {converted}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn a_split_attribute_assignment_cannot_redirect_a_following_xref() {
+        for html in [
+            "<p>{set:lj-archiver-post-link-prefix<i></i>:javascript:alert(1)//}</p>",
+            "<p>{set:lj-archiver-post-link-prefix:javascript:alert(1)//<b>x</b>}</p>",
+            "<p><b>{set:lj-archiver-post-link-prefix:javascript:alert(1)//</b>}</p>",
+        ] {
+            let adoc = format!(
+                concat!(
+                    "ifndef::lj-archiver-post-link-prefix",
+                    "[:lj-archiver-post-link-prefix:]\n\n",
+                    "{}\n",
+                    "xref:{{lj-archiver-post-link-prefix}}166511.adoc[other post]\n",
+                ),
+                html_to_adoc(html),
+            );
+            let converted = convert_with_asciidoctor(&adoc);
+            let document = Html::parse_document(&converted);
+
+            assert!(
+                document
+                    .select(&Selector::parse("a").unwrap())
+                    .filter_map(|anchor| anchor.attr("href"))
+                    .all(|href| href == "166511.html"),
+                "the post-link prefix was hijacked for {html}: {converted}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn localized_cross_post_links_still_resolve_beside_authored_text() {
+        let rewriter = news_rewriter();
+        let adoc = html_to_adoc_with_links(
+            concat!(
+                r#"<p>before<a href="https://news.livejournal.com/166512.html">other</a>after</p>"#,
+                r#"<p>x<a href="https://news.livejournal.com/166512.html">"#,
+                r#"<img src="https://cdn.example.test/p.jpg" alt="a"></a>y</p>"#,
+            ),
+            Some(&rewriter),
+        );
+        let converted = convert_with_asciidoctor(&format!(
+            "ifndef::lj-archiver-post-link-prefix[:lj-archiver-post-link-prefix:]\n\n{adoc}"
+        ));
+        let document = Html::parse_document(&converted);
+        let hrefs: Vec<_> = document
+            .select(&Selector::parse("a").unwrap())
+            .filter_map(|anchor| anchor.attr("href"))
+            .collect();
+
+        // The anchor resolves through `xref:`, the linked image through the
+        // `link=` attribute prefix — one localized `.html`, one localized
+        // `.adoc` the book resolves — and both survive the authored words that
+        // abut them with no separating space.
+        assert_eq!(hrefs, ["166512.html", "166512.adoc"], "got: {converted}");
+        assert!(!converted.contains('\\'), "got: {converted}");
+        assert!(
+            document
+                .select(&Selector::parse("img").unwrap())
+                .any(|image| image.attr("src") == Some("https://cdn.example.test/p.jpg")),
+            "the localized linked image lost its source: {converted}"
+        );
+    }
+
     #[test]
     fn renders_script_as_visible_source_text_instead_of_passthrough() {
         let adoc = html_to_adoc("<script>alert(1)</script>");

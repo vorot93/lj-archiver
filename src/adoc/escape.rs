@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 pub(crate) fn normalize_inline_text(text: &str) -> String {
     let mut output = String::new();
     let mut in_whitespace = false;
@@ -450,18 +452,22 @@ impl MacroScanSteps {
     }
 }
 
-fn bracket_before_whitespace(bytes: &[u8], scan_steps: &mut MacroScanSteps) -> Vec<bool> {
-    let mut result = vec![false; bytes.len() + 1];
-    let mut bracket_is_next = false;
+/// For every offset, the position of the next `[` reachable from it without
+/// crossing whitespace — a macro target runs up to its opening bracket and
+/// stops at the first space — or `bytes.len()` when there is none. One reverse
+/// pass keeps each candidate's target check O(1).
+fn bracket_before_whitespace(bytes: &[u8], scan_steps: &mut MacroScanSteps) -> Vec<usize> {
+    let mut result = vec![bytes.len(); bytes.len() + 1];
+    let mut next_bracket = bytes.len();
 
     for (cursor, byte) in bytes.iter().enumerate().rev() {
         scan_steps.add(1);
         if *byte == b'[' {
-            bracket_is_next = true;
+            next_bracket = cursor;
         } else if byte.is_ascii_whitespace() {
-            bracket_is_next = false;
+            next_bracket = bytes.len();
         }
-        result[cursor] = bracket_is_next;
+        result[cursor] = next_bracket;
     }
 
     result
@@ -488,21 +494,32 @@ fn is_inline_macro_at(
     bytes: &[u8],
     start: usize,
     name_end: usize,
-    bracket_before_whitespace: &[bool],
+    bracket_before_whitespace: &[usize],
 ) -> bool {
+    inline_macro_bracket(bytes, start, name_end, bracket_before_whitespace).is_some()
+}
+
+/// The position of the `[` that opens this macro's attribute list, or `None`
+/// when `start..name_end` does not name a macro at all.
+fn inline_macro_bracket(
+    bytes: &[u8],
+    start: usize,
+    name_end: usize,
+    bracket_before_whitespace: &[usize],
+) -> Option<usize> {
     if bytes.get(name_end) != Some(&b':') {
-        return false;
+        return None;
     }
 
     let target_start = name_end + 1;
     if bytes.get(target_start) == Some(&b'[') {
-        return is_targetless_builtin_macro(&bytes[start..name_end]);
+        return is_targetless_builtin_macro(&bytes[start..name_end]).then_some(target_start);
     }
 
     bracket_before_whitespace
         .get(target_start)
         .copied()
-        .unwrap_or(false)
+        .filter(|bracket| *bracket < bytes.len())
 }
 
 fn is_targetless_builtin_macro(name: &[u8]) -> bool {
@@ -546,16 +563,22 @@ fn neutralize_inline_passthrough_macros(text: &str) -> String {
 }
 
 fn starts_inline_passthrough_macro(text: &str, start: usize) -> bool {
+    inline_passthrough_macro_bracket(text, start).is_some()
+}
+
+/// The position of the `[` that opens the passthrough macro beginning at
+/// `start`, or `None` when no passthrough macro begins there.
+fn inline_passthrough_macro_bracket(text: &str, start: usize) -> Option<usize> {
     let bytes = text.as_bytes();
 
     if !is_inline_passthrough_token_boundary(bytes, start) {
-        return false;
+        return None;
     }
 
     let mut cursor = start + "pass:".len();
 
     if bytes.get(cursor) == Some(&b'[') {
-        return true;
+        return Some(cursor);
     }
 
     let qualifier_start = cursor;
@@ -563,7 +586,7 @@ fn starts_inline_passthrough_macro(text: &str, start: usize) -> bool {
         cursor += 1;
     }
 
-    cursor > qualifier_start && bytes.get(cursor) == Some(&b'[')
+    (cursor > qualifier_start && bytes.get(cursor) == Some(&b'[')).then_some(cursor)
 }
 
 fn is_inline_passthrough_token_boundary(bytes: &[u8], start: usize) -> bool {
@@ -1047,31 +1070,21 @@ fn line_is_anchored_active_adoc_syntax(line: &str) -> bool {
 /// The replacement for the logical line `line` immediately before a
 /// renderer-generated inline fragment is appended to it, or `None` when the
 /// line needs no change.
+///
+/// One case only: the line-start neutralizer replaced a trailing `::` with
+/// `:pass:[:]` because it read as a description-list marker, and the fragment
+/// about to be appended makes `::` ineligible as one. Restore the delimiter and
+/// take the escape a block macro needs instead.
+///
+/// A *dangling* macro prefix — `pass:`, `pass:q`, `name::` — that the appended
+/// fragment's own `[` completes needs no handling here: the composed-fragment
+/// scan sees the finished construct and escapes it immediately before its name,
+/// which is where the escape belongs mid-line and coincides with the line start
+/// when the name starts the line.
 pub(crate) fn neutralize_pending_plain_text_before_generated_inline(line: &str) -> Option<String> {
-    if let Some(prefix) = line.strip_suffix(":pass:[:]")
-        && is_block_macro_prefix(prefix)
-    {
-        // This is only reached immediately before appending a
-        // renderer-generated inline fragment. That fragment makes `::`
-        // ineligible as a description-list delimiter; preserve the existing
-        // escaped macro-prefix output without applying this to user text
-        // before a line break.
-        return Some(format!("\\{prefix}::"));
-    }
+    let prefix = line.strip_suffix(":pass:[:]")?;
 
-    if ends_with_block_macro_prefix(line) || ends_with_inline_passthrough_macro_prefix(line) {
-        return Some(format!("\\{line}"));
-    }
-
-    None
-}
-
-fn ends_with_block_macro_prefix(text: &str) -> bool {
-    let Some(prefix) = text.strip_suffix("::") else {
-        return false;
-    };
-
-    is_block_macro_prefix(prefix)
+    is_block_macro_prefix(prefix).then(|| format!("\\{prefix}::"))
 }
 
 fn is_block_macro_prefix(text: &str) -> bool {
@@ -1081,24 +1094,219 @@ fn is_block_macro_prefix(text: &str) -> bool {
         })
 }
 
-/// True when `text` ends with an inline passthrough macro prefix — `pass:`, or
-/// `pass:` plus a qualifier list — that the `[` opening the generated fragment
-/// about to be appended would complete.
+/// The byte offsets in `text[window]` that need a `\` so that no inline
+/// AsciiDoc construct composed out of more than one emitted fragment stays
+/// live.
 ///
-/// The prefix must run to the *end* of the line. A `pass:` macro that already
-/// closed earlier on it (the code renderer's own `` `pass:c[x]` ``, the line
-/// guard, or a neutralized description-list marker) is complete rather than
-/// dangling, and escaping the line for one puts a visible backslash in front of
-/// ordinary prose.
-fn ends_with_inline_passthrough_macro_prefix(text: &str) -> bool {
-    let Some(pass_start) = text.rfind("pass:") else {
-        return false;
+/// `contained` answers "does one single emitted fragment hold this whole byte
+/// range?". A construct one fragment holds keeps exactly the meaning its
+/// producer gave it: a renderer-generated `image:`, `xref:` or `` `pass:c[]` ``
+/// stays live, and an authored run stays as the run neutralizer left it. A
+/// construct no single fragment holds belongs to no producer, and that — and
+/// only that — is what gets escaped.
+///
+/// Coverage is by vocabulary rather than by case: this walks exactly the four
+/// scanners of [`neutralize_inline_adoc_syntax`], so an authored construct is
+/// caught whichever direction it composed in (authored then generated,
+/// generated then authored, or authored around a generated fragment, including
+/// the empty one an `<i></i>` renders to).
+///
+/// The window is the current block. Everything before it is finished, verbatim
+/// block bytes; inside it, the three line-scoped scanners restrict themselves
+/// (an attribute reference needs its `}` before the line break, a macro target
+/// stops at whitespace), while an inline `+++` pair legitimately spans the hard
+/// breaks within one paragraph and so is scanned across them.
+pub(crate) fn composed_inline_escape_offsets(
+    text: &str,
+    window: Range<usize>,
+    contained: &dyn Fn(Range<usize>) -> bool,
+) -> Vec<usize> {
+    let start = window.start;
+    let window = &text[window];
+    let bytes = window.as_bytes();
+    let holds = |range: Range<usize>| contained(start + range.start..start + range.end);
+    let passthroughs = contained_passthrough_macros(window, &holds);
+    let mut offsets = Vec::new();
+    let mut record = |escape_at: usize, end: usize| {
+        if !is_immediately_escaped(bytes, escape_at)
+            && !holds(escape_at..end)
+            && !is_inside(&passthroughs, escape_at)
+        {
+            offsets.push(start + escape_at);
+        }
     };
 
-    is_inline_passthrough_token_boundary(text.as_bytes(), pass_start)
-        && text[pass_start + "pass:".len()..]
-            .bytes()
-            .all(is_inline_passthrough_qualifier_byte)
+    composed_attribute_reference_escapes(window, &mut record);
+    composed_inline_passthrough_macro_escapes(window, &mut record);
+    composed_inline_macro_escapes(window, &holds, &mut record);
+    composed_inline_passthrough_delimiter_escapes(window, &mut record);
+
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
+/// The inline passthrough macros one fragment holds outright — the code
+/// renderer's `` `pass:c[…]` ``, [`GENERATED_INLINE_LINE_GUARD`], the `pass:[:]`
+/// a neutralized description-list marker leaves behind.
+///
+/// Asciidoctor extracts passthroughs *before* it substitutes anything else, so
+/// nothing inside one is ever live and nothing inside one needs escaping. An
+/// authored `pass:` never reaches this list: the run neutralizer escapes it, and
+/// one that only completes across a fragment boundary is not held by a single
+/// fragment.
+fn contained_passthrough_macros(
+    text: &str,
+    holds: &dyn Fn(Range<usize>) -> bool,
+) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut regions = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(relative_start) = text[cursor..].find("pass:") {
+        let start = cursor + relative_start;
+        cursor = start + "pass:".len();
+
+        let Some(bracket) = inline_passthrough_macro_bracket(text, start) else {
+            continue;
+        };
+        if is_immediately_escaped(bytes, start) {
+            continue;
+        }
+        // Asciidoctor's attribute-list close is the first `]` the content did
+        // not itself escape, which is exactly how the code renderer encodes a
+        // literal `]`.
+        let Some(close) = (bracket + 1..bytes.len())
+            .find(|index| bytes[*index] == b']' && !is_immediately_escaped(bytes, *index))
+        else {
+            continue;
+        };
+
+        let region = start..close + 1;
+        if holds(region.clone()) {
+            regions.push(region);
+        }
+    }
+
+    regions
+}
+
+/// True when `offset` falls *inside* one of `regions` — its opening byte does
+/// not count, so a passthrough macro is still classified in its own right.
+fn is_inside(regions: &[Range<usize>], offset: usize) -> bool {
+    regions
+        .iter()
+        .any(|region| region.start < offset && offset < region.end)
+}
+
+fn composed_attribute_reference_escapes(text: &str, record: &mut impl FnMut(usize, usize)) {
+    let bytes = text.as_bytes();
+    let mut scan_steps = AttributeScanSteps::default();
+    let closing_brace_before_line_break = closing_brace_before_line_break(bytes, &mut scan_steps);
+
+    for cursor in 0..bytes.len() {
+        if bytes[cursor] != b'{'
+            || !is_attribute_reference_at(
+                bytes,
+                cursor,
+                &closing_brace_before_line_break,
+                &mut scan_steps,
+            )
+        {
+            continue;
+        }
+
+        // Both reference forms close at the first `}` on the line: a plain name
+        // holds none, and the special `set:`/`counter:` values are `[^{}]+`.
+        if let Some(end) = bytes[cursor..]
+            .iter()
+            .position(|byte| matches!(*byte, b'}' | b'\n' | b'\r'))
+            .filter(|offset| bytes[cursor + offset] == b'}')
+        {
+            record(cursor, cursor + end + 1);
+        }
+    }
+}
+
+fn composed_inline_passthrough_macro_escapes(text: &str, record: &mut impl FnMut(usize, usize)) {
+    let mut cursor = 0;
+
+    while let Some(relative_start) = text[cursor..].find("pass:") {
+        let start = cursor + relative_start;
+
+        if let Some(bracket) = inline_passthrough_macro_bracket(text, start) {
+            record(start, bracket + 1);
+        }
+
+        cursor = start + "pass:".len();
+    }
+}
+
+fn composed_inline_macro_escapes(
+    text: &str,
+    holds: &dyn Fn(Range<usize>) -> bool,
+    record: &mut impl FnMut(usize, usize),
+) {
+    let bytes = text.as_bytes();
+    let mut scan_steps = MacroScanSteps::default();
+    let bracket_before_whitespace = bracket_before_whitespace(bytes, &mut scan_steps);
+
+    for cursor in 0..bytes.len() {
+        if !bytes[cursor].is_ascii_alphabetic() || !is_inline_macro_token_boundary(bytes, cursor) {
+            continue;
+        }
+
+        let name_end = inline_macro_name_end(bytes, cursor, &mut scan_steps);
+
+        // `name::target[]` is block vocabulary, not inline: every builtin inline
+        // macro excludes a leading `:` from its target, so mid-line the shape
+        // carries no meaning at all, and at a line start it is a block macro
+        // (`include::` a live preprocessor directive with it) that
+        // [`line_is_active_adoc_syntax`] already owns and guards with
+        // [`GENERATED_INLINE_LINE_GUARD`]. Claiming it here as well would only
+        // race that guard and win with a weaker remedy.
+        if bytes.get(name_end + 1) == Some(&b':') {
+            continue;
+        }
+
+        let Some(bracket) =
+            inline_macro_bracket(bytes, cursor, name_end, &bracket_before_whitespace)
+        else {
+            continue;
+        };
+
+        // Asciidoctor's macro patterns carry no left word boundary, so a live
+        // macro may begin at any suffix of the name run this scan measures from
+        // its token boundary. When the same construct re-anchored later in that
+        // run fits inside one fragment, the macro is that fragment's — the run
+        // only reached further left because an authored word happened to abut
+        // it (`before` + `xref:166512.adoc[t]`). Escaping at the token boundary
+        // would then neither deactivate the macro nor stay invisible.
+        if (cursor + 1..name_end).any(|anchor| holds(anchor..bracket + 1)) {
+            continue;
+        }
+
+        record(cursor, bracket + 1);
+    }
+}
+
+fn composed_inline_passthrough_delimiter_escapes(
+    text: &str,
+    record: &mut impl FnMut(usize, usize),
+) {
+    let mut cursor = 0;
+
+    while let Some(relative_start) = text[cursor..].find("+++") {
+        let start = cursor + relative_start;
+        let content_start = start + 3;
+        let Some(relative_end) = text[content_start..].find("+++") else {
+            break;
+        };
+        let end = content_start + relative_end + 3;
+
+        record(start, end);
+        cursor = end;
+    }
 }
 
 #[cfg(test)]
@@ -1275,5 +1483,35 @@ mod tests {
             "macro scanner took {scan_steps} steps for {} input bytes",
             input.len()
         );
+    }
+
+    /// The composed scan's whole rule, stated at the scanner: with the text
+    /// held by one fragment nothing is escaped, and with the *same* text split
+    /// so the construct completes in the second fragment, every scanner's
+    /// construct is.
+    #[test]
+    fn a_construct_is_escaped_exactly_when_no_one_fragment_holds_it() {
+        for (text, split, escape_at) in [
+            ("{set:a:b//}", 9, 0),
+            ("pass:q[x]", 6, 0),
+            ("hi pass:q[x]", 9, 3),
+            ("link:javascript:alert(1)[c]", 24, 0),
+            ("+++raw+++", 6, 0),
+        ] {
+            let whole = 0..text.len();
+            assert_eq!(
+                composed_inline_escape_offsets(text, whole.clone(), &|_| true),
+                Vec::<usize>::new(),
+                "one fragment holding {text:?} must escape nothing"
+            );
+
+            let offsets = composed_inline_escape_offsets(text, whole, &|range: Range<usize>| {
+                range.end <= split || split <= range.start
+            });
+            assert!(
+                offsets.contains(&escape_at),
+                "{text:?} split at {split} escaped {offsets:?}, wanted {escape_at}"
+            );
+        }
     }
 }
