@@ -224,6 +224,39 @@ does trail the enclosing element's own closing tag; over-emitting one inert
 closing tag is deliberate, because stopping earlier needs a content-end offset
 the scanner does not record and guessing one risks dropping content.
 
+Identity alone is not enough: html5ever *moves* content, so a node can be a DOM
+sibling of the very element whose source range contains its bytes — foster
+parenting lifts a node out of a `<table>` to before it, and a foreign-content
+breakout lifts `<font>` out of `<svg>` or `<table>` out of `<math>`. Rendering
+both emits those bytes twice. `build_source_index` therefore runs a coverage
+pass: one DOM walk collects the elements
+`renders_as_source_preserving_passthrough` calls **owners**, then one
+source-order sweep with a stack of open owners resolves every identity against
+the innermost owner covering it. A covered DOM descendant needs nothing —
+recursion stops at the owner; a covered DOM sibling is marked **suppressed**, and
+every loop that renders child elements (`html_to_adoc_with_links`,
+`render_inline_children_with_options`, `render_block_children`, and both of
+`render_list`'s) skips suppressed nodes, before `<br>` accumulation so a
+suppressed `<br>` cannot leak a hard break. A covered range that *ends* past the
+owner's end interleaves with it; both are marked **ambiguous** and degrade to one
+inert listing each, because neither range can be emitted as live markup when each
+holds a tag the other closes, and how often the overlap should appear is
+undecidable.
+
+`render_element` asks `renders_as_source_preserving_passthrough` first and
+dispatches on the answer, so the renderer and the coverage pass share one
+decision rather than two that drift. Keep it that way: an owner the renderer does
+not honour suppresses content nobody emits (a silent loss), while a passthrough
+it does not know about duplicates content. Where a call site disagrees with
+`render_element` the classifier stays *conservative* — it claims nothing that is
+not emitted from source bytes on every path, since under-claiming can only leave
+inert duplicates. That is why stripped chrome (emits nothing), `<script>`/
+`<style>` and text-only `<pre>` (emit text), and every direct child of a `<ul>`
+or `<ol>` (`render_list` renders items through their content and drops all other
+children) own nothing. Suppression is keyed on start-tag identities, which only
+elements carry: foster-parented bare *text* has no source offsets and is still
+emitted twice, which is the recoverable direction.
+
 The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
 Renderer-owned inline output (strong, emphasis, code, anchors, linked images) is

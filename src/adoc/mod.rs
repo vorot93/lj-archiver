@@ -210,6 +210,10 @@ pub fn html_to_adoc_with_links(html: &str, link_rewriter: Option<&LinkRewriter>)
             }
             Node::Element(_) => {
                 if let Some(element) = ElementRef::wrap(child) {
+                    if skip_suppressed(element, ctx) {
+                        continue;
+                    }
+
                     if element.value().name() == "br" {
                         pending_breaks += 1;
                         continue;
@@ -290,6 +294,12 @@ fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
         return String::new();
     }
 
+    // The single passthrough decision, shared with the source-coverage pass so
+    // the two can never disagree about who owns an element's source bytes.
+    if renders_as_source_preserving_passthrough(element) {
+        return render_passthrough(element, ctx);
+    }
+
     let name = element.value().name();
 
     match name {
@@ -299,9 +309,6 @@ fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
         "img" => render_image(element, ctx),
         "strong" | "b" => render_inline_wrapper(&render_inline_children(element, ctx), "*", "*"),
         "em" | "i" => render_inline_wrapper(&render_inline_children(element, ctx), "_", "_"),
-        "code" | "pre" if has_unreviewed_element_descendant(element) => {
-            render_passthrough(element, ctx)
-        }
         "code" => render_inline_code(element),
         "pre" => render_listing(element),
         "script" | "style" => render_safe_listing(element),
@@ -309,17 +316,11 @@ fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
         "ul" => render_list(element, "*", ctx),
         "ol" => render_list(element, ".", ctx),
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => render_heading(element, name, ctx),
-        "table" | "iframe" => render_passthrough(element, ctx),
-        _ if is_block(name) => render_passthrough(element, ctx),
-        _ if !passthrough_element_name_is_safe(name) => render_passthrough(element, ctx),
-        _ if !is_supported_inline(name) && has_block_or_passthrough_descendant(element) => {
-            render_passthrough(element, ctx)
-        }
         _ => render_inline_children(element, ctx),
     }
 }
 
-fn has_unreviewed_element_descendant(element: ElementRef<'_>) -> bool {
+pub(super) fn has_unreviewed_element_descendant(element: ElementRef<'_>) -> bool {
     element.descendants().skip(1).any(|descendant| {
         ElementRef::wrap(descendant)
             .is_some_and(|descendant| !passthrough_element_name_is_safe(descendant.value().name()))
@@ -361,6 +362,10 @@ fn render_inline_children_with_options(
             }
             Node::Element(_) => {
                 if let Some(child_element) = ElementRef::wrap(child) {
+                    if skip_suppressed(child_element, ctx) {
+                        continue;
+                    }
+
                     if skip_direct_lists && matches!(child_element.value().name(), "ul" | "ol") {
                         continue;
                     }
@@ -428,6 +433,10 @@ fn render_block_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String 
             }
             Node::Element(_) => {
                 if let Some(child_element) = ElementRef::wrap(child) {
+                    if skip_suppressed(child_element, ctx) {
+                        continue;
+                    }
+
                     output.push_str(&render_element(child_element, ctx.deeper()));
                 }
             }
@@ -670,6 +679,9 @@ fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> Str
             let Some(child_element) = ElementRef::wrap(child) else {
                 continue;
             };
+            if skip_suppressed(child_element, ctx) {
+                continue;
+            }
 
             output.push_str(&marker);
             output.push(' ');
@@ -682,6 +694,9 @@ fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> Str
                 let Some(list_element) = ElementRef::wrap(list_child) else {
                     continue;
                 };
+                if skip_suppressed(list_element, ctx) {
+                    continue;
+                }
 
                 match list_element.value().name() {
                     "ul" => output.push_str(&render_element(list_element, ctx.in_list().deeper())),
@@ -774,6 +789,15 @@ fn flush_root_inline(output: &mut String, inline_output: &mut String, before_blo
     }
 
     inline_output.clear();
+}
+
+/// True when this node's original bytes are already emitted by a distinct
+/// source-preserving passthrough owner — html5ever moved it out of the element
+/// whose source range contains it, so it is that element's DOM sibling rather
+/// than its descendant. Every loop that renders child elements consults this
+/// first, so covered bytes are emitted exactly once, by their owner.
+fn skip_suppressed(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> bool {
+    ctx.source_index.is_suppressed(element.id())
 }
 
 /// The one path for appending renderer-owned inline output (strong, emphasis,
@@ -1407,21 +1431,200 @@ mod tests {
 
     /// html5ever foster-parents `<div>FOSTER</div>` out of the table to *before*
     /// it, so the DOM's first child is the fostered div while the source's first
-    /// div is the cell one. It must carry its own bytes. (It is still emitted
-    /// twice — once alone, once inside the table's passthrough — because
-    /// coverage suppression is a separate task.)
+    /// div is the cell one. Each must resolve to its own bytes; a per-name
+    /// ordinal would exchange them. The rendered output can no longer show this
+    /// — the table covers the fostered div and emits those bytes itself — so the
+    /// mapping is asserted where it lives, and
+    /// `foster_parented_content_is_emitted_exactly_once_by_its_passthrough_owner`
+    /// fences the rendering.
     #[test]
     fn foster_parented_same_name_elements_keep_their_own_source_bytes() {
+        let html = r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#;
+        let scanned = crate::html_scan::scan(html).unwrap();
+        let fragment = Html::parse_fragment(&scanned.instrumented_html(html));
+        let index = build_source_index(&fragment, &scanned);
+
+        let divs: Vec<&str> = fragment
+            .tree
+            .root()
+            .descendants()
+            .filter_map(ElementRef::wrap)
+            .filter(|element| element.value().name() == "div")
+            .map(|element| &html[index.range(element.id()).expect("div has a source range")])
+            .collect();
+
+        assert_eq!(divs, ["<div>FOSTER</div>", "<div>CELL</div>"]);
+    }
+
+    #[test]
+    fn foster_parented_content_is_emitted_exactly_once_by_its_passthrough_owner() {
         let html = r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#;
 
         assert_eq!(
             html_to_adoc(html),
+            format!("++++\n{html}\n++++\n\n"),
+            "the table owns every byte in its source range"
+        );
+    }
+
+    #[test]
+    fn foster_parented_non_passthrough_content_is_also_emitted_once() {
+        let html = r#"<table><tr><td><div>CELL</div></td></tr><p>FOSTER</p></table>"#;
+        let rendered = html_to_adoc(html);
+
+        assert_eq!(rendered, format!("++++\n{html}\n++++\n\n"));
+        assert_eq!(
+            rendered.matches("FOSTER").count(),
+            1,
+            "foster-parented paragraph must not also render as prose: {rendered}"
+        );
+    }
+
+    #[test]
+    fn content_outside_a_passthrough_owner_is_still_rendered_normally() {
+        let html = concat!(
+            r#"<p>before</p>"#,
+            r#"<table><tr><td>c</td></tr></table>"#,
+            r#"<p>after</p>"#,
+        );
+
+        assert_eq!(
+            html_to_adoc(html),
             concat!(
-                "++++\n<div>FOSTER</div>\n++++\n\n",
-                "++++\n<table><tr><td><div>CELL</div></td></tr>",
-                "<div>FOSTER</div></table>\n++++\n\n",
+                "before\n\n",
+                "++++\n<table><tr><td>c</td></tr></table>\n++++\n\n",
+                "after\n\n",
             )
         );
+    }
+
+    /// A foreign-content breakout is the same hazard as foster parenting: the
+    /// tree constructor promotes `<font>` out of `<svg>` (and `<table>` out of
+    /// `<math>`'s HTML integration point) to a *sibling* of the element whose
+    /// source range still contains it. The coverage pass suppresses it for the
+    /// same reason and by the same rule.
+    #[test]
+    fn foreign_content_breakout_is_emitted_once_by_its_owner() {
+        for html in [
+            r#"<svg><font color="red"><table><tr><td>c</td></tr></table></font></svg>"#,
+            concat!(
+                r#"<math><annotation-xml encoding="text/html">"#,
+                r#"<table><tr><td>c</td></tr></table></annotation-xml></math>"#,
+            ),
+        ] {
+            assert_eq!(
+                html_to_adoc(html),
+                format!("[subs=specialcharacters]\n----\n{html}\n----\n\n"),
+                "for {html}"
+            );
+        }
+    }
+
+    /// Suppression may only credit an owner that actually emits the bytes.
+    /// Stripped chrome emits nothing at all, so a table that is chrome owns
+    /// nothing and the content html5ever moved out of it must still render.
+    #[test]
+    fn stripped_chrome_owns_nothing_so_content_moved_out_of_it_survives() {
+        let html = r#"<table class="lj-like"><tr><td>c</td></tr><div>FOSTER</div></table>"#;
+
+        assert_eq!(html_to_adoc(html), "++++\n<div>FOSTER</div>\n++++\n\n");
+    }
+
+    /// Every loop that renders child elements must skip suppressed ones, not
+    /// just the root loop: `render_inline_children_with_options` (the `<span>`),
+    /// `render_block_children` (the `<blockquote>`) and `render_list`'s nested
+    /// list pass (the inner `<ul>`).
+    #[test]
+    fn foster_parented_content_is_suppressed_inside_every_child_loop() {
+        for (html, expected) in [
+            (
+                r#"<span><table><tr><td>c</td></tr><b>F</b></table></span>"#,
+                "++++\n<table><tr><td>c</td></tr><b>F</b></table>\n++++\n\n",
+            ),
+            (
+                r#"<blockquote><table><tr><td>c</td></tr><div>F</div></table></blockquote>"#,
+                concat!(
+                    "[quote]\n____\n",
+                    "++++\n<table><tr><td>c</td></tr><div>F</div></table>\n++++\n",
+                    "____\n\n",
+                ),
+            ),
+            (
+                r#"<ul><li><table><tr><td>c</td></tr><ul><li>F</li></ul></table></li></ul>"#,
+                concat!(
+                    "* ++++\n",
+                    "<table><tr><td>c</td></tr><ul><li>F</li></ul></table>\n",
+                    "++++\n\n",
+                ),
+            ),
+        ] {
+            let rendered = html_to_adoc(html);
+
+            assert_eq!(rendered, expected, "for {html}");
+            assert_eq!(rendered.matches('F').count(), 1, "for {html}: {rendered}");
+        }
+    }
+
+    /// Suppression may only credit an owner that actually emits the bytes.
+    /// `render_list` renders a list item through its content and drops every
+    /// other child of a list, so a table directly inside a list emits nothing
+    /// and the item html5ever fostered out of it must still render.
+    #[test]
+    fn a_list_owns_nothing_so_an_item_fostered_out_of_it_survives() {
+        assert_eq!(
+            html_to_adoc(r#"<ul><li>a</li><table><tr><td>c</td></tr><li>F</li></table></ul>"#),
+            "* a\n* F\n\n"
+        );
+    }
+
+    /// Known limitation: suppression is keyed on the scanner's start-tag
+    /// identities, which only elements carry. Foster-parented bare *text* has no
+    /// identity and no source offsets, so it still renders beside the table that
+    /// also emits it. That duplicates inert prose; it never loses content, which
+    /// is the direction that matters.
+    #[test]
+    fn foster_parented_bare_text_is_still_emitted_twice() {
+        let html = r#"<table><tr><td>c</td></tr>TEXT</table>"#;
+
+        assert_eq!(
+            html_to_adoc(html),
+            format!("TEXT\n\n++++\n{html}\n++++\n\n")
+        );
+    }
+
+    /// The `<div>` opens inside the table and closes after it, so the two source
+    /// ranges interleave and neither element can be emitted as live markup: each
+    /// range holds a tag the other one closes. Both fail closed to one inert
+    /// listing. The overlap is still emitted twice — which of the two blocks
+    /// should own it is exactly what is undecidable — but nothing is lost, and
+    /// no unbalanced markup reaches the converted document.
+    #[test]
+    fn crossing_source_ranges_degrade_to_inert_listings() {
+        let html = r#"<table><tr><td>c</td></tr><div>cross</table>tail</div>"#;
+
+        assert_eq!(
+            html_to_adoc(html),
+            concat!(
+                "[subs=specialcharacters]\n----\n<div>cross</table>tail</div>\n----\n\n",
+                "[subs=specialcharacters]\n----\n",
+                "<table><tr><td>c</td></tr><div>cross</table>\n----\n\n",
+                "tail\n\n",
+            )
+        );
+    }
+
+    #[test]
+    fn deeply_nested_foster_parenting_stays_within_the_render_depth_cap() {
+        let depth = MAX_RENDER_DEPTH + 32;
+        let html = format!(
+            "{}<table><tr><td>c</td></tr><div>FOSTER</div></table>{}",
+            "<div>".repeat(depth),
+            "</div>".repeat(depth),
+        );
+
+        // Must not overflow the stack and must emit the fostered content once.
+        let rendered = html_to_adoc(&html);
+        assert_eq!(rendered.matches("FOSTER").count(), 1, "{rendered}");
     }
 
     #[test]
@@ -1434,7 +1637,6 @@ mod tests {
             (
                 r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#,
                 concat!(
-                    "++++\n<div>FOSTER</div>\n++++\n\n",
                     "++++\n<table><tr><td><div>CELL</div></td></tr>",
                     "<div>FOSTER</div></table>\n++++\n\n",
                 ),
@@ -4854,6 +5056,46 @@ mod tests {
                 .next()
                 .map(|strong| strong.text().collect::<String>()),
             Some("Title".to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn foster_parented_table_content_converts_once() {
+        let html = r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#;
+        let converted = convert_with_asciidoctor(&html_to_adoc(html));
+
+        assert_eq!(converted.matches("FOSTER").count(), 1, "{converted}");
+        assert_eq!(converted.matches("CELL").count(), 1, "{converted}");
+        assert_eq!(
+            Html::parse_document(&converted)
+                .select(&Selector::parse("table").unwrap())
+                .count(),
+            1
+        );
+    }
+
+    /// Interleaved source ranges must not put unbalanced markup into the
+    /// converted document: both ranges are emitted as inert listings, so the
+    /// stray `</table>` stays text and the document grows no table at all.
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn crossing_source_ranges_convert_without_unbalanced_markup() {
+        let html = r#"<table><tr><td>c</td></tr><div>cross</table>tail</div>"#;
+        let converted = convert_with_asciidoctor(&html_to_adoc(html));
+        let document = Html::parse_document(&converted);
+
+        assert_eq!(
+            document.select(&Selector::parse("table").unwrap()).count(),
+            0,
+            "{converted}"
+        );
+        assert_eq!(
+            document
+                .select(&Selector::parse("div.listingblock").unwrap())
+                .count(),
+            2,
+            "{converted}"
         );
     }
 

@@ -1,7 +1,11 @@
 use super::{RenderCtx, classify::is_stripped_chrome, render_specialcharacters_listing};
 use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
-use std::{collections::HashMap, ops::Range};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 use url::Url;
 
 /// Maps semantic DOM nodes to scanner-owned original byte ranges through the
@@ -13,6 +17,8 @@ use url::Url;
 pub(crate) struct SourceIndex {
     ranges: HashMap<NodeId, Range<usize>>,
     identities: HashMap<NodeId, usize>,
+    suppressed: HashSet<NodeId>,
+    ambiguous: HashSet<NodeId>,
 }
 
 impl SourceIndex {
@@ -27,6 +33,21 @@ impl SourceIndex {
     /// [`Self::range`] but the start tag's own offset is still known.
     pub(crate) fn identity(&self, node: NodeId) -> Option<usize> {
         self.identities.get(&node).copied()
+    }
+
+    /// A node whose source bytes another node already emits as one
+    /// source-preserving passthrough. Rendering it as well would emit the same
+    /// original bytes twice.
+    pub(crate) fn is_suppressed(&self, node: NodeId) -> bool {
+        self.suppressed.contains(&node)
+    }
+
+    /// A node whose source range crosses a passthrough owner's range boundary.
+    /// Neither "inside" nor "outside" is true of the overlap, so multiplicity
+    /// cannot be decided; the node degrades to one inert listing rather than
+    /// emitting interleaved markup as live HTML.
+    pub(crate) fn is_ambiguous(&self, node: NodeId) -> bool {
+        self.ambiguous.contains(&node)
     }
 }
 
@@ -112,6 +133,13 @@ pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) ->
         return render_enclosing_source_listing(element, ctx);
     };
 
+    if ctx.source_index.is_ambiguous(element.id()) {
+        // This range and another element's interleave, so how many times each
+        // overlapping byte should appear is undecidable — and the range holds
+        // unbalanced markup either way. Emit it once, inert, rather than guess.
+        return render_source_listing(html);
+    }
+
     if !passthrough_is_safe(html) {
         return render_source_listing(html);
     }
@@ -169,6 +197,61 @@ fn passthrough_attribute_is_safe(tag: &str, attribute: &str, qualified: bool) ->
 
 pub(super) fn passthrough_element_name_is_safe(name: &str) -> bool {
     SAFE_ELEMENTS.contains(&name)
+}
+
+/// True when the renderer emits this element's original source bytes as one
+/// block, making it the sole emitter of every source byte in its element range.
+///
+/// [`super::render_element`] asks this first and dispatches to
+/// [`render_passthrough`] on `true`, so the renderer and the source-coverage
+/// pass share one decision instead of two that can drift apart. Drift would
+/// either duplicate content (owner missed) or drop it (owner invented).
+///
+/// Two call sites reach [`render_passthrough`] without asking, and this stays
+/// deliberately conservative about both — an owner claimed here suppresses other
+/// nodes, so under-claiming can only leave inert duplicates while over-claiming
+/// loses content:
+///
+/// * `render_inline_children_with_options` also passes a `<pre>` whose block
+///   descendants are all reviewed names; [`super::render_element`] renders that
+///   one from its text instead. Nothing can escape a `<pre>`'s subtree, so
+///   claiming it would suppress nothing anyway.
+/// * `render_element` passes *any* element once `MAX_RENDER_DEPTH` is reached.
+///   The depth is a property of the render walk, not of the element, and the
+///   deep element's bytes are a superset of what its subtree would have emitted.
+pub(crate) fn renders_as_source_preserving_passthrough(element: ElementRef<'_>) -> bool {
+    // Chrome is dropped whole, so it emits nothing and owns nothing.
+    if is_stripped_chrome(element) {
+        return false;
+    }
+    // `render_list` renders a list item through its *content* and skips every
+    // other child of a list outright, so nothing directly inside a `<ul>` or
+    // `<ol>` ever emits its own source bytes, however it would dispatch
+    // elsewhere.
+    if parent_element_name(element).is_some_and(|name| matches!(name, "ul" | "ol")) {
+        return false;
+    }
+
+    let name = element.value().name();
+
+    match name {
+        // Rendered from their text content, never from their source bytes.
+        "script" | "style" => false,
+        "code" | "pre" => super::has_unreviewed_element_descendant(element),
+        // Rendered structurally by a renderer of their own.
+        "p" | "blockquote" | "ul" | "ol" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => false,
+        "table" | "iframe" => true,
+        _ => {
+            super::is_block(name)
+                || !passthrough_element_name_is_safe(name)
+                || (!super::is_supported_inline(name)
+                    && super::has_block_or_passthrough_descendant(element))
+        }
+    }
+}
+
+fn parent_element_name<'a>(element: ElementRef<'a>) -> Option<&'a str> {
+    Some(element.parent()?.value().as_element()?.name())
 }
 
 fn has_safe_passthrough_url(value: &str) -> bool {
@@ -313,7 +396,114 @@ pub(crate) fn build_source_index(
         }
     }
 
+    mark_source_coverage(&mut index, document, scanned, fragment_root);
+
     index
+}
+
+/// Marks the nodes a source-preserving passthrough already covers, so every
+/// original byte is emitted exactly once.
+///
+/// Owning the right bytes is not enough on its own, because html5ever *moves*
+/// content: foster parenting lifts a node out of a `<table>` to before it, and a
+/// foreign-content breakout lifts one out of `<svg>` or `<math>`. Either way the
+/// node becomes a DOM sibling of the very element whose source range contains
+/// its bytes, and rendering both emits those bytes twice.
+///
+/// Two passes, with no per-owner rescan of the document: one DOM walk collects
+/// the owners, then one source-order sweep with a stack of open owners resolves
+/// every node against the innermost owner covering it.
+fn mark_source_coverage(
+    index: &mut SourceIndex,
+    document: &Html,
+    scanned: &crate::html_scan::ScannedHtml,
+    fragment_root: NodeId,
+) {
+    // Pass A — one DOM walk. `owners` emit a whole source range as one block;
+    // `inside_owner` are the nodes an owner's own subtree already covers, which
+    // the render walk therefore stops short of and need no suppression.
+    let mut owners: Vec<(NodeId, Range<usize>)> = Vec::new();
+    let mut inside_owner: HashSet<NodeId> = HashSet::new();
+    let mut covered: Vec<(NodeId, Range<usize>)> = Vec::new();
+    // Children are pushed in reverse, so the walk pops them in document order.
+    let mut stack = vec![(document.tree.root().id(), false)];
+
+    while let Some((node_id, has_owner_ancestor)) = stack.pop() {
+        let node = document
+            .tree
+            .get(node_id)
+            .expect("node id comes from this tree");
+        let mut children_have_owner_ancestor = has_owner_ancestor;
+
+        // The fragment parser's own `<html>` root is not an archived element and
+        // an authored `<html>` merges onto it, so treating it as an owner would
+        // put every node inside one and suppress nothing at all.
+        if let Some(element) =
+            ElementRef::wrap(node).filter(|element| element.id() != fragment_root)
+        {
+            if has_owner_ancestor {
+                inside_owner.insert(element.id());
+            }
+            // An element the source never closed has no range of its own, but
+            // its start tag still places it inside an owner.
+            if let Some(range) = index.range(element.id()).or_else(|| {
+                let identity = index.identity(element.id())?;
+                Some(scanned.start_tags().get(identity)?.source_range())
+            }) {
+                covered.push((element.id(), range));
+            }
+            if renders_as_source_preserving_passthrough(element) {
+                children_have_owner_ancestor = true;
+                if let Some(range) = index.range(element.id()) {
+                    owners.push((element.id(), range));
+                }
+            }
+        }
+
+        stack.extend(
+            node.children()
+                .rev()
+                .map(|child| (child.id(), children_have_owner_ancestor)),
+        );
+    }
+
+    // Pass B — one source-order sweep. An owner opening at or before a node's
+    // start and still open at it is the innermost owner covering that node.
+    // Covered and inside it in the DOM: nothing to do. Covered but outside it in
+    // the DOM: suppress, so the owner emits those bytes once. Covered at the
+    // start but ending past the owner's end: the ranges interleave, so how often
+    // the overlap should appear is undecidable and both fail closed to inert
+    // listings instead of emitting interleaved markup as live HTML.
+    owners.sort_by_key(|(_, range)| (range.start, Reverse(range.end)));
+    covered.sort_by_key(|(_, range)| range.start);
+
+    let mut open: Vec<&(NodeId, Range<usize>)> = Vec::new();
+    let mut next_owner = 0;
+    for (node, range) in covered {
+        // Strictly before: an owner opening *at* this start is this node itself
+        // — or a clone of it the adoption agency made — and nothing covers
+        // itself.
+        while next_owner < owners.len() && owners[next_owner].1.start < range.start {
+            open.push(&owners[next_owner]);
+            next_owner += 1;
+        }
+        while open
+            .last()
+            .is_some_and(|(_, owner)| owner.end <= range.start)
+        {
+            open.pop();
+        }
+        let Some((owner_id, owner_range)) = open.last() else {
+            continue;
+        };
+
+        if range.end > owner_range.end {
+            index.ambiguous.insert(*owner_id);
+            index.ambiguous.insert(node);
+        } else if !inside_owner.contains(&node) {
+            index.suppressed.insert(node);
+        }
+    }
 }
 
 pub(crate) fn raw_text(element: ElementRef<'_>) -> String {
