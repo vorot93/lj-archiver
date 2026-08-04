@@ -348,6 +348,14 @@ eligible for recorded cross-references to be upgraded with a controlled rewrite
 after the final post set is known; if no upgrade is needed, or the metadata
 cannot be trusted, their bytes stay unchanged.
 
+One archive folder is updated by one run at a time. Each run takes an advisory
+lock on `.lj-archiver.lock` in the archive root and holds it for the whole
+update, so a second `lj-archiver` run against the same folder exits immediately
+with "archive at … is being updated by another lj-archiver process" instead of
+interleaving writes. The lock file stays in the folder and is always empty; the
+operating system releases the lock when the run ends, including after a crash,
+so there is never a stale lock to delete.
+
 ## Current Limits
 
 `lj-archiver` archives public content only.

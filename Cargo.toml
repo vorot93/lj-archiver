@@ -5,12 +5,14 @@ members = ["gui"]
 version = "1.0.0"
 edition = "2024"
 license = "Apache-2.0"
+rust-version = "1.89"
 
 [package]
 name = "lj-archiver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

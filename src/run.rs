@@ -184,6 +184,9 @@ async fn archive_post(
 ) -> Result<RunOutcome> {
     let root = output_dir(options, &journal);
     let archive = Archive::new(root.clone(), &journal);
+    // Held until this function returns, so inspection, post publication, the
+    // sidecar write, and manifest generation are one archive update.
+    let _update_lock = archive.acquire_update_lock()?;
     let existing = archive.inspect_existing()?;
     let generate_book =
         options.generate_book || existing.as_ref().is_some_and(|existing| existing.has_book);
@@ -285,6 +288,9 @@ async fn archive_journal_with_writer<W: FinalPostWriter>(
     let start = std::time::Instant::now();
     let root = output_dir(options, &journal);
     let archive = Archive::new(root.clone(), journal.clone());
+    // Held for the whole run. The within-run `buffer_unordered` post pipeline is
+    // unchanged and runs entirely under this one guard.
+    let _update_lock = archive.acquire_update_lock()?;
     let existing = archive.inspect_existing()?;
     let generate_book =
         options.generate_book || existing.as_ref().is_some_and(|existing| existing.has_book);

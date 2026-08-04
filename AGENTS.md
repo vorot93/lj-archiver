@@ -472,6 +472,28 @@ back to the *absolute* path when `strip_prefix` failed, which leaked
 outside-root paths into a manifest — never reintroduce that fallback; every
 production caller already passes root-joined paths.
 
+`Archive::acquire_update_lock` returns an `ArchiveUpdateGuard` that both run
+paths (`archive_post`, `archive_journal_with_writer`) take **before**
+`inspect_existing` and keep alive through post, sidecar, index, and optional
+book publication; the within-run `buffer_unordered` pipeline runs unchanged
+under that single guard. It uses the standard-library file lock stabilized in
+Rust 1.89 (hence `rust-version = "1.89"` in `[workspace.package]`) and adds no
+locking dependency. `try_lock` rather than `lock` is deliberate: an async worker
+or GUI thread must never block on another process, so contention is the typed
+`LjError::ArchiveBusy` instead. The lock file is controlled through
+`storage::prepare_controlled_file` (rejecting symlink and non-regular entries),
+is empty and persistent, and `inspect_existing` filters it out so a root holding
+only the lock still reads as an empty/new archive. The lock is advisory with
+respect to unrelated programs; the contract is that every lj-archiver
+CLI/GUI process and reusable-API caller performing a multi-file update holds it.
+Process exit, cancellation, panic, or guard drop releases the OS lock, so there
+is deliberately no PID file and no stale-lock recovery protocol. Relatedly,
+`src/main.rs` prints a returned `LjError` via `Display`, not the default
+`Result`-from-`main` `Termination`'s `Debug` dump — `Debug` would render
+`ArchiveBusy { path: .. }` with none of the human sentence in it, which is what
+every `#[error(...)]` message (including this one) is for; the GUI already
+formats errors with `{error}` for the same reason.
+
 ## LiveJournal Discovery And URL Structure
 
 Discovery walks LiveJournal's own archive navigation, all served as static (no-JS) pages:

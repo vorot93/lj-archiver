@@ -40,6 +40,17 @@ struct ExistingEntry {
     file_type: fs::FileType,
 }
 
+/// The one controlled, persistent, empty file that serializes archive updates.
+pub(crate) const UPDATE_LOCK_FILE_NAME: &str = ".lj-archiver.lock";
+
+/// Holds the archive-wide update lock. The OS releases the lock when this value
+/// drops — including on process exit, cancellation, or panic — so there is no
+/// stale-PID recovery protocol and no lock to clean up by hand.
+#[derive(Debug)]
+pub struct ArchiveUpdateGuard {
+    _file: fs::File,
+}
+
 impl Archive {
     pub fn new(root: impl Into<PathBuf>, journal: impl Into<String>) -> Self {
         Self {
@@ -74,6 +85,12 @@ impl Archive {
                 ));
             }
         };
+        // The controlled lock file is ours and carries no archive content, so a
+        // root holding only it is an empty/new archive rather than a corrupt one.
+        let entries = entries
+            .into_iter()
+            .filter(|entry| entry.path.file_name() != Some(OsStr::new(UPDATE_LOCK_FILE_NAME)))
+            .collect::<Vec<_>>();
         if entries.is_empty() {
             return Ok(None);
         }
@@ -129,6 +146,42 @@ impl Archive {
             posts,
             has_book,
         }))
+    }
+
+    /// Takes the archive-wide update lock, or reports the archive as busy.
+    ///
+    /// Non-blocking on purpose: an async worker or a GUI thread must never hang
+    /// on a lock held by another process, so contention is a typed
+    /// [`LjError::ArchiveBusy`] the caller can surface immediately. The lock is
+    /// advisory with respect to unrelated programs; the documented contract is
+    /// that every `lj-archiver` CLI/GUI process and every reusable-API caller
+    /// performing a multi-file update holds this guard. Per-file controlled
+    /// atomic writes and crash-repair behavior remain in place underneath it.
+    pub fn acquire_update_lock(&self) -> Result<ArchiveUpdateGuard> {
+        let relative = Path::new(UPDATE_LOCK_FILE_NAME);
+        // Creates the archive root and rejects a symlink or non-regular entry.
+        storage::prepare_controlled_file(&self.root, relative)?;
+        let path = self.root.join(relative);
+        // Always empty by contract: truncating is a no-op in the ordinary case
+        // (nothing ever writes to this file) and self-heals it otherwise.
+        let file = fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|source| LjError::Write {
+                path: path.clone(),
+                source,
+            })?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(ArchiveUpdateGuard { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => Err(LjError::ArchiveBusy {
+                path: self.root.clone(),
+            }),
+            Err(fs::TryLockError::Error(source)) => Err(LjError::Write { path, source }),
+        }
     }
 
     pub fn write_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
@@ -1548,5 +1601,99 @@ mod tests {
         assert!(archive.write_index(&posts).is_err());
         assert!(archive.write_book(&posts).is_err());
         assert!(root_entries(&root).is_empty());
+    }
+
+    #[test]
+    fn a_second_update_lock_on_one_root_reports_the_archive_as_busy() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let first = Archive::new(&root, "news");
+        let second = Archive::new(&root, "news");
+
+        let guard = first.acquire_update_lock().unwrap();
+        let error = second.acquire_update_lock().unwrap_err();
+        assert!(
+            matches!(&error, LjError::ArchiveBusy { path } if path == &root),
+            "expected ArchiveBusy for {root:?}, got {error}"
+        );
+        assert!(error.to_string().contains("another"), "{error}");
+
+        // Dropping the guard releases the OS lock; no stale-PID recovery needed.
+        drop(guard);
+        second.acquire_update_lock().unwrap();
+    }
+
+    #[test]
+    fn the_update_lock_file_is_empty_persistent_and_ignored_by_inspection() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+
+        let guard = archive.acquire_update_lock().unwrap();
+        let lock_path = root.join(".lj-archiver.lock");
+        assert!(lock_path.is_file());
+        assert_eq!(fs::read(&lock_path).unwrap(), Vec::<u8>::new());
+
+        // A root holding only the lock file is a new/empty archive, not a corrupt one.
+        assert_eq!(archive.inspect_existing().unwrap(), None);
+
+        drop(guard);
+        assert!(lock_path.is_file(), "the lock file is persistent");
+        assert_eq!(archive.inspect_existing().unwrap(), None);
+    }
+
+    #[test]
+    fn a_non_regular_lock_entry_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        fs::create_dir_all(root.join(".lj-archiver.lock")).unwrap();
+
+        assert!(Archive::new(&root, "news").acquire_update_lock().is_err());
+    }
+
+    #[test]
+    fn inspection_still_sees_a_real_archive_beside_the_lock_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let path = archive.write_post(1, "= Post\n").unwrap();
+        archive
+            .write_index(&[ArchivedPost {
+                id: 1,
+                title: ArchivedTitle::authored("Post"),
+                path,
+            }])
+            .unwrap();
+
+        let _guard = archive.acquire_update_lock().unwrap();
+        let existing = archive.inspect_existing().unwrap().unwrap();
+        assert_eq!(existing.journal, "news");
+        assert_eq!(existing.posts.len(), 1);
+    }
+
+    #[test]
+    fn one_guard_covers_post_sidecar_and_manifest_agreement() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+
+        let _guard = archive.acquire_update_lock().unwrap();
+        let first = descriptor(1, archive.write_post(1, "= One\n").unwrap());
+        let second = descriptor(2, archive.write_post(2, "= Two\n").unwrap());
+        archive.write_index(&[first, second]).unwrap();
+
+        let index = fs::read_to_string(root.join("index.adoc")).unwrap();
+        assert!(index.contains("xref:posts/1.adoc["), "{index}");
+        assert!(index.contains("xref:posts/2.adoc["), "{index}");
+
+        let existing = archive.inspect_existing().unwrap().unwrap();
+        assert_eq!(
+            existing
+                .posts
+                .iter()
+                .map(|post| post.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }

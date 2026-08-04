@@ -8,6 +8,39 @@ use wiremock::{
 };
 
 #[tokio::test]
+async fn cli_reports_a_busy_archive_instead_of_interleaving_an_update() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("out");
+    let archive = lj_archiver::archive::Archive::new(&out, "news");
+    let _guard = archive.acquire_update_lock().unwrap();
+
+    let mut cmd = Command::cargo_bin("lj-archiver").unwrap();
+    cmd.arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(&out)
+        .arg("--no-media")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("another lj-archiver process"));
+
+    assert!(
+        !out.join("posts/166511.adoc").exists(),
+        "a busy archive must not be written"
+    );
+}
+
+#[tokio::test]
 async fn cli_archives_single_post() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

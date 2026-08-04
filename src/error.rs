@@ -33,6 +33,8 @@ pub enum LjError {
     Discovery { journal: String, reason: String },
     #[error("invalid archive at {path}: {reason}")]
     InvalidArchive { path: PathBuf, reason: String },
+    #[error("archive at {path} is being updated by another lj-archiver process")]
+    ArchiveBusy { path: PathBuf },
     #[error("could not write {path}: {source}")]
     Write {
         path: PathBuf,
