@@ -1044,33 +1044,26 @@ fn line_is_anchored_active_adoc_syntax(line: &str) -> bool {
         || starts_with_non_description_active_adoc_syntax(line)
 }
 
-pub(crate) fn neutralize_pending_plain_text_before_generated_inline(output: &mut String) {
-    if output.is_empty() {
-        return;
-    }
-
-    let line_start = output.rfind('\n').map_or(0, |index| index + 1);
-    let line = &output[line_start..];
-
-    if let Some(prefix) = line.strip_suffix(":pass:[:]") {
-        let prefix = prefix.to_string();
-        if is_block_macro_prefix(&prefix) {
-            // This call site is only reached immediately before appending a
-            // renderer-generated inline fragment. That fragment makes `::`
-            // ineligible as a description-list delimiter; preserve the
-            // existing escaped macro-prefix output without applying this to
-            // user text before a line break.
-            output.truncate(line_start);
-            output.push('\\');
-            output.push_str(&prefix);
-            output.push_str("::");
-            return;
-        }
+/// The replacement for the logical line `line` immediately before a
+/// renderer-generated inline fragment is appended to it, or `None` when the
+/// line needs no change.
+pub(crate) fn neutralize_pending_plain_text_before_generated_inline(line: &str) -> Option<String> {
+    if let Some(prefix) = line.strip_suffix(":pass:[:]")
+        && is_block_macro_prefix(prefix)
+    {
+        // This is only reached immediately before appending a
+        // renderer-generated inline fragment. That fragment makes `::`
+        // ineligible as a description-list delimiter; preserve the existing
+        // escaped macro-prefix output without applying this to user text
+        // before a line break.
+        return Some(format!("\\{prefix}::"));
     }
 
     if ends_with_block_macro_prefix(line) || ends_with_inline_passthrough_macro_prefix(line) {
-        output.insert(line_start, '\\');
+        return Some(format!("\\{line}"));
     }
+
+    None
 }
 
 fn ends_with_block_macro_prefix(text: &str) -> bool {

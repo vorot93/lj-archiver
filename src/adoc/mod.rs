@@ -8,10 +8,12 @@ use url::Url;
 
 mod classify;
 mod escape;
+mod inline;
 mod source_html;
 
 use classify::*;
 use escape::*;
+use inline::*;
 use source_html::*;
 
 pub(crate) use escape::sanitize_macro_target;
@@ -183,7 +185,7 @@ pub fn html_to_adoc_with_links(html: &str, link_rewriter: Option<&LinkRewriter>)
     let fragment = Html::parse_fragment(&instrumented);
     let source_index = build_source_index(&fragment, &scanned);
     let mut output = String::new();
-    let mut inline_output = String::new();
+    let mut inline_output = InlineBuffer::new();
     let mut plain_text = String::new();
     let ctx = RenderCtx {
         source_html: html,
@@ -347,7 +349,7 @@ fn render_inline_children_with_options(
     ctx: RenderCtx<'_>,
     skip_direct_lists: bool,
 ) -> String {
-    let mut output = String::new();
+    let mut output = InlineBuffer::new();
     let mut plain_text = String::new();
     let mut pending_breaks: usize = 0;
 
@@ -418,11 +420,11 @@ fn render_inline_children_with_options(
 
     flush_plain_text_run(&mut output, &mut plain_text);
 
-    output
+    output.into_string()
 }
 
 fn render_block_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
-    let mut output = String::new();
+    let mut output = InlineBuffer::new();
 
     for child in element.children() {
         match child.value() {
@@ -437,14 +439,14 @@ fn render_block_children(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String 
                         continue;
                     }
 
-                    output.push_str(&render_element(child_element, ctx.deeper()));
+                    output.push_verbatim(&render_element(child_element, ctx.deeper()));
                 }
             }
             _ => {}
         }
     }
 
-    output
+    output.into_string()
 }
 
 fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
@@ -774,7 +776,7 @@ fn is_plain_text_inline_wrapper(name: &str) -> bool {
             || (!is_supported_inline(name) && !is_block_or_passthrough_boundary(name)))
 }
 
-fn flush_root_inline(output: &mut String, inline_output: &mut String, before_block: bool) {
+fn flush_root_inline(output: &mut String, inline_output: &mut InlineBuffer, before_block: bool) {
     let inline = inline_output.trim();
     if inline.is_empty() {
         inline_output.clear();
@@ -811,29 +813,21 @@ fn skip_suppressed(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> bool {
 /// appends, and then guards the composed logical line when the generated
 /// delimiters newly completed active block syntax. Every generated-inline
 /// append must go through here — appending directly reopens finding 1.
-fn append_generated_inline(output: &mut String, fragment: &str) {
-    neutralize_pending_plain_text_before_generated_inline(output);
-    let line_start = output.rfind('\n').map_or(0, |index| index + 1);
-    let before = output[line_start..].to_string();
-    append_inline_fragment(output, fragment);
-    if generated_inline_completes_active_line(&before, &output[line_start..], fragment) {
-        output.insert_str(line_start, GENERATED_INLINE_LINE_GUARD);
+fn append_generated_inline(output: &mut InlineBuffer, fragment: &str) {
+    if let Some(pending) = neutralize_pending_plain_text_before_generated_inline(output.line()) {
+        let line_start = output.line_start();
+        output.replace_from(line_start, &pending);
+    }
+
+    let line_start = output.line_start();
+    let before = output.line().to_string();
+    output.push(fragment);
+    if generated_inline_completes_active_line(&before, output.line(), fragment) {
+        output.insert_at(line_start, GENERATED_INLINE_LINE_GUARD);
     }
 }
 
-fn append_inline_fragment(output: &mut String, fragment: &str) {
-    let mut characters = fragment.chars().peekable();
-
-    if output.ends_with(' ') || output.ends_with('\n') {
-        while matches!(characters.peek(), Some(' ')) {
-            characters.next();
-        }
-    }
-
-    output.extend(characters);
-}
-
-fn append_plain_text_fragment(output: &mut String, text: &str) {
+fn append_plain_text_fragment(output: &mut InlineBuffer, text: &str) {
     let mut plain_text = String::new();
     append_normalized_text_fragment(&mut plain_text, text);
     flush_plain_text_run(output, &mut plain_text);
@@ -845,7 +839,7 @@ fn append_normalized_text_fragment(output: &mut String, text: &str) {
     append_inline_fragment(output, &normalized);
 }
 
-fn flush_plain_text_run(output: &mut String, plain_text: &mut String) {
+fn flush_plain_text_run(output: &mut InlineBuffer, plain_text: &mut String) {
     if plain_text.is_empty() {
         return;
     }
@@ -857,7 +851,7 @@ fn flush_plain_text_run(output: &mut String, plain_text: &mut String) {
     if is_line_start {
         // The run *is* the logical line, and the neutralizer just handled it as
         // one.
-        append_inline_fragment(output, &fragment);
+        output.push(&fragment);
         return;
     }
 
@@ -866,15 +860,12 @@ fn flush_plain_text_run(output: &mut String, plain_text: &mut String) {
     // means neither run starts the line, so the line-start neutralizer never
     // inspects it. Classify the composed line instead. Appending directly here
     // reopens that hole.
-    let line_start = output.rfind('\n').map_or(0, |index| index + 1);
-    let before = output[line_start..].to_string();
-    append_inline_fragment(output, &fragment);
+    let line_start = output.line_start();
+    let before = output.line().to_string();
+    output.push(&fragment);
 
-    if let Some(neutralized) =
-        neutralize_line_completed_by_authored_text(&before, &output[line_start..])
-    {
-        output.truncate(line_start);
-        output.push_str(&neutralized);
+    if let Some(neutralized) = neutralize_line_completed_by_authored_text(&before, output.line()) {
+        output.replace_from(line_start, &neutralized);
     }
 }
 
@@ -886,7 +877,7 @@ fn flush_plain_text_run(output: &mut String, plain_text: &mut String) {
 /// while a run of two or more collapses into a single paragraph break (a
 /// blank line, no trailing `+`).
 fn flush_pending_line_breaks(
-    output: &mut String,
+    output: &mut InlineBuffer,
     plain_text: &mut String,
     pending_breaks: &mut usize,
 ) {
@@ -904,12 +895,11 @@ fn flush_pending_line_breaks(
         // content still lands at a line start, so block-macro neutralization
         // (which keys off the same line-start condition) is unaffected.
         if !output.is_empty() && !output.ends_with('\n') {
-            append_inline_fragment(output, " +\n");
+            output.push(" +\n");
         }
     } else {
-        let trimmed_len = output.trim_end().len();
-        output.truncate(trimmed_len);
-        output.push_str("\n\n");
+        output.trim_end_in_place();
+        output.push("\n\n");
     }
 
     *pending_breaks = 0;
@@ -954,21 +944,22 @@ fn trim_leading_hard_breaks(text: &str) -> String {
     start.to_string()
 }
 
-fn append_inline_block(output: &mut String, block: &str) {
+fn append_inline_block(output: &mut InlineBuffer, block: &str) {
     let block = block.trim_end();
     if block.is_empty() {
         return;
     }
 
-    let trimmed_output = output.trim_end().len();
-    output.truncate(trimmed_output);
+    output.trim_end_in_place();
 
+    let mut fragment = String::new();
     if !output.is_empty() {
-        output.push_str("\n\n");
+        fragment.push_str("\n\n");
     }
+    fragment.push_str(block);
+    fragment.push_str("\n\n");
 
-    output.push_str(block);
-    output.push_str("\n\n");
+    output.push_verbatim(&fragment);
 }
 
 #[cfg(test)]
