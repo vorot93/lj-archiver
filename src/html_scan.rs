@@ -4,7 +4,7 @@ use html5ever::{
 };
 use std::{
     cell::RefCell,
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     ops::Range,
 };
 
@@ -15,16 +15,26 @@ pub(crate) struct ScanError {
     reason: String,
 }
 
+/// The base name of the synthetic source-identity attribute. It is extended
+/// with `-x` until it collides with no attribute the source already carries, so
+/// the instrumented copy can never shadow authored markup.
+const SOURCE_IDENTITY_ATTRIBUTE_BASE: &str = "data-lj-archiver-source-id";
+
 #[derive(Debug)]
 pub(crate) struct ScannedHtml {
     start_tags: Vec<ScannedStartTag>,
-    element_spans: HashMap<String, Vec<Range<usize>>>,
+    source_identity_attribute: String,
 }
 
+/// A start tag the source opened, addressed by its *source identity*: its index
+/// in [`ScannedHtml::start_tags`], which is also the value written into the
+/// instrumented copy.
 #[derive(Debug)]
 pub(crate) struct ScannedStartTag {
     name: String,
     source_range: Range<usize>,
+    name_source_end: usize,
+    element_range: Option<Range<usize>>,
     attributes: Vec<ScannedAttribute>,
 }
 
@@ -41,12 +51,71 @@ impl ScannedHtml {
         &self.start_tags
     }
 
-    pub(crate) fn element_spans(&self, name: &str) -> &[Range<usize>] {
-        self.element_spans
-            .get(name)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    /// The synthetic attribute name carried by [`Self::instrumented_html`].
+    pub(crate) fn source_identity_attribute(&self) -> &str {
+        &self.source_identity_attribute
     }
+
+    /// The immutable original byte range of the element opened by `identity`,
+    /// when the source closed it. `None` for a never-closed element and for an
+    /// identity the scan never assigned.
+    pub(crate) fn element_range(&self, identity: usize) -> Option<Range<usize>> {
+        self.start_tags
+            .get(identity)
+            .and_then(|tag| tag.element_range.clone())
+    }
+
+    /// A copy of `source` with the synthetic identity attribute added to every
+    /// source start tag, for semantic DOM parsing only. `source` must be the
+    /// input this [`ScannedHtml`] was scanned from.
+    ///
+    /// The original bytes are never modified, and only the original bytes are
+    /// ever emitted: passthrough and listing output is sliced from `source`
+    /// through [`Self::element_range`], never re-serialized from the DOM.
+    pub(crate) fn instrumented_html(&self, source: &str) -> String {
+        let attribute = &self.source_identity_attribute;
+        // ` name="1234"` per start tag.
+        let per_tag = attribute.len() + 8;
+        let mut instrumented =
+            String::with_capacity(source.len() + self.start_tags.len() * per_tag);
+        let mut cursor = 0;
+
+        for (identity, tag) in self.start_tags.iter().enumerate() {
+            instrumented.push_str(&source[cursor..tag.name_source_end]);
+            instrumented.push(' ');
+            instrumented.push_str(attribute);
+            instrumented.push_str("=\"");
+            instrumented.push_str(&identity.to_string());
+            instrumented.push('"');
+            cursor = tag.name_source_end;
+        }
+
+        instrumented.push_str(&source[cursor..]);
+        instrumented
+    }
+}
+
+/// Picks an attribute name no scanned start tag already uses, so instrumenting
+/// can never create a duplicate attribute (which html5ever resolves in favour of
+/// the first occurrence) or shadow an authored one.
+///
+/// Only names extending the base can collide, and gathering them up front keeps
+/// this linear: authoring `k` distinct extensions costs `Θ(k²)` input bytes, so
+/// the `Θ(k²)` candidate hashing is bounded by the input length.
+fn collision_free_identity_attribute(start_tags: &[ScannedStartTag]) -> String {
+    let authored: HashSet<&str> = start_tags
+        .iter()
+        .flat_map(|tag| &tag.attributes)
+        .map(|attribute| attribute.name.as_str())
+        .filter(|name| name.starts_with(SOURCE_IDENTITY_ATTRIBUTE_BASE))
+        .collect();
+
+    let mut candidate = SOURCE_IDENTITY_ATTRIBUTE_BASE.to_string();
+    while authored.contains(candidate.as_str()) {
+        candidate.push_str("-x");
+    }
+
+    candidate
 }
 
 impl ScannedStartTag {
@@ -54,12 +123,11 @@ impl ScannedStartTag {
         &self.name
     }
 
-    #[allow(dead_code)] // Consumed by the staged passthrough source migration.
+    #[allow(dead_code)] // Consumed by the passthrough coverage pass.
     pub(crate) fn source_range(&self) -> Range<usize> {
         self.source_range.clone()
     }
 
-    #[allow(dead_code)] // Consumed by the staged passthrough source migration.
     pub(crate) fn attributes(&self) -> &[ScannedAttribute] {
         &self.attributes
     }
@@ -72,7 +140,6 @@ impl ScannedStartTag {
 }
 
 impl ScannedAttribute {
-    #[allow(dead_code)] // Consumed by staged attribute-sensitive caller migrations.
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
@@ -85,7 +152,6 @@ impl ScannedAttribute {
         self.value_range.clone()
     }
 
-    #[allow(dead_code)] // Consumed by staged attribute-sensitive caller migrations.
     pub(crate) fn is_qualified(&self) -> bool {
         self.qualified
     }
@@ -100,12 +166,17 @@ struct RawAttribute {
 struct RawStartTag {
     normalized_name: String,
     source_range: Range<usize>,
+    name_source_end: usize,
+    /// Filled in when the matching closing tag is found; permanently `None` if
+    /// the source never closes this element.
+    element_range: Option<Range<usize>>,
     attributes: Vec<RawAttribute>,
 }
 
 struct ParsedTag {
     normalized_name: String,
     source_range: Range<usize>,
+    name_source_end: usize,
     attributes: Vec<RawAttribute>,
     closing: bool,
 }
@@ -221,7 +292,7 @@ fn scan_with_source_steps(source: &str) -> Result<(ScannedHtml, usize), ScanErro
 }
 
 fn scan_impl(source: &str, mut source_steps: Option<&mut usize>) -> Result<ScannedHtml, ScanError> {
-    let (raw_start_tags, element_spans) = scan_source(source, &mut source_steps);
+    let raw_start_tags = scan_source(source, &mut source_steps);
     let semantic_start_tags = tokenize(source);
 
     if semantic_start_tags.len() != raw_start_tags.len() {
@@ -236,6 +307,7 @@ fn scan_impl(source: &str, mut source_steps: Option<&mut usize>) -> Result<Scann
     }
 
     let mut start_tags = Vec::with_capacity(raw_start_tags.len());
+    let mut previous_name_source_end = 0;
     for (token_index, (semantic, raw)) in semantic_start_tags
         .into_iter()
         .zip(raw_start_tags)
@@ -298,22 +370,23 @@ fn scan_impl(source: &str, mut source_steps: Option<&mut usize>) -> Result<Scann
         }
 
         validate_range(source, &raw.source_range, token_index)?;
+        validate_optional_range(source, raw.element_range.as_ref(), token_index)?;
+        validate_name_source_end(source, &raw, previous_name_source_end, token_index)?;
+        previous_name_source_end = raw.name_source_end;
         start_tags.push(ScannedStartTag {
             name: semantic.name,
             source_range: raw.source_range,
+            name_source_end: raw.name_source_end,
+            element_range: raw.element_range,
             attributes,
         });
     }
 
-    for spans in element_spans.values() {
-        for span in spans {
-            validate_range(source, span, start_tags.len())?;
-        }
-    }
+    let source_identity_attribute = collision_free_identity_attribute(&start_tags);
 
     Ok(ScannedHtml {
         start_tags,
-        element_spans,
+        source_identity_attribute,
     })
 }
 
@@ -344,6 +417,30 @@ fn validate_optional_range(
     Ok(())
 }
 
+/// The synthetic identity attribute is spliced in at `name_source_end`, so that
+/// offset must be a char boundary inside the tag's own source range, and the
+/// offsets must ascend with the tags: [`ScannedHtml::instrumented_html`] walks
+/// them once, left to right, slicing the original input between them.
+fn validate_name_source_end(
+    source: &str,
+    tag: &RawStartTag,
+    previous: usize,
+    token_index: usize,
+) -> Result<(), ScanError> {
+    let name_source_end = tag.name_source_end;
+    if name_source_end < previous
+        || name_source_end < tag.source_range.start
+        || name_source_end > tag.source_range.end
+        || !source.is_char_boundary(name_source_end)
+    {
+        return Err(alignment_error(
+            token_index,
+            format!("invalid tag name end {name_source_end}"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_range(source: &str, range: &Range<usize>, token_index: usize) -> Result<(), ScanError> {
     if range.start > range.end
         || range.end > source.len()
@@ -358,14 +455,17 @@ fn validate_range(source: &str, range: &Range<usize>, token_index: usize) -> Res
     Ok(())
 }
 
-fn scan_source(
-    source: &str,
-    source_steps: &mut Option<&mut usize>,
-) -> (Vec<RawStartTag>, HashMap<String, Vec<Range<usize>>>) {
+/// Recovers every start tag the source opened, in source order. A tag's index in
+/// the result is its *source identity*: the handle every later stage uses to
+/// address its original bytes, in place of a per-name ordinal that DOM
+/// reordering can invalidate.
+fn scan_source(source: &str, source_steps: &mut Option<&mut usize>) -> Vec<RawStartTag> {
     let bytes = source.as_bytes();
-    let mut raw_start_tags = Vec::new();
-    let mut slots: HashMap<String, Vec<Option<Range<usize>>>> = HashMap::new();
-    let mut open_stacks: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut raw_start_tags: Vec<RawStartTag> = Vec::new();
+    // Per name, the stack of open identities awaiting their close. Each identity
+    // resolves independently: unlike the former per-name truncation, one
+    // unclosed element no longer discards every later element of the same name.
+    let mut open_stacks: HashMap<String, Vec<usize>> = HashMap::new();
     let mut cursor = 0;
 
     while cursor < bytes.len() {
@@ -398,38 +498,34 @@ fn scan_source(
             TagScan::Unclosed => break,
             TagScan::Complete(tag) => {
                 cursor = tag.source_range.end;
-                let name = tag.normalized_name.clone();
+                let name = tag.normalized_name;
 
                 if tag.closing {
-                    if let Some((slot, open_start)) = open_stacks.get_mut(&name).and_then(Vec::pop)
-                        && let Some(list) = slots.get_mut(&name)
-                    {
-                        list[slot] = Some(open_start..tag.source_range.end);
+                    if let Some(identity) = open_stacks.get_mut(&name).and_then(Vec::pop) {
+                        let open_start = raw_start_tags[identity].source_range.start;
+                        raw_start_tags[identity].element_range =
+                            Some(open_start..tag.source_range.end);
                     }
                     continue;
                 }
 
-                if is_void_tag(&name) {
-                    slots
-                        .entry(name.clone())
-                        .or_default()
-                        .push(Some(tag.source_range.clone()));
-                } else {
-                    let list = slots.entry(name.clone()).or_default();
-                    let slot = list.len();
-                    list.push(None);
-                    open_stacks
-                        .entry(name.clone())
-                        .or_default()
-                        .push((slot, tag.source_range.start));
-                }
-
+                let identity = raw_start_tags.len();
                 let opaque = is_opaque_tag(&name);
+                // A void element is complete at its own start tag. Any other
+                // element — including a self-closing non-void tag such as
+                // `<div/>`, which html5ever does *not* treat as closed — waits
+                // for a real closing tag on the per-name stack.
+                let void = is_void_tag(&name);
                 raw_start_tags.push(RawStartTag {
                     normalized_name: name.clone(),
-                    source_range: tag.source_range,
+                    source_range: tag.source_range.clone(),
+                    name_source_end: tag.name_source_end,
+                    element_range: void.then_some(tag.source_range),
                     attributes: tag.attributes,
                 });
+                if !void {
+                    open_stacks.entry(name.clone()).or_default().push(identity);
+                }
 
                 if opaque {
                     if name == "plaintext" {
@@ -446,11 +542,7 @@ fn scan_source(
         }
     }
 
-    let element_spans = slots
-        .into_iter()
-        .map(|(name, list)| (name, list.into_iter().map_while(|slot| slot).collect()))
-        .collect();
-    (raw_start_tags, element_spans)
+    raw_start_tags
 }
 
 fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -> TagScan {
@@ -469,6 +561,10 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
     }
 
     let mut normalized_name = String::new();
+    // The byte offset just past the tag name in the *source*. `\0` normalizes to
+    // U+FFFD, so the source length and `normalized_name.len()` can differ; the
+    // synthetic identity attribute is inserted here and must use source bytes.
+    let mut name_source_end = cursor;
     let mut attributes = Vec::new();
     let mut pending_attribute: Option<PendingAttribute> = None;
     let mut attribute_value_start = cursor;
@@ -494,9 +590,9 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
                 '>' => {
                     cursor += current_len;
                     return complete_tag(
-                        start,
-                        cursor,
+                        start..cursor,
                         normalized_name,
+                        name_source_end,
                         attributes,
                         pending_attribute,
                         closing,
@@ -505,10 +601,12 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
                 '\0' => {
                     normalized_name.push('\u{fffd}');
                     cursor += current_len;
+                    name_source_end = cursor;
                 }
                 _ => {
                     normalized_name.push(current.to_ascii_lowercase());
                     cursor += current_len;
+                    name_source_end = cursor;
                 }
             },
             TagState::BeforeAttributeName => match current {
@@ -521,7 +619,14 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
                 '>' => {
                     finish_pending_attribute(&mut attributes, &mut pending_attribute);
                     cursor += current_len;
-                    return complete_tag(start, cursor, normalized_name, attributes, None, closing);
+                    return complete_tag(
+                        start..cursor,
+                        normalized_name,
+                        name_source_end,
+                        attributes,
+                        None,
+                        closing,
+                    );
                 }
                 _ => {
                     pending_attribute = Some(PendingAttribute {
@@ -550,7 +655,14 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
                 '>' => {
                     finish_pending_attribute(&mut attributes, &mut pending_attribute);
                     cursor += current_len;
-                    return complete_tag(start, cursor, normalized_name, attributes, None, closing);
+                    return complete_tag(
+                        start..cursor,
+                        normalized_name,
+                        name_source_end,
+                        attributes,
+                        None,
+                        closing,
+                    );
                 }
                 _ => {
                     if let Some(attribute) = pending_attribute.as_mut() {
@@ -574,7 +686,14 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
                 '>' => {
                     finish_pending_attribute(&mut attributes, &mut pending_attribute);
                     cursor += current_len;
-                    return complete_tag(start, cursor, normalized_name, attributes, None, closing);
+                    return complete_tag(
+                        start..cursor,
+                        normalized_name,
+                        name_source_end,
+                        attributes,
+                        None,
+                        closing,
+                    );
                 }
                 _ => {
                     finish_pending_attribute(&mut attributes, &mut pending_attribute);
@@ -597,7 +716,14 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
                     set_pending_value(&mut pending_attribute, cursor..cursor);
                     finish_pending_attribute(&mut attributes, &mut pending_attribute);
                     cursor += current_len;
-                    return complete_tag(start, cursor, normalized_name, attributes, None, closing);
+                    return complete_tag(
+                        start..cursor,
+                        normalized_name,
+                        name_source_end,
+                        attributes,
+                        None,
+                        closing,
+                    );
                 }
                 _ => {
                     attribute_value_start = cursor;
@@ -631,7 +757,14 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
                     set_pending_value(&mut pending_attribute, attribute_value_start..cursor);
                     finish_pending_attribute(&mut attributes, &mut pending_attribute);
                     cursor += current_len;
-                    return complete_tag(start, cursor, normalized_name, attributes, None, closing);
+                    return complete_tag(
+                        start..cursor,
+                        normalized_name,
+                        name_source_end,
+                        attributes,
+                        None,
+                        closing,
+                    );
                 }
                 _ => cursor += current_len,
             },
@@ -646,7 +779,14 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
                 }
                 '>' => {
                     cursor += current_len;
-                    return complete_tag(start, cursor, normalized_name, attributes, None, closing);
+                    return complete_tag(
+                        start..cursor,
+                        normalized_name,
+                        name_source_end,
+                        attributes,
+                        None,
+                        closing,
+                    );
                 }
                 _ => state = TagState::BeforeAttributeName,
             },
@@ -654,7 +794,14 @@ fn scan_tag(source: &str, start: usize, source_steps: &mut Option<&mut usize>) -
                 if current == '>' {
                     finish_pending_attribute(&mut attributes, &mut pending_attribute);
                     cursor += current_len;
-                    return complete_tag(start, cursor, normalized_name, attributes, None, closing);
+                    return complete_tag(
+                        start..cursor,
+                        normalized_name,
+                        name_source_end,
+                        attributes,
+                        None,
+                        closing,
+                    );
                 }
                 state = TagState::BeforeAttributeName;
             }
@@ -693,9 +840,9 @@ fn finish_pending_attribute(
 }
 
 fn complete_tag(
-    start: usize,
-    end: usize,
+    source_range: Range<usize>,
     normalized_name: String,
+    name_source_end: usize,
     mut attributes: Vec<RawAttribute>,
     mut pending_attribute: Option<PendingAttribute>,
     closing: bool,
@@ -703,7 +850,8 @@ fn complete_tag(
     finish_pending_attribute(&mut attributes, &mut pending_attribute);
     TagScan::Complete(ParsedTag {
         normalized_name,
-        source_range: start..end,
+        source_range,
+        name_source_end,
         attributes,
         closing,
     })
@@ -1080,8 +1228,19 @@ fn starts_with_ascii_case_insensitive_at(bytes: &[u8], index: usize, needle: &[u
 mod tests {
     use super::*;
 
+    /// The identities of every start tag the scan recovered under `name`, in
+    /// source order.
+    fn identities_named(scanned: &ScannedHtml, name: &str) -> Vec<usize> {
+        scanned
+            .start_tags()
+            .iter()
+            .enumerate()
+            .filter(|(_, tag)| tag.name() == name)
+            .map(|(identity, _)| identity)
+            .collect()
+    }
+
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
     fn bogus_declarations_and_processing_instructions_are_opaque() {
         for input in [
             "<!foo <div>fake</div>><div>real</div>",
@@ -1090,9 +1249,9 @@ mod tests {
             let real_start = input.find("<div>real</div>").unwrap();
             let scanned = scan(input).unwrap();
 
-            assert_eq!(scanned.element_spans("div"), &[real_start..input.len()]);
             assert_eq!(scanned.start_tags().len(), 1);
             assert_eq!(scanned.start_tags()[0].name(), "div");
+            assert_eq!(scanned.element_range(0), Some(real_start..input.len()));
         }
     }
 
@@ -1132,12 +1291,118 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
     fn double_escaped_script_data_uses_the_real_closing_tag_span() {
         let input = "<script><!--<script></script>--></script>";
         let scanned = scan(input).unwrap();
 
-        assert_eq!(scanned.element_spans("script"), &[0..input.len()]);
+        assert_eq!(scanned.start_tags().len(), 1);
+        assert_eq!(scanned.element_range(0), Some(0..input.len()));
+    }
+
+    #[test]
+    fn assigns_identities_and_completed_element_ranges() {
+        let source = r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#;
+        let scanned = scan(source).unwrap();
+
+        let divs = identities_named(&scanned, "div");
+        assert_eq!(divs.len(), 2);
+        assert_eq!(
+            &source[scanned.element_range(divs[0]).unwrap()],
+            "<div>CELL</div>"
+        );
+        assert_eq!(
+            &source[scanned.element_range(divs[1]).unwrap()],
+            "<div>FOSTER</div>"
+        );
+        assert_eq!(
+            &source[scanned
+                .element_range(identities_named(&scanned, "table")[0])
+                .unwrap()],
+            source
+        );
+    }
+
+    #[test]
+    fn one_unclosed_element_does_not_discard_later_same_name_elements() {
+        let source = r#"<div>open<span>a</span><div>closed</div>"#;
+        let scanned = scan(source).unwrap();
+        let divs = identities_named(&scanned, "div");
+
+        // The outer div never closes; the inner one still resolves.
+        assert_eq!(scanned.element_range(divs[0]), None);
+        assert_eq!(
+            &source[scanned.element_range(divs[1]).unwrap()],
+            "<div>closed</div>"
+        );
+    }
+
+    #[test]
+    fn instrumented_html_adds_one_identity_per_start_tag() {
+        let source = r#"<p class="x">a<br>b</p>"#;
+        let scanned = scan(source).unwrap();
+        let instrumented = scanned.instrumented_html(source);
+
+        assert_eq!(
+            instrumented,
+            concat!(
+                r#"<p data-lj-archiver-source-id="0" class="x">"#,
+                r#"a<br data-lj-archiver-source-id="1">b</p>"#,
+            )
+        );
+        assert_eq!(
+            instrumented
+                .matches(scanned.source_identity_attribute())
+                .count(),
+            scanned.start_tags().len()
+        );
+    }
+
+    #[test]
+    fn instrumented_identity_attribute_avoids_authored_collisions() {
+        let source = r#"<div data-lj-archiver-source-id="9">x</div>"#;
+        let scanned = scan(source).unwrap();
+
+        assert_eq!(
+            scanned.source_identity_attribute(),
+            "data-lj-archiver-source-id-x"
+        );
+        assert_eq!(
+            scanned.instrumented_html(source),
+            concat!(
+                r#"<div data-lj-archiver-source-id-x="0" "#,
+                r#"data-lj-archiver-source-id="9">x</div>"#,
+            )
+        );
+    }
+
+    #[test]
+    fn instrumented_html_keeps_scan_alignment() {
+        for source in [
+            r#"<div/>trailing"#,
+            r#"<p>a<br>b</p>"#,
+            r#"<table><tr><td>c</td></tr></table>"#,
+            r#"<div data-lj-archiver-source-id="9">x</div>"#,
+            "<div\0x>nul in tag name</div\0x>",
+            r#"<a/href="/x">slash before attribute</a>"#,
+            "<script>const x = \"<div>fake</div>\";</script><div>real</div>",
+            "<!-- <div>fake</div> --><div title='real'>real</div>",
+        ] {
+            let scanned = scan(source).unwrap();
+            let instrumented = scanned.instrumented_html(source);
+            let rescanned = scan(&instrumented).expect(source);
+
+            let names: Vec<_> = scanned
+                .start_tags()
+                .iter()
+                .map(ScannedStartTag::name)
+                .collect();
+            let rescanned_names: Vec<_> = rescanned
+                .start_tags()
+                .iter()
+                .map(ScannedStartTag::name)
+                .collect();
+            assert_eq!(rescanned_names, names, "{source}");
+        }
     }
 
     #[test]

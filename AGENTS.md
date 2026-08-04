@@ -186,7 +186,33 @@ Treat comments and media as part of the archive record. Do not silently drop con
 
 For journal archives, preserve the current resilient behavior: continue past individual post failures, write successful posts, and return a nonzero status when any post failed.
 
-The AsciiDoc renderer (`src/adoc/`) produces byte-exact output guarded by a large black-box test suite; change it with care and assert exact output. Passthrough source recovery precomputes range-backed original-byte mappings with one tokenizer-compatible source scan plus one DOM traversal; both must remain linear. The shared scanner treats comments, declarations, and raw-text/RCDATA payloads as opaque, and aligns tokenizer-decoded attributes with ranges into the unchanged input rather than decoding or rescanning source values itself. Script payload scanning must retain ScriptData escaped and double-escaped states: an appropriate `</script>` in double-escaped data only returns to escaped data, so it is not the element's structural close. Quotes enter quoted attribute-value state only after `=`, and a self-closing non-void tag stays on the tag stack so normalized fallback retains its trailing children. A `ScanError` means alignment is unavailable: callers must use their explicit conservative fallback or return a parse error, never guess source ranges or attributes. Raw-text collection is iterative, while recursive rendering and plain-inline collection are capped at `MAX_RENDER_DEPTH`; missing a recursive cap lets deeply nested input overflow the stack (an uncatchable abort).
+The AsciiDoc renderer (`src/adoc/`) produces byte-exact output guarded by a large black-box test suite; change it with care and assert exact output. Passthrough source recovery precomputes range-backed original-byte mappings with one tokenizer-compatible source scan plus one DOM traversal; both must remain linear, and the mappings are addressed by **source identity**, never by a per-name ordinal (see the next paragraph). The shared scanner treats comments, declarations, and raw-text/RCDATA payloads as opaque, and aligns tokenizer-decoded attributes with ranges into the unchanged input rather than decoding or rescanning source values itself. Script payload scanning must retain ScriptData escaped and double-escaped states: an appropriate `</script>` in double-escaped data only returns to escaped data, so it is not the element's structural close. Quotes enter quoted attribute-value state only after `=`, and a self-closing non-void tag stays on the tag stack because html5ever nests the following flow content inside it rather than closing it — so it has no completed element range and its content is recovered through an enclosing range instead of being dropped. A `ScanError` means alignment is unavailable: callers must use their explicit conservative fallback or return a parse error, never guess source ranges or attributes. Raw-text collection is iterative, while recursive rendering and plain-inline collection are capped at `MAX_RENDER_DEPTH`; missing a recursive cap lets deeply nested input overflow the stack (an uncatchable abort).
+
+`html_scan::scan` numbers every source start tag — that index is its **source
+identity** — and records the tag's completed element range.
+`ScannedHtml::instrumented_html` returns a copy of the input carrying a
+collision-free synthetic `data-lj-archiver-source-id` attribute on each of those
+tags, and `html_to_adoc_with_links` parses *that* copy so `build_source_index`
+can read each node's identity directly instead of inferring it. This is
+load-bearing: html5ever reorders elements relative to the source — foster
+parenting moves `<div>FOSTER</div>` out of
+`<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>` to *before*
+the table, and the adoption agency clones formatting elements — so the former
+per-name ordinal correlation silently emitted one element's bytes for another.
+Instrumenting cannot move a node: every attribute the tree-construction
+algorithm branches on is a specific authored name (`type` on `<input>` in a
+table, `color`/`face`/`size` on `<font>` in foreign content, `encoding` on
+`<annotation-xml>`), the synthetic name is none of them, and it is extended with
+`-x` until no authored attribute shares it, so it can never shadow one or create
+the duplicate that html5ever would resolve in favour of the first occurrence.
+Only tags the scanner recovered are instrumented, so raw-text/RCDATA payloads,
+comments, and attribute values are never rewritten. Two rules keep the synthetic
+attribute invisible: only the original input is ever sliced for output
+(`ctx.source_html`), and a node with no scanner-owned range is **never**
+re-serialized — it falls back to an inert listing of the smallest enclosing
+known source range, because `element.html()` would both carry the synthetic
+attribute and invent markup the archive never had (an inserted `<tbody>`, a
+synthesized closing tag, a normalized `<div/>`).
 
 The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
@@ -251,10 +277,11 @@ rerender with another fresh namespace; four-attempt exhaustion is a
 Unsupported HTML remains exact source-preserved raw passthrough only when the
 shared scanner classifies every tokenizer-decoded capability as reviewed and
 inert. HTML-to-AsciiDoc conversion performs one authoritative scan before DOM
-rendering and reuses that successful scan for source-map construction. Any
-`ScanError` returns one visible listing of the complete unchanged input
-fragment; do not continue with an empty map, serialize an unmapped element, or
-rescan normalized fallback HTML as though it were trusted original source. The
+rendering and reuses that successful scan for both instrumentation and
+source-index construction. Any `ScanError` returns one visible listing of the
+complete unchanged input fragment; do not continue with an empty index, and
+never serialize an unmapped element — there is no normalized-fallback HTML, and
+a DOM serialization is neither the archived bytes nor trusted original source. The
 element allowlist is ordinary structural/phrasing HTML through
 tables; the only global attributes are `class`, `id`, `title`, `lang`, `dir`,
 `role`, and `aria-*`. Tag-specific attributes are limited to `a[href]`,

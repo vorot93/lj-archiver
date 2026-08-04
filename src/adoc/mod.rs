@@ -175,14 +175,19 @@ pub fn html_to_adoc_with_links(html: &str, link_rewriter: Option<&LinkRewriter>)
         Ok(scanned) => scanned,
         Err(_) => return render_source_listing(html),
     };
-    let fragment = Html::parse_fragment(html);
-    let source_map = build_source_map(&fragment, &scanned);
+    // Parse the instrumented copy so every semantic node carries the source
+    // identity that owns its original bytes. `ctx.source_html` stays the
+    // *original* input: every emitted byte is sliced from it, never from the
+    // instrumented copy and never re-serialized from the DOM.
+    let instrumented = scanned.instrumented_html(html);
+    let fragment = Html::parse_fragment(&instrumented);
+    let source_index = build_source_index(&fragment, &scanned);
     let mut output = String::new();
     let mut inline_output = String::new();
     let mut plain_text = String::new();
     let ctx = RenderCtx {
         source_html: html,
-        source_map: &source_map,
+        source_index: &source_index,
         depth: 0,
         list_depth: 0,
         link_rewriter,
@@ -252,7 +257,7 @@ const MAX_RENDER_DEPTH: usize = 256;
 #[derive(Clone, Copy)]
 struct RenderCtx<'a> {
     source_html: &'a str,
-    source_map: &'a SourceMap,
+    source_index: &'a SourceIndex,
     depth: usize,
     list_depth: usize,
     link_rewriter: Option<&'a LinkRewriter>,
@@ -1395,6 +1400,70 @@ mod tests {
         assert_eq!(
             html_to_adoc(html),
             "++++\n<div title='bang'>real</div>\n++++\n\n"
+        );
+    }
+
+    #[test]
+    fn foster_parented_same_name_elements_keep_their_own_source_bytes() {
+        let html = r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#;
+        let rendered = html_to_adoc(html);
+
+        assert!(
+            !rendered.contains("<div>CELL</div>\n++++\n\n++++\n<table>"),
+            "foster-parented div was emitted with the cell div's bytes: {rendered}"
+        );
+    }
+
+    #[test]
+    fn synthetic_source_identity_never_reaches_output() {
+        for html in [
+            r#"<table><tr><td>c</td></tr></table>"#,
+            r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#,
+            r#"<div><span>text</span><table><tr><td>x</td></tr></table></div>"#,
+            r#"<div/>trailing<table><tr><td>c</td></tr></table>"#,
+            r#"<pre><table><tr><td>c</td></tr></table></pre>"#,
+        ] {
+            let rendered = html_to_adoc(html);
+            assert!(
+                !rendered.contains("lj-archiver-source-id"),
+                "synthetic identity leaked for {html}: {rendered}"
+            );
+        }
+    }
+
+    /// The source may already carry the synthetic attribute's base name. The
+    /// scanner then instruments under a suffixed name, and neither name may
+    /// reach the output: the authored one survives byte-for-byte because output
+    /// is sliced from the original input, and the suffixed one never appears at
+    /// all because the instrumented copy is only ever parsed.
+    #[test]
+    fn existing_source_identity_attribute_is_preserved_byte_for_byte() {
+        let html =
+            r#"<div data-lj-archiver-source-id="7"><table><tr><td>c</td></tr></table></div>"#;
+        let rendered = html_to_adoc(html);
+
+        assert_eq!(
+            rendered,
+            format!("[subs=specialcharacters]\n----\n{html}\n----\n\n")
+        );
+        assert!(
+            !rendered.contains("data-lj-archiver-source-id-x"),
+            "collision-avoiding synthetic identity leaked: {rendered}"
+        );
+    }
+
+    /// An authored `<html>` start tag merges its attributes onto the fragment
+    /// parser's own root element, so that root can absorb a source identity it
+    /// does not own. Indexing it would give every unmapped node an "enclosing"
+    /// range that ends before them — here, dropping everything after
+    /// `</html>`.
+    #[test]
+    fn an_authored_html_element_never_becomes_an_enclosing_source_range() {
+        let adoc = html_to_adoc(r#"<html>a</html><div/>b"#);
+
+        assert!(
+            adoc.contains("<div/>b"),
+            "content after an authored </html> was dropped: {adoc}"
         );
     }
 

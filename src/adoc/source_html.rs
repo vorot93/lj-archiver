@@ -1,10 +1,24 @@
 use super::{RenderCtx, classify::is_stripped_chrome, render_specialcharacters_listing};
 use ego_tree::NodeId;
 use scraper::{ElementRef, Html, node::Node};
-use std::{borrow::Cow, collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range};
 use url::Url;
 
-pub(crate) type SourceMap = HashMap<NodeId, Range<usize>>;
+/// Maps semantic DOM nodes to scanner-owned original byte ranges through the
+/// synthetic identity attribute carried by the instrumented parse. Because the
+/// identity is read from the node itself rather than inferred from a per-name
+/// ordinal, DOM reordering (html5ever foster parenting, adoption agency
+/// cloning) can no longer exchange same-name spans.
+#[derive(Debug, Default)]
+pub(crate) struct SourceIndex {
+    ranges: HashMap<NodeId, Range<usize>>,
+}
+
+impl SourceIndex {
+    pub(crate) fn range(&self, node: NodeId) -> Option<Range<usize>> {
+        self.ranges.get(&node).cloned()
+    }
+}
 
 const SAFE_ELEMENTS: &[&str] = &[
     "a",
@@ -84,13 +98,15 @@ pub(crate) fn render_passthrough(element: ElementRef<'_>, ctx: RenderCtx<'_>) ->
         return String::new();
     }
 
-    let html = source_preserving_html(element, ctx);
+    let Some(html) = source_preserving_html(element, ctx) else {
+        return render_enclosing_source_listing(element, ctx);
+    };
 
-    if !passthrough_is_safe(html.as_ref()) {
-        return render_source_listing(html.as_ref());
+    if !passthrough_is_safe(html) {
+        return render_source_listing(html);
     }
 
-    let delimiter = safe_block_delimiter(html.as_ref(), '+');
+    let delimiter = safe_block_delimiter(html, '+');
 
     format!("{delimiter}\n{html}\n{delimiter}\n\n")
 }
@@ -196,70 +212,71 @@ fn safe_block_delimiter_impl(
     character.to_string().repeat(maximum.max(3) + 1)
 }
 
-fn source_preserving_html<'a>(element: ElementRef<'_>, ctx: RenderCtx<'a>) -> Cow<'a, str> {
-    if let Some(range) = ctx.source_map.get(&element.id()) {
-        return Cow::Borrowed(&ctx.source_html[range.clone()]);
-    }
-
-    let html = element.html();
-    if element.value().name() == "table" {
-        let without_inserted_tbody = html.replace("<tbody>", "").replace("</tbody>", "");
-        if ctx.source_html.contains(&without_inserted_tbody) {
-            return Cow::Owned(without_inserted_tbody);
-        }
-    }
-
-    Cow::Owned(html)
+fn source_preserving_html<'a>(element: ElementRef<'_>, ctx: RenderCtx<'a>) -> Option<&'a str> {
+    ctx.source_index
+        .range(element.id())
+        .map(|range| &ctx.source_html[range])
 }
 
-/// Precompute the original source byte range of every element in the document
-/// with one linear scan of the source plus one walk of the DOM, instead of
-/// rescanning the whole tree and source once per passthrough (which was O(n^2)
-/// for deeply nested content).
+/// A node with no scanner-owned range must never be re-serialized: the
+/// serialization would carry the synthetic identity attribute and would not be
+/// the archived bytes. Emit the smallest enclosing original source range that is
+/// known instead, as one inert listing — the same fail-closed response the
+/// renderer already gives to scanner ambiguity.
+fn render_enclosing_source_listing(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
+    let enclosing = element
+        .ancestors()
+        .find_map(|ancestor| ctx.source_index.range(ancestor.id()))
+        .map_or(ctx.source_html, |range| &ctx.source_html[range]);
+
+    render_source_listing(enclosing)
+}
+
+/// Builds the DOM-node → original-source index from the instrumented parse with
+/// one walk of the DOM, instead of rescanning the tree and source once per
+/// passthrough (which was O(n^2) for deeply nested content).
 ///
-/// Each element maps to the source range of the k-th source element of the
-/// same (lowercased) tag name, where k is the element's document-order ordinal
-/// among elements of that name. Because the DOM is parsed from the source, the
-/// k-th element of a given name in DOM document order is the k-th of that name in
-/// source document order, so this reproduces the former
-/// `(name, serialized-html)` matching byte-for-byte: the html refinement only
-/// partitioned each name's elements without reordering them, and source/DOM order
-/// already align 1:1 per name. Parser-inserted elements (e.g. `<tbody>`) have no
-/// source counterpart, so the DOM holds more elements of that name than the
-/// source recovered; the counter runs past the recovered spans and those
-/// elements get no entry, falling back through `source_preserving_html` exactly
-/// as before. No `element.html()` and no per-candidate re-parse are performed.
+/// The instrumented copy adds one synthetic identity attribute per *source*
+/// start tag, so a node carries an identity exactly when the source opened it.
+/// Parser-inserted nodes (`<tbody>`) carry none and get no entry; a source
+/// element the document never closed — which includes a self-closing non-void
+/// tag such as `<div/>`, since html5ever nests the following flow content inside
+/// it rather than closing it — has an identity but no completed range, and also
+/// gets no entry. Both cases fail closed in [`render_passthrough`] rather than
+/// falling back to re-serialization, because a re-serialized node would carry
+/// the synthetic attribute and would not be the archived bytes.
 ///
-/// One intentional, content-preserving deviation from "byte-for-byte": a
-/// self-closing tag on a non-void element (e.g. `<div/>`) is *not* treated as
-/// closed here, because html5ever does not treat it as closed either — the
-/// following flow content is nested inside it. Such an element's slot is left
-/// open, so it gets no entry and falls back to `source_preserving_html`'s
-/// `element.html()`, trading a raw `<div/>` for a normalized
-/// `<div>...</div>` rather than silently dropping the nested content.
-pub(crate) fn build_source_map(
+/// The fragment parser's own `<html>` root is skipped: it is not an archived
+/// element, but an authored `<html>` start tag merges its attributes — including
+/// the synthetic identity — onto it. Indexing it would hand every unmapped node
+/// an "enclosing" range that need not enclose it at all, silently dropping
+/// everything the authored `<html>` element did not cover.
+pub(crate) fn build_source_index(
     document: &Html,
     scanned: &crate::html_scan::ScannedHtml,
-) -> SourceMap {
-    let mut counters: HashMap<String, usize> = HashMap::new();
-    let mut source_map = HashMap::new();
+) -> SourceIndex {
+    let attribute = scanned.source_identity_attribute();
+    let fragment_root = document.root_element().id();
+    let mut index = SourceIndex::default();
 
     for node in document.tree.root().descendants() {
-        let Some(element) = ElementRef::wrap(node) else {
+        let Some(element) = ElementRef::wrap(node).filter(|element| element.id() != fragment_root)
+        else {
+            continue;
+        };
+        let Some(range) = element
+            .value()
+            .attr(attribute)
+            .and_then(|identity| identity.parse::<usize>().ok())
+            .and_then(|identity| scanned.element_range(identity))
+        else {
             continue;
         };
 
-        let name = element.value().name().to_ascii_lowercase();
-        let ordinal = *counters.get(&name).unwrap_or(&0);
-
-        if let Some(span) = scanned.element_spans(&name).get(ordinal) {
-            source_map.insert(element.id(), span.clone());
-        }
-
-        *counters.entry(name).or_insert(0) += 1;
+        index.ranges.insert(element.id(), range);
     }
 
-    source_map
+    index
 }
 
 pub(crate) fn raw_text(element: ElementRef<'_>) -> String {
@@ -279,7 +296,68 @@ pub(crate) fn raw_text(element: ElementRef<'_>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_source_listing;
+    use super::*;
+
+    /// One entry per node in document order, carrying nesting depth, element
+    /// name and attributes, or text. `ignored` is the synthetic identity
+    /// attribute — the single difference the instrumented parse may have.
+    fn dom_shape(document: &Html, ignored: &str) -> Vec<String> {
+        document
+            .tree
+            .root()
+            .descendants()
+            .filter_map(|node| {
+                let depth = node.ancestors().count();
+                match node.value() {
+                    Node::Element(element) => {
+                        let attributes = element
+                            .attrs()
+                            .filter(|(name, _)| *name != ignored)
+                            .map(|(name, value)| format!(" {name}={value:?}"))
+                            .collect::<String>();
+                        Some(format!("{depth}:<{}{attributes}>", element.name()))
+                    }
+                    Node::Text(text) => Some(format!("{depth}:#{}", &**text)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// The instrumented parse is only trustworthy if adding the synthetic
+    /// attribute changes nothing else. Every attribute the HTML tree
+    /// construction algorithm branches on is a specific authored name (`type` on
+    /// `<input>` in a table, `color`/`face`/`size` on `<font>` in foreign
+    /// content, `encoding` on `<annotation-xml>`), and the synthetic name is
+    /// none of them — nor any authored name, by construction — so it can neither
+    /// move a node nor shadow an authored attribute.
+    #[test]
+    fn instrumenting_changes_nothing_but_the_synthetic_attribute() {
+        for source in [
+            r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#,
+            r#"<table><input type="hidden" name="x"><tr><td>c</td></tr></table>"#,
+            r#"<p><b>a<i>b</p>c</i>d"#,
+            r#"<a href="/1">1<a href="/2">2"#,
+            r#"<svg><font color="red">x</font><circle/>tail</svg>"#,
+            r#"<math><annotation-xml encoding="text/html"><div>x</div></annotation-xml></math>"#,
+            r#"<div/>trailing"#,
+            r#"<select><option>a<option>b</select>"#,
+            r#"<html lang="en"><body class="b"><p>x</p>"#,
+            r#"<table><caption><table><tr><td>inner</td></tr></table></caption></table>"#,
+            r#"<div data-lj-archiver-source-id="9"><table><tr><td>c</td></tr></table></div>"#,
+        ] {
+            let scanned = crate::html_scan::scan(source).unwrap();
+            let identity = scanned.source_identity_attribute();
+            let plain = Html::parse_fragment(source);
+            let instrumented = Html::parse_fragment(&scanned.instrumented_html(source));
+
+            assert_eq!(
+                dom_shape(&instrumented, identity),
+                dom_shape(&plain, identity),
+                "instrumenting changed the tree for {source}"
+            );
+        }
+    }
 
     #[test]
     fn source_listing_declares_specialcharacters_only_substitutions() {
@@ -299,7 +377,18 @@ mod tests {
         let depth = 4_000;
         let html = format!("{}x{}", "<div>".repeat(depth), "</div>".repeat(depth));
         let scanned = crate::html_scan::scan(&html).unwrap();
-        let divs = scanned.element_spans("div");
+        let fragment = Html::parse_fragment(&scanned.instrumented_html(&html));
+        let index = build_source_index(&fragment, &scanned);
+
+        let divs: Vec<_> = fragment
+            .tree
+            .root()
+            .descendants()
+            .filter_map(ElementRef::wrap)
+            .filter(|element| element.value().name() == "div")
+            .map(|element| index.range(element.id()).expect("div has a source range"))
+            .collect();
+
         assert_eq!(divs.len(), depth);
         assert_eq!(divs[0], 0..html.len());
         assert!(divs.windows(2).all(|pair| pair[0].start < pair[1].start));
