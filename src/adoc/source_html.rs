@@ -953,7 +953,11 @@ mod tests {
     /// `ifdef::`/`ifndef::` wrapper, and that would silently undo the reason
     /// escaping *both* directive families inside a listing is sound. Pin the
     /// composition site's own guard so the change trips a test instead.
+    ///
+    /// `cfg(debug_assertions)` because the guard is a `debug_assert!`; a release
+    /// test run compiles it out and the panic never comes.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "a conditional directive line reached a generated passthrough block")]
     fn a_generated_conditional_refuses_to_wrap_a_conditional_directive_line() {
         render_passthrough_variants(&PassthroughVariants::Conditional {
@@ -962,17 +966,14 @@ mod tests {
         });
     }
 
+    /// A lone `++++` block must not carry one either: the check covers every
+    /// emitted fragment, not only the ones a conditional would wrap.
     #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a conditional directive line reached a generated passthrough block")]
     fn a_reviewed_single_variant_refuses_the_same_line() {
-        let composed = std::panic::catch_unwind(|| {
-            render_passthrough_variants(&PassthroughVariants::Single(
-                "ifdef::lj-archiver-book[]".to_string(),
-            ))
-        });
-
-        assert!(
-            composed.is_err(),
-            "a lone `++++` block must not carry a conditional either"
-        );
+        render_passthrough_variants(&PassthroughVariants::Single(
+            "ifdef::lj-archiver-book[]".to_string(),
+        ));
     }
 }
