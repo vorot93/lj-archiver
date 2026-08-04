@@ -190,6 +190,24 @@ The AsciiDoc renderer (`src/adoc/`) produces byte-exact output guarded by a larg
 
 The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
+Renderer-owned inline output (strong, emphasis, code, anchors, linked images) is
+appended through the single `append_generated_inline` path in `src/adoc/mod.rs`.
+That path compares the current logical line before and after the append and, when
+the generated delimiters *newly* complete active block syntax (a block title such
+as `.` + `*bold*`, a list marker, a heading, `[...]` block metadata, a delimiter
+line, …), inserts the trusted empty inline passthrough `pass:[]` at the line
+start. The guard is renderer-only — authored `pass:` macros are neutralized by
+the authored-text pass, so post content cannot forge it. Never append generated
+inline output with a bare `append_inline_fragment`; that reintroduces
+line-completion attacks that the authored-text neutralizer cannot see, because
+the authored run alone is inert. The guard also requires nonblank authored
+content already on the line: when `before` is empty or whitespace-only, the
+composed line's active shape comes entirely from the generated fragment itself
+— for example a bare (unwrapped) `<img>` renders its own complete
+`image::target[alt]` block macro — which is deliberate, self-contained renderer
+output, not authored prose newly activated by appended delimiters, and must
+convert as a real block macro rather than being guarded inert.
+
 Attribute-reference neutralization includes Asciidoctor's state-changing
 `{set:...}`, `{counter:...}`, and `{counter2:...}` forms, not only simple
 `{name}` references. Authored commas in image labels are numeric-reference

@@ -227,10 +227,7 @@ pub fn html_to_adoc_with_links(html: &str, link_rewriter: Option<&LinkRewriter>)
                                 flush_root_inline(&mut output, &mut inline_output, true);
                                 output.push_str(&rendered);
                             } else {
-                                neutralize_pending_plain_text_before_generated_inline(
-                                    &mut inline_output,
-                                );
-                                append_inline_fragment(&mut inline_output, &rendered);
+                                append_generated_inline(&mut inline_output, &rendered);
                             }
                         }
                     } else {
@@ -398,8 +395,7 @@ fn render_inline_children_with_options(
                         if should_preserve_unwrapped_inline_output(&rendered) {
                             append_inline_block(&mut output, &rendered);
                         } else {
-                            neutralize_pending_plain_text_before_generated_inline(&mut output);
-                            append_inline_fragment(&mut output, &rendered);
+                            append_generated_inline(&mut output, &rendered);
                         }
                     }
                 }
@@ -757,6 +753,21 @@ fn flush_root_inline(output: &mut String, inline_output: &mut String, before_blo
     }
 
     inline_output.clear();
+}
+
+/// The one path for appending renderer-owned inline output (strong, emphasis,
+/// code, anchor, linked image). It neutralizes a pending authored macro prefix,
+/// appends, and then guards the composed logical line when the generated
+/// delimiters newly completed active block syntax. Every generated-inline
+/// append must go through here — appending directly reopens finding 1.
+fn append_generated_inline(output: &mut String, fragment: &str) {
+    neutralize_pending_plain_text_before_generated_inline(output);
+    let line_start = output.rfind('\n').map_or(0, |index| index + 1);
+    let before = output[line_start..].to_string();
+    append_inline_fragment(output, fragment);
+    if generated_inline_completes_active_line(&before, &output[line_start..]) {
+        output.insert_str(line_start, GENERATED_INLINE_LINE_GUARD);
+    }
 }
 
 fn append_inline_fragment(output: &mut String, fragment: &str) {
@@ -2776,6 +2787,40 @@ mod tests {
     }
 
     #[test]
+    fn generated_inline_wrappers_do_not_complete_active_block_lines() {
+        for (html, expected) in [
+            ("<p>.<strong>Title</strong></p>", "pass:[].*Title*\n\n"),
+            ("<p>.<em>Title</em></p>", "pass:[]._Title_\n\n"),
+            ("<p>.<code>x</code></p>", "pass:[].`pass:c[x]`\n\n"),
+            (
+                r#"<p>.<a href="https://example.test/">x</a></p>"#,
+                "pass:[].https://example.test/[x]\n\n",
+            ),
+            (
+                concat!(
+                    r#"<p>.<a href="https://example.test/">"#,
+                    r#"<img src="https://cdn.example.test/p.png" alt="a"></a></p>"#,
+                ),
+                "pass:[].image:https://cdn.example.test/p.png[a,link=https://example.test/]\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    #[test]
+    fn safe_prose_controls_do_not_gain_a_generated_inline_guard() {
+        for (html, expected) in [
+            ("<p>Hello <strong>world</strong></p>", "Hello *world*\n\n"),
+            ("<p><strong>Lead</strong> text</p>", "*Lead* text\n\n"),
+            ("<p>. <strong>spaced</strong></p>", "\\. *spaced*\n\n"),
+            ("<p>C++ <em>and</em> more</p>", "C++ _and_ more\n\n"),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    #[test]
     fn renders_script_as_visible_source_text_instead_of_passthrough() {
         let adoc = html_to_adoc("<script>alert(1)</script>");
 
@@ -4446,6 +4491,33 @@ mod tests {
                 .iter()
                 .any(|scheme| src.to_ascii_lowercase().starts_with(scheme))
         }));
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn guarded_generated_inline_lines_convert_as_paragraph_text() {
+        let converted = convert_with_asciidoctor(&html_to_adoc("<p>.<strong>Title</strong></p>"));
+        let document = Html::parse_document(&converted);
+
+        assert!(
+            document
+                .select(&Selector::parse(".title").unwrap())
+                .next()
+                .is_none(),
+            "generated inline output produced a block title: {converted}"
+        );
+        let paragraph = document
+            .select(&Selector::parse("p").unwrap())
+            .next()
+            .expect("guarded line converts to a paragraph");
+        assert_eq!(paragraph.text().collect::<String>(), ".Title");
+        assert_eq!(
+            paragraph
+                .select(&Selector::parse("strong").unwrap())
+                .next()
+                .map(|strong| strong.text().collect::<String>()),
+            Some("Title".to_string())
+        );
     }
 
     fn convert_with_asciidoctor(adoc: &str) -> String {

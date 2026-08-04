@@ -817,6 +817,41 @@ fn is_adoc_macro_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
+/// A trusted empty inline passthrough. Inserted only by the renderer at a
+/// logical line start, it changes AsciiDoc's parsing context for that line
+/// without escaping or exposing the renderer-owned formatting delimiters that
+/// follow it. Authored `pass:` macros remain neutralized by
+/// [`neutralize_inline_passthrough_macros`], so this can never be forged from
+/// post text.
+pub(crate) const GENERATED_INLINE_LINE_GUARD: &str = "pass:[]";
+
+/// True when appending renderer-owned inline output turned an inert logical
+/// line into one AsciiDoc parses as active block syntax.
+///
+/// `before` is the current logical line as it stood before the append;
+/// `composed` is the same line afterwards. A line that was *already* active
+/// keeps whatever protection it already carries — only a newly completed
+/// construct earns a guard, so safe prose never gains one. A blank `before`
+/// (no authored content yet on this line, ignoring leading whitespace) is
+/// also exempt: the composed line's active shape then comes entirely from
+/// the generated fragment itself — for example a bare `<img>` renders its
+/// own complete `image::target[alt]` block macro — which is the renderer's
+/// deliberate, self-contained output rather than authored prose newly
+/// activated by appended delimiters.
+pub(crate) fn generated_inline_completes_active_line(before: &str, composed: &str) -> bool {
+    !before.trim_start().is_empty()
+        && !line_is_active_adoc_syntax(before)
+        && line_is_active_adoc_syntax(composed)
+}
+
+/// The full active-line vocabulary: headings, ordered/unordered/hyphen/
+/// description lists, admonitions, block macros, document attributes, line
+/// comments, block titles, page and thematic breaks, open/table block
+/// delimiters, every delimiter-only line, and complete `[...]` block metadata.
+fn line_is_active_adoc_syntax(line: &str) -> bool {
+    is_complete_block_metadata_line(line.trim_start()) || starts_with_active_adoc_syntax(line)
+}
+
 pub(crate) fn neutralize_pending_plain_text_before_generated_inline(output: &mut String) {
     if output.is_empty() {
         return;
