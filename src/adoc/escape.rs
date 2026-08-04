@@ -1088,18 +1088,24 @@ fn is_block_macro_prefix(text: &str) -> bool {
         })
 }
 
+/// True when `text` ends with an inline passthrough macro prefix — `pass:`, or
+/// `pass:` plus a qualifier list — that the `[` opening the generated fragment
+/// about to be appended would complete.
+///
+/// The prefix must run to the *end* of the line. A `pass:` macro that already
+/// closed earlier on it (the code renderer's own `` `pass:c[x]` ``, the line
+/// guard, or a neutralized description-list marker) is complete rather than
+/// dangling, and escaping the line for one puts a visible backslash in front of
+/// ordinary prose.
 fn ends_with_inline_passthrough_macro_prefix(text: &str) -> bool {
     let Some(pass_start) = text.rfind("pass:") else {
         return false;
     };
 
-    starts_inline_passthrough_macro(&format!("{}[", &text[pass_start..]), 0)
-        && (pass_start == 0
-            || text.as_bytes()[..pass_start]
-                .last()
-                .is_some_and(|previous| {
-                    !previous.is_ascii_alphanumeric() && !matches!(previous, b'_' | b'-')
-                }))
+    is_inline_passthrough_token_boundary(text.as_bytes(), pass_start)
+        && text[pass_start + "pass:".len()..]
+            .bytes()
+            .all(is_inline_passthrough_qualifier_byte)
 }
 
 #[cfg(test)]

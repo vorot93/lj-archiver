@@ -3598,6 +3598,43 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_passthrough_macro_is_not_a_dangling_prefix() {
+        // Only a `pass:` prefix that runs to the *end* of the line is completed
+        // by the `[` the next generated fragment supplies. A macro that already
+        // closed earlier on the line is not, and escaping the line for it puts a
+        // visible backslash in front of ordinary prose.
+        for (html, expected) in [
+            (
+                "<p>a <code>x</code> <em>y</em></p>",
+                "a `pass:c[x]` _y_\n\n",
+            ),
+            ("<p>a<code>x</code><em>y</em></p>", "a`pass:c[x]`_y_\n\n"),
+            (
+                "<p>.<strong>Title</strong><em>x</em></p>",
+                "pass:[].*Title*_x_\n\n",
+            ),
+            ("<p>[pass<i></i>]<i></i></p>", "pass:[][pass]\n\n"),
+            (
+                "<p>foo<i></i>:: bar <em>y</em></p>",
+                "foo:pass:[:] bar _y_\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+
+        // A genuinely dangling authored prefix still earns its escape.
+        for (html, expected) in [
+            (r#"<p>pass:q<a href="">x</a></p>"#, "\\pass:q[x]\n\n"),
+            (
+                "<p>include::<strong>secret[]</strong></p>",
+                "\\include::*secret[]*\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    #[test]
     fn renders_script_as_visible_source_text_instead_of_passthrough() {
         let adoc = html_to_adoc("<script>alert(1)</script>");
 
