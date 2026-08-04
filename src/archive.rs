@@ -46,7 +46,12 @@ pub(crate) const UPDATE_LOCK_FILE_NAME: &str = ".lj-archiver.lock";
 /// Holds the archive-wide update lock. The OS releases the lock when this value
 /// drops — including on process exit, cancellation, or panic — so there is no
 /// stale-PID recovery protocol and no lock to clean up by hand.
+///
+/// Dropping it is therefore the same as never taking it: `#[must_use]` is what
+/// stops a bare `archive.acquire_update_lock()?;` from compiling into a run that
+/// silently interleaves with another process.
 #[derive(Debug)]
+#[must_use = "the update lock is released the moment this guard is dropped"]
 pub struct ArchiveUpdateGuard {
     _file: fs::File,
 }
@@ -162,13 +167,24 @@ impl Archive {
         // Creates the archive root and rejects a symlink or non-regular entry.
         storage::prepare_controlled_file(&self.root, relative)?;
         let path = self.root.join(relative);
-        // Always empty by contract: truncating is a no-op in the ordinary case
-        // (nothing ever writes to this file) and self-heals it otherwise.
+        // `truncate(false)` is deliberate, not an oversight. The flag is only
+        // here at all to make `clippy::suspicious_open_options` explicit, and
+        // `false` silences it just as well as `true` — but `true` would make
+        // this a destructive open guarded solely by the separate
+        // `symlink_metadata` check above, a narrow TOCTOU that could empty an
+        // arbitrary file. There is nothing to truncate either: the lock file is
+        // empty by contract and is never written to. On Windows `truncate(true)`
+        // additionally maps to `CREATE_ALWAYS`, whose truncation of a file
+        // another process has locked with `LockFileEx` can fail the *open* with
+        // `ERROR_LOCK_VIOLATION` — surfacing contention as `LjError::Write`
+        // instead of the `ArchiveBusy` the CLI test asserts. `OPEN_ALWAYS`,
+        // which `truncate(false)` maps to, modifies nothing and lets `try_lock`
+        // report contention.
         let file = fs::File::options()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&path)
             .map_err(|source| LjError::Write {
                 path: path.clone(),
@@ -1620,7 +1636,8 @@ mod tests {
 
         // Dropping the guard releases the OS lock; no stale-PID recovery needed.
         drop(guard);
-        second.acquire_update_lock().unwrap();
+        let reacquired = second.acquire_update_lock().unwrap();
+        drop(reacquired);
     }
 
     #[test]

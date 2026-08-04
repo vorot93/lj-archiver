@@ -380,7 +380,23 @@ fn localized_passthrough_variants(
 ///
 /// The generated conditional wrapper is the renderer's own and is composed after
 /// the escaping, so it is never itself escaped.
+///
+/// The assertion restates the precondition *here*, at the site that depends on
+/// it, rather than leaving it only at the caller that currently enforces it: a
+/// fragment carrying a conditional directive line must never reach a generated
+/// wrapper, because escaping it there emits a line of the non-selected variant
+/// (see [`contains_conditional_directive_line`]). It is a `debug_assert!`
+/// because in release the caller's fail-closed listing is the right answer for
+/// hostile content — a panic would not be.
 fn render_passthrough_variants(variants: &PassthroughVariants) -> String {
+    debug_assert!(
+        !variants
+            .emitted_html()
+            .any(contains_conditional_directive_line),
+        "a conditional directive line reached a generated passthrough block; \
+         it must fail closed to a listing instead"
+    );
+
     match variants {
         PassthroughVariants::Single(html) => {
             let html = neutralize_include_directive_lines(html);
@@ -930,5 +946,33 @@ mod tests {
         assert_eq!(divs.len(), depth);
         assert_eq!(divs[0], 0..html.len());
         assert!(divs.windows(2).all(|pair| pair[0].start < pair[1].start));
+    }
+
+    /// Nothing in the type system stops a future change from putting a listing —
+    /// or any other conditional-carrying fragment — inside the generated
+    /// `ifdef::`/`ifndef::` wrapper, and that would silently undo the reason
+    /// escaping *both* directive families inside a listing is sound. Pin the
+    /// composition site's own guard so the change trips a test instead.
+    #[test]
+    #[should_panic(expected = "a conditional directive line reached a generated passthrough block")]
+    fn a_generated_conditional_refuses_to_wrap_a_conditional_directive_line() {
+        render_passthrough_variants(&PassthroughVariants::Conditional {
+            standalone: "<p>ok</p>".to_string(),
+            book: "endif::[]\n<p>ok</p>".to_string(),
+        });
+    }
+
+    #[test]
+    fn a_reviewed_single_variant_refuses_the_same_line() {
+        let composed = std::panic::catch_unwind(|| {
+            render_passthrough_variants(&PassthroughVariants::Single(
+                "ifdef::lj-archiver-book[]".to_string(),
+            ))
+        });
+
+        assert!(
+            composed.is_err(),
+            "a lone `++++` block must not carry a conditional either"
+        );
     }
 }

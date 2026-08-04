@@ -367,7 +367,13 @@ so escaping is sound there. The check stays deliberately broader than
 Asciidoctor's rule and covers every emitted fragment, not only the ones a
 conditional would wrap — which shape a fragment takes depends on its URLs, and a
 rule that moved with the content would be far harder to keep true than "no `++++`
-block ever carries one".
+block ever carries one". "A listing is never inside a generated conditional" is
+load-bearing rather than incidental, so `render_passthrough_variants` restates it
+as a `debug_assert!` at the composition site and two tests pin that assertion:
+a future change that wraps a conditional-carrying fragment fails the suite
+instead of quietly reopening the disclosure. (`debug_assert!`, because for
+hostile content in release the caller's fail-closed listing is the right answer
+and a panic is not.)
 
 Direct conversion without a `LinkRewriter` invents no archive context at all:
 references stay exactly as delivered.
@@ -544,12 +550,21 @@ only the lock still reads as an empty/new archive. The lock is advisory with
 respect to unrelated programs; the contract is that every lj-archiver
 CLI/GUI process and reusable-API caller performing a multi-file update holds it.
 Process exit, cancellation, panic, or guard drop releases the OS lock, so there
-is deliberately no PID file and no stale-lock recovery protocol. Relatedly,
-`src/main.rs` prints a returned `LjError` via `Display`, not the default
-`Result`-from-`main` `Termination`'s `Debug` dump — `Debug` would render
-`ArchiveBusy { path: .. }` with none of the human sentence in it, which is what
-every `#[error(...)]` message (including this one) is for; the GUI already
-formats errors with `{error}` for the same reason.
+is deliberately no PID file and no stale-lock recovery protocol. The guard is
+`#[must_use]`: a bare `archive.acquire_update_lock()?;` would otherwise compile
+and drop the lock on the spot, leaving the run unserialized and every test still
+passing.
+
+Relatedly, `src/main.rs` prints a returned `LjError` through
+`error::error_chain`, not the default `Result`-from-`main` `Termination`'s
+`Debug` dump — `Debug` would render `ArchiveBusy { path: .. }` with none of the
+human sentence in it, which is what every `#[error(...)]` message (including
+that one) is for; the GUI formats errors with `{error}` for the same reason.
+Plain `Display` is *not* enough on its own: `thiserror` does not walk `#[source]`,
+so a connection failure would stop at "http failure for <url>" and never name the
+`ConnectionRefused` underneath. `error_chain` appends each cause, skipping one
+whose message the accumulated text already carries — several variants
+interpolate `{source}` into their own message and would otherwise stutter.
 
 ## LiveJournal Discovery And URL Structure
 
