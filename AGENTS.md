@@ -457,6 +457,21 @@ The composed document ends with exactly one newline **by construction**, not a p
 
 The optional `book.adoc` (opt-in initially via `--book` or the GUI checkbox, both setting `RunOptions::generate_book`) is assembled by `archive::Archive::write_book`, called after `write_index` in both run paths (`archive_post`, `archive_journal`) from the **same sorted `&[ArchivedPost]` slice** — so it lists exactly what `index.adoc` lists, oldest-first. Once a validated archive already has a book, every later successful update rewrites it even when the current run omits the option; otherwise generation remains opt-in. Its output is byte-exact and asserted like the rest of `archive.rs` (the `write_book` unit tests pin the exact bytes): a `= <journal> Archive` title carrying `:doctype: book`, `:toc:`, `:imagesdir: posts`, and `:lj-archiver-post-link-prefix: posts/`, then `include::index.adoc[leveloffset=+1]`, then one include for each post's surviving actual path. Two load-bearing invariants: a blank line precedes **every** include (block separation — without it an included post's now-`==` chapter title is absorbed into the preceding post's trailing paragraph), and the file ends with exactly one newline. `leveloffset=+1` demotes each standalone post's level-0 `= Title` to a `==` chapter under `:doctype: book`, and `:toc:` supplies in-document navigation; the included `index.adoc`'s path-based `xref:` links deliberately resolve to the sibling post files, not in-book anchors (they need no existing target, so no converter warning). `:imagesdir: posts` is load-bearing for downloaded media: included post targets such as `../assets/<hash>.<ext>` then render as archive-root `assets/...` paths when converter output is written beside `book.adoc`. The internal post-link prefix is independently load-bearing for linked images whose click target is another archived post: standalone posts default it to empty (for example, `01.adoc`), while the book keeps it as `posts/` (for example, `posts/01.adoc`). `write_book` shares `ensure_root()` (archive-root creation) with `write_index`; `write_post` keeps its own controlled post-only write path for a different purpose — do not merge those. Apart from those context attributes, book assembly emits only include directives and leaves the rendered post body unchanged. Ubuntu CI explicitly runs the ignored library Asciidoctor tests for renderer semantics and the ignored `book_render_smoke` integration tests for assembled output; normal Rust test runs remain converter-independent.
 
+`Archive::new` is deliberately inexpensive and infallible (callers build one just
+to compute paths), so every *public write boundary* validates instead:
+`write_post`, `write_index`, and `write_book` each check that the archive
+journal passes the canonical journal-name validator, and both manifest writers
+validate **all** descriptors as a batch *before* `ensure_root` and before any
+write, so a rejected call is a byte-for-byte no-write operation. A descriptor
+needs a positive ID and a path that is a direct UTF-8 `posts/<positive
+numeric>.adoc` child of *this* archive root whose numeric filename parses to the
+descriptor's own ID; zero-padded spellings are valid when the numeric value
+matches. Absolute, outside-root, traversal, nested, newline-bearing, non-UTF-8,
+zero, and mismatched paths are rejected. The former `index_path` helper fell
+back to the *absolute* path when `strip_prefix` failed, which leaked
+outside-root paths into a manifest — never reintroduce that fallback; every
+production caller already passes root-joined paths.
+
 ## LiveJournal Discovery And URL Structure
 
 Discovery walks LiveJournal's own archive navigation, all served as static (no-JS) pages:

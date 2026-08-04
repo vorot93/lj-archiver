@@ -12,7 +12,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::{BufRead, BufReader, Read},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 #[derive(Debug, Clone)]
@@ -132,6 +132,10 @@ impl Archive {
     }
 
     pub fn write_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
+        self.validate_journal()?;
+        if id == 0 {
+            return Err(invalid_archive(&self.root, "post id must be positive"));
+        }
         let path = self.post_path(id);
         self.write_post_at(&path, contents)
     }
@@ -228,11 +232,11 @@ impl Archive {
     }
 
     pub fn write_index(&self, posts: &[ArchivedPost]) -> Result<PathBuf> {
+        let relatives = self.validated_manifest_paths(posts)?;
         self.ensure_root()?;
         let mut contents = format!("= {} Archive\n\n", self.journal);
         contents.push_str("|===\n|Post ID |Title\n\n");
-        for post in posts {
-            let path = self.index_path(&post.path);
+        for (post, relative) in posts.iter().zip(&relatives) {
             let title = match &post.title {
                 ArchivedTitle::Authored(title) => adoc::sanitize_authored_xref_label(title),
                 ArchivedTitle::RenderedHeading(title) => adoc::sanitize_rendered_xref_label(title),
@@ -240,7 +244,7 @@ impl Archive {
             contents.push_str(&format!(
                 "|{} |xref:{}[{}]\n",
                 post.id,
-                storage::adoc_path(&path),
+                storage::adoc_path(relative),
                 title
             ));
         }
@@ -251,17 +255,17 @@ impl Archive {
     }
 
     pub fn write_book(&self, posts: &[ArchivedPost]) -> Result<PathBuf> {
+        let relatives = self.validated_manifest_paths(posts)?;
         self.ensure_root()?;
         let mut contents = format!(
             "= {} Archive\n:doctype: book\n:toc:\n:{}:\n:imagesdir: posts\n:{}: posts/\n\n",
             self.journal, BOOK_ATTRIBUTE, POST_LINK_PREFIX_ATTRIBUTE
         );
         contents.push_str("include::index.adoc[leveloffset=+1]\n");
-        for post in posts {
-            let path = self.index_path(&post.path);
+        for relative in &relatives {
             contents.push_str(&format!(
                 "\ninclude::{}[leveloffset=+1]\n",
-                storage::adoc_path(&path)
+                storage::adoc_path(relative)
             ));
         }
         let path = self.root.join("book.adoc");
@@ -276,8 +280,89 @@ impl Archive {
         })
     }
 
-    fn index_path(&self, path: &Path) -> PathBuf {
-        path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
+    /// Every public write boundary validates the archive journal. `Archive::new`
+    /// stays inexpensive and infallible, so a caller can build one to compute
+    /// paths; nothing reaches the filesystem until a descriptor has passed here.
+    fn validate_journal(&self) -> Result<()> {
+        if is_valid_journal_name(&self.journal) {
+            Ok(())
+        } else {
+            Err(invalid_archive(
+                &self.root,
+                format!(
+                    "archive journal name {:?} is not a valid LiveJournal journal name",
+                    self.journal
+                ),
+            ))
+        }
+    }
+
+    /// Validates the journal and *every* descriptor as one batch, returning the
+    /// root-relative manifest paths. Callers run this before `ensure_root` and
+    /// before any manifest write, so a rejected call is a byte-for-byte
+    /// no-write operation.
+    fn validated_manifest_paths(&self, posts: &[ArchivedPost]) -> Result<Vec<PathBuf>> {
+        self.validate_journal()?;
+        posts
+            .iter()
+            .map(|post| self.validated_manifest_path(post))
+            .collect()
+    }
+
+    /// A descriptor's path must be a direct UTF-8 `posts/<positive numeric>.adoc`
+    /// child of *this* archive root, and its numeric filename must parse to the
+    /// descriptor's own ID. Zero-padded spellings are valid when their numeric
+    /// value matches. Absolute, outside-root, traversal, nested, newline-bearing,
+    /// non-UTF-8, zero, and mismatched paths are rejected.
+    fn validated_manifest_path(&self, post: &ArchivedPost) -> Result<PathBuf> {
+        if post.id == 0 {
+            return Err(invalid_archive(&post.path, "post id must be positive"));
+        }
+
+        let relative = post
+            .path
+            .strip_prefix(&self.root)
+            .map_err(|_| invalid_archive(&post.path, "post path is outside the archive root"))?;
+        let mut components = relative.components();
+        let (Some(Component::Normal(directory)), Some(Component::Normal(filename)), None) =
+            (components.next(), components.next(), components.next())
+        else {
+            return Err(invalid_archive(
+                &post.path,
+                "post path must be a direct posts/<id>.adoc child of the archive root",
+            ));
+        };
+        if directory != OsStr::new("posts") {
+            return Err(invalid_archive(
+                &post.path,
+                "post path must live directly under posts/",
+            ));
+        }
+
+        let filename = filename
+            .to_str()
+            .ok_or_else(|| invalid_archive(&post.path, "post filename is not valid UTF-8"))?;
+        if filename.contains(['\n', '\r']) {
+            return Err(invalid_archive(
+                &post.path,
+                "post filename contains a line break",
+            ));
+        }
+
+        let parsed = numeric_post_filename_id(filename).ok_or_else(|| {
+            invalid_archive(
+                &post.path,
+                "post filename is not a positive numeric .adoc file",
+            )
+        })?;
+        if parsed != post.id {
+            return Err(invalid_archive(
+                &post.path,
+                format!("filename identifies post {parsed}, expected {}", post.id),
+            ));
+        }
+
+        Ok(relative.to_path_buf())
     }
 
     fn controlled_post_paths(&self, path: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -1027,21 +1112,22 @@ mod tests {
     #[test]
     fn writes_post_file_and_index() {
         let dir = tempdir().unwrap();
-        let archive = Archive::new(dir.path().join("archive"), "news");
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
         archive.write_post(166511, "= Title\n\nBody\n").unwrap();
         archive
             .write_index(&[ArchivedPost {
                 id: 166511,
                 title: ArchivedTitle::authored("Title"),
-                path: PathBuf::from("posts/166511.adoc"),
+                path: root.join("posts/166511.adoc"),
             }])
             .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("archive/posts/166511.adoc")).unwrap(),
+            std::fs::read_to_string(root.join("posts/166511.adoc")).unwrap(),
             "= Title\n\nBody\n"
         );
-        let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
+        let index = std::fs::read_to_string(root.join("index.adoc")).unwrap();
         assert!(index.contains("= news Archive"));
         assert!(index.contains("xref:posts/166511.adoc[Title]"));
     }
@@ -1122,16 +1208,17 @@ mod tests {
     #[test]
     fn sanitizes_index_title_labels() {
         let dir = tempdir().unwrap();
-        let archive = Archive::new(dir.path().join("archive"), "news");
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
         archive
             .write_index(&[ArchivedPost {
                 id: 166511,
                 title: ArchivedTitle::authored("A | tricky\n[title]"),
-                path: PathBuf::from("posts/166511.adoc"),
+                path: root.join("posts/166511.adoc"),
             }])
             .unwrap();
 
-        let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
+        let index = std::fs::read_to_string(root.join("index.adoc")).unwrap();
         let row = index
             .lines()
             .find(|line| line.starts_with("|166511 "))
@@ -1142,16 +1229,17 @@ mod tests {
     #[test]
     fn neutralizes_active_asciidoc_in_index_titles() {
         let dir = tempdir().unwrap();
-        let archive = Archive::new(dir.path().join("archive"), "news");
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
         archive
             .write_index(&[ArchivedPost {
                 id: 1,
                 title: ArchivedTitle::authored("+++<img src=x onerror=alert(1)>+++"),
-                path: PathBuf::from("posts/1.adoc"),
+                path: root.join("posts/1.adoc"),
             }])
             .unwrap();
 
-        let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
+        let index = std::fs::read_to_string(root.join("index.adoc")).unwrap();
         let row = index.lines().find(|line| line.starts_with("|1 ")).unwrap();
         assert_eq!(
             row,
@@ -1163,16 +1251,17 @@ mod tests {
     #[test]
     fn keeps_generated_index_xref_active_while_neutralizing_user_title_syntax() {
         let dir = tempdir().unwrap();
-        let archive = Archive::new(dir.path().join("archive"), "news");
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
         archive
             .write_index(&[ArchivedPost {
                 id: 1,
                 title: ArchivedTitle::authored("image:evil.png[] xref:1.adoc[x] {secret}"),
-                path: PathBuf::from("posts/1.adoc"),
+                path: root.join("posts/1.adoc"),
             }])
             .unwrap();
 
-        let index = std::fs::read_to_string(dir.path().join("archive/index.adoc")).unwrap();
+        let index = std::fs::read_to_string(root.join("index.adoc")).unwrap();
         let row = index.lines().find(|line| line.starts_with("|1 ")).unwrap();
         assert_eq!(
             row,
@@ -1201,23 +1290,24 @@ mod tests {
     #[test]
     fn writes_book_with_index_and_post_includes() {
         let dir = tempdir().unwrap();
-        let archive = Archive::new(dir.path().join("archive"), "news");
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
         let path = archive
             .write_book(&[
                 ArchivedPost {
                     id: 166511,
                     title: ArchivedTitle::authored("First"),
-                    path: PathBuf::from("posts/166511.adoc"),
+                    path: root.join("posts/166511.adoc"),
                 },
                 ArchivedPost {
                     id: 166512,
                     title: ArchivedTitle::authored("Second"),
-                    path: PathBuf::from("posts/166512.adoc"),
+                    path: root.join("posts/166512.adoc"),
                 },
             ])
             .unwrap();
 
-        assert_eq!(path, dir.path().join("archive/book.adoc"));
+        assert_eq!(path, root.join("book.adoc"));
         let book = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             book,
@@ -1240,19 +1330,20 @@ mod tests {
     #[test]
     fn replaces_existing_index_with_exact_second_contents() {
         let dir = tempdir().unwrap();
-        let archive = Archive::new(dir.path().join("archive"), "news");
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
         archive
             .write_index(&[ArchivedPost {
                 id: 166511,
                 title: ArchivedTitle::authored("First"),
-                path: PathBuf::from("posts/166511.adoc"),
+                path: root.join("posts/166511.adoc"),
             }])
             .unwrap();
         let path = archive
             .write_index(&[ArchivedPost {
                 id: 166512,
                 title: ArchivedTitle::authored("Second"),
-                path: PathBuf::from(r"posts\166512.adoc"),
+                path: root.join("posts/166512.adoc"),
             }])
             .unwrap();
 
@@ -1265,19 +1356,20 @@ mod tests {
     #[test]
     fn replaces_existing_book_with_exact_second_contents() {
         let dir = tempdir().unwrap();
-        let archive = Archive::new(dir.path().join("archive"), "news");
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
         archive
             .write_book(&[ArchivedPost {
                 id: 166511,
                 title: ArchivedTitle::authored("First"),
-                path: PathBuf::from("posts/166511.adoc"),
+                path: root.join("posts/166511.adoc"),
             }])
             .unwrap();
         let path = archive
             .write_book(&[ArchivedPost {
                 id: 166512,
                 title: ArchivedTitle::authored("Second"),
-                path: PathBuf::from(r"posts\166512.adoc"),
+                path: root.join("posts/166512.adoc"),
             }])
             .unwrap();
 
@@ -1343,5 +1435,97 @@ mod tests {
             archive.remove_pending_post(2),
             Err(LjError::InvalidArchive { .. })
         ));
+    }
+
+    fn descriptor(id: u64, path: impl Into<PathBuf>) -> ArchivedPost {
+        ArchivedPost {
+            id,
+            title: ArchivedTitle::authored("T"),
+            path: path.into(),
+        }
+    }
+
+    fn root_entries(root: &Path) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(root) else {
+            return Vec::new();
+        };
+        let mut names = entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn manifest_writes_reject_invalid_descriptors_without_writing_anything() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+
+        let rejected = [
+            descriptor(0, root.join("posts/0.adoc")),
+            descriptor(1, root.join("posts/2.adoc")),
+            descriptor(1, root.join("posts/one.adoc")),
+            descriptor(1, root.join("1.adoc")),
+            descriptor(1, root.join("posts/nested/1.adoc")),
+            descriptor(1, root.join("../outside/posts/1.adoc")),
+            descriptor(1, PathBuf::from("/absolute/posts/1.adoc")),
+            descriptor(1, root.join("posts/1.adoc\n")),
+        ];
+
+        for post in rejected {
+            let posts = [post.clone()];
+            assert!(
+                archive.write_index(&posts).is_err(),
+                "index accepted {:?}",
+                post.path
+            );
+            assert!(
+                archive.write_book(&posts).is_err(),
+                "book accepted {:?}",
+                post.path
+            );
+            assert!(
+                root_entries(&root).is_empty(),
+                "rejected descriptor {:?} still touched the archive root: {:?}",
+                post.path,
+                root_entries(&root)
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_writes_accept_zero_padded_numeric_aliases() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        let posts = [descriptor(166511, root.join("posts/0166511.adoc"))];
+
+        archive.write_index(&posts).unwrap();
+        let index = fs::read_to_string(root.join("index.adoc")).unwrap();
+        assert!(index.contains("xref:posts/0166511.adoc[T]"), "{index}");
+    }
+
+    #[test]
+    fn write_post_rejects_a_zero_id_without_writing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+
+        assert!(archive.write_post(0, "= T\n").is_err());
+        assert!(root_entries(&root).is_empty());
+    }
+
+    #[test]
+    fn every_public_write_rejects_an_invalid_archive_journal() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "bad journal/name");
+        let posts = [descriptor(1, root.join("posts/1.adoc"))];
+
+        assert!(archive.write_post(1, "= T\n").is_err());
+        assert!(archive.write_index(&posts).is_err());
+        assert!(archive.write_book(&posts).is_err());
+        assert!(root_entries(&root).is_empty());
     }
 }
