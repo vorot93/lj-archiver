@@ -982,12 +982,66 @@ pub(crate) fn generated_inline_completes_active_line(
     !line_is_active_adoc_syntax(before) && line_is_active_adoc_syntax(composed)
 }
 
+/// Neutralizes a logical line that an appended run of *authored* text newly
+/// turned into active block syntax, returning the replacement for the whole
+/// line, or `None` when the line needs no change.
+///
+/// [`neutralize_active_adoc_lines`] only ever sees a run that starts a line, so
+/// it cannot see this: a generated inline fragment splits an authored run in
+/// two, and neither half starts the line the two halves compose
+/// (`<p>[pass<i></i>]</p>` composes the block-metadata line `[pass]` out of two
+/// inert halves). A line that was *already* active keeps whatever protection it
+/// already carries, so an escaped line is never escaped twice.
+///
+/// Two remedies, because neither covers the other's construct:
+///
+/// * [`GENERATED_INLINE_LINE_GUARD`] at the line start deactivates every
+///   construct AsciiDoc anchors at column zero — block metadata, headings, list
+///   markers, admonition labels, block macros (`include::` among them, which is
+///   also a live preprocessor directive), document attributes, block titles and
+///   delimiter lines.
+/// * A description-list marker is positional rather than anchored, so the guard
+///   does not reach it: `pass:[]term:: def` still converts to a `<dl>` (verified
+///   on Asciidoctor 2.0.26). The marker itself is neutralized instead, exactly
+///   as the line-start pass neutralizes the same authored text.
+///
+/// Rewriting the composed line is safe precisely because `before` was inert: a
+/// marker needs `::` followed by whitespace or the line end, and appending only
+/// ever extends the line, so any `::` already on the line that is followed by a
+/// non-space stays disqualified. Every marker this rewrites therefore owns at
+/// least one colon from the authored text just appended.
+pub(crate) fn neutralize_line_completed_by_authored_text(
+    before: &str,
+    composed: &str,
+) -> Option<String> {
+    if line_is_active_adoc_syntax(before) || !line_is_active_adoc_syntax(composed) {
+        return None;
+    }
+
+    let neutralized = neutralize_description_list_markers(composed);
+    let line = neutralized.as_deref().unwrap_or(composed);
+
+    if line_is_anchored_active_adoc_syntax(line) {
+        return Some(format!("{GENERATED_INLINE_LINE_GUARD}{line}"));
+    }
+
+    neutralized
+}
+
 /// The full active-line vocabulary: headings, ordered/unordered/hyphen/
 /// description lists, admonitions, block macros, document attributes, line
 /// comments, block titles, page and thematic breaks, open/table block
 /// delimiters, every delimiter-only line, and complete `[...]` block metadata.
 fn line_is_active_adoc_syntax(line: &str) -> bool {
-    is_complete_block_metadata_line(line.trim_start()) || starts_with_active_adoc_syntax(line)
+    line_is_anchored_active_adoc_syntax(line)
+        || starts_with_description_list_marker(line.trim_start())
+}
+
+/// The part of that vocabulary AsciiDoc anchors at the start of a line, and so
+/// exactly the part a line-start guard deactivates.
+fn line_is_anchored_active_adoc_syntax(line: &str) -> bool {
+    is_complete_block_metadata_line(line.trim_start())
+        || starts_with_non_description_active_adoc_syntax(line)
 }
 
 pub(crate) fn neutralize_pending_plain_text_before_generated_inline(output: &mut String) {

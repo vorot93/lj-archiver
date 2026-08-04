@@ -850,13 +850,32 @@ fn flush_plain_text_run(output: &mut String, plain_text: &mut String) {
         return;
     }
 
-    let fragment = neutralize_plain_adoc_fragment_at_line_start(
-        plain_text,
-        output.is_empty() || output.ends_with('\n'),
-    );
-
-    append_inline_fragment(output, &fragment);
+    let is_line_start = output.is_empty() || output.ends_with('\n');
+    let fragment = neutralize_plain_adoc_fragment_at_line_start(plain_text, is_line_start);
     plain_text.clear();
+
+    if is_line_start {
+        // The run *is* the logical line, and the neutralizer just handled it as
+        // one.
+        append_inline_fragment(output, &fragment);
+        return;
+    }
+
+    // Mid-line the run is inert on its own, but the line it completes may not
+    // be: renderer-owned output between two authored runs (`<p>[pass<i></i>]</p>`)
+    // means neither run starts the line, so the line-start neutralizer never
+    // inspects it. Classify the composed line instead. Appending directly here
+    // reopens that hole.
+    let line_start = output.rfind('\n').map_or(0, |index| index + 1);
+    let before = output[line_start..].to_string();
+    append_inline_fragment(output, &fragment);
+
+    if let Some(neutralized) =
+        neutralize_line_completed_by_authored_text(&before, &output[line_start..])
+    {
+        output.truncate(line_start);
+        output.push_str(&neutralized);
+    }
 }
 
 /// Flush a run of `<br>` elements buffered by the child-iteration loops in
@@ -3422,6 +3441,160 @@ mod tests {
             html_to_adoc(r#"<img src="x.jpg" alt="x">"#),
             "image::x.jpg[x]"
         );
+    }
+
+    #[test]
+    fn authored_text_after_a_generated_inline_fragment_cannot_complete_active_lines() {
+        // A generated inline fragment splits an authored run in two, and neither
+        // half starts a line, so the line-start neutralizer never sees the line
+        // these halves compose. Every case below is inert as authored text alone.
+        for (html, expected) in [
+            // `[pass]` is block metadata that sets the *next* block's style to a
+            // raw passthrough — the paragraph after it is emitted unescaped.
+            ("<p>[pass<i></i>]</p>", "pass:[][pass]\n\n"),
+            (
+                r#"<p>[subs="macros"<i></i>]</p>"#,
+                "pass:[][subs=\"macros\"]\n\n",
+            ),
+            ("<p>[pass<b>x</b>]</p>", "pass:[][pass*x*]\n\n"),
+            (
+                "<p>[pass<code>x</code>]</p>",
+                "pass:[][pass`pass:c[x]`]\n\n",
+            ),
+            // Heading and table-of-contents injection.
+            (
+                "<p>=<i></i> Injected Heading</p>",
+                "pass:[]= Injected Heading\n\n",
+            ),
+            // The rest of the active-line vocabulary, all anchored at column zero.
+            ("<p>-<i></i> item</p>", "pass:[]- item\n\n"),
+            ("<p>*<i></i> item</p>", "pass:[]* item\n\n"),
+            ("<p>NOTE<i></i>: hi</p>", "pass:[]NOTE: hi\n\n"),
+            ("<p>:<i></i>attr: v</p>", "pass:[]:attr: v\n\n"),
+            // A block macro line, which for `include::` is also a live
+            // preprocessor directive that reads a local file at conversion time.
+            (
+                "<p>include<i></i>::/etc/hostname[]</p>",
+                "pass:[]include::/etc/hostname[]\n\n",
+            ),
+            // A description-list marker is positional rather than anchored at the
+            // line start, so the guard cannot deactivate it; the marker itself is
+            // neutralized instead, byte-for-byte as the line-start pass does.
+            ("<p>term<i></i>:: def</p>", "term:pass:[:] def\n\n"),
+            // The same marker split *across* the generated fragment.
+            ("<p>term:<i></i>: def</p>", "term:pass:[:] def\n\n"),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn a_neutralized_split_line_converts_to_the_authored_text() {
+        // Neutralizing must stay invisible: the reader sees the bytes the post
+        // author wrote, with no guard and no stray escape.
+        for (html, visible) in [
+            ("<p>[pass<i></i>]</p>", "[pass]"),
+            (r#"<p>[subs="macros"<i></i>]</p>"#, r#"[subs="macros"]"#),
+            ("<p>=<i></i> Injected Heading</p>", "= Injected Heading"),
+            ("<p>NOTE<i></i>: hi</p>", "NOTE: hi"),
+            ("<p>term<i></i>:: def</p>", "term:: def"),
+            ("<p>term:<i></i>: def</p>", "term:: def"),
+        ] {
+            let converted = convert_with_asciidoctor(&html_to_adoc(html));
+            let text = Html::parse_document(&converted)
+                .root_element()
+                .text()
+                .collect::<String>();
+
+            assert_eq!(text.trim(), visible, "{html} converted to {converted}");
+        }
+    }
+
+    #[test]
+    fn mid_sentence_prose_does_not_gain_a_line_guard() {
+        for (html, expected) in [
+            (
+                "<p>Hello <b>there</b> [not a block] ok.</p>",
+                "Hello *there* [not a block] ok.\n\n",
+            ),
+            ("<p>a = b <b>c</b> = d</p>", "a = b *c* = d\n\n"),
+            ("<p>C++ <em>and</em> more</p>", "C++ _and_ more\n\n"),
+            ("<p>x<i></i>y</p>", "xy\n\n"),
+            ("<p>x<i></i>. y</p>", "x. y\n\n"),
+            (
+                "<p>1<code>st</code> place [ok]</p>",
+                "1`pass:c[st]` place [ok]\n\n",
+            ),
+            // An already-escaped line keeps its single escape: the composed line
+            // is inert before *and* after the append, so no guard is added.
+            ("<p>//<i></i> comment</p>", "\\// comment\n\n"),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    #[test]
+    fn plain_text_inline_wrappers_keep_their_single_authored_run() {
+        // `<span>` contributes its text to the *same* authored run rather than
+        // splitting it, so the run is still neutralized as one line start. This
+        // path must stay untouched by the mid-line guard.
+        for (html, expected) in [
+            ("<p>[pass<span></span>]</p>", "\\[pass]\n\n"),
+            ("<p>[pass<span>x</span>]</p>", "\\[passx]\n\n"),
+            (
+                "<p>=<span></span> Injected Heading</p>",
+                "\\= Injected Heading\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn split_authored_block_metadata_cannot_activate_a_following_block() {
+        // `[pass]` on its own line turns the *next* block into a raw passthrough,
+        // so an authored `<script>` in the following paragraph reaches the reader
+        // executable. `[subs="macros"]` turns on macro substitution inside the
+        // reviewed raw-HTML block that follows, so authored AsciiDoc macro text
+        // inside an archived table becomes a live link the URL policy never saw.
+        for html in [
+            concat!(
+                "<p>[pass<i></i>]</p>",
+                "<p>&lt;script&gt;alert(document.domain)&lt;/script&gt;</p>",
+            ),
+            concat!(
+                r#"<p>[subs="macros"<i></i>]</p>"#,
+                "<table><tr><td>link:javascript:alert(1)[CLICK]</td></tr></table>",
+            ),
+            concat!(
+                "<p>=<i></i> Injected Heading</p>",
+                "<p>ordinary post text</p>",
+            ),
+        ] {
+            let converted = convert_with_asciidoctor(&html_to_adoc(html));
+            let document = Html::parse_document(&converted);
+
+            assert!(
+                !converted.contains("<script"),
+                "raw script reached the converted output for {html}: {converted}"
+            );
+            assert!(
+                document
+                    .select(&Selector::parse("a").unwrap())
+                    .filter_map(|anchor| anchor.attr("href"))
+                    .all(|href| !href.to_ascii_lowercase().starts_with("javascript:")),
+                "a javascript: target reached the converted output for {html}: {converted}"
+            );
+            assert!(
+                document
+                    .select(&Selector::parse("h1, h2, h3, h4, h5, h6").unwrap())
+                    .next()
+                    .is_none(),
+                "an authored heading was injected for {html}: {converted}"
+            );
+        }
     }
 
     #[test]

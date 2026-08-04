@@ -403,6 +403,25 @@ an anchor whose sanitized target begins with `.` (`../other/page.html[x]`,
 as a block title that swallows the *following* block. Both behaviors are pinned
 by tests — widening the exemption to a blank-line check reopens the second one.
 
+The *authored* half of the same composition is closed in `flush_plain_text_run`
+(`src/adoc/mod.rs`). `neutralize_active_adoc_lines` only ever inspects a run that
+starts a line, so a generated fragment between two authored runs leaves the line
+those runs compose unexamined: `<p>[pass<i></i>]</p>` emits two inert halves that
+compose the block-metadata line `[pass]`, which turns the *next* block into a raw
+passthrough — stored XSS. (`<span>` does not trigger it: it contributes through
+`plain_text_inline_content` to the same run. `<b>`, `<i>`, `<em>`, `<code>` and
+anchors all do, empty or not.) A mid-line flush therefore classifies the composed
+line through `neutralize_line_completed_by_authored_text` in `src/adoc/escape.rs`,
+which applies two remedies because neither covers the other's construct: the
+`pass:[]` line guard for everything AsciiDoc anchors at column zero, and the
+`pass:[:]` marker rewrite for a description-list marker, which is positional —
+`pass:[]term:: def` still converts to a `<dl>`. Rewriting the composed line is
+safe only because the line was inert before the append (a marker needs `::`
+before whitespace or the line end, and appending only extends the line), so every
+marker it touches owns a colon from the authored text just appended. The same
+rewrite must **not** be extended to generated fragments: `` `pass:c[a:: b]` ``
+would be corrupted.
+
 `sanitize_macro_target` (`src/adoc/escape.rs`) is the shared function that makes
 any href/src safe to splice into a macro-target position (image link, xref,
 linked image). It percent-encodes a *leading* `:` to `%3A`: a target beginning
