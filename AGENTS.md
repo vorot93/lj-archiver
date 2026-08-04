@@ -443,52 +443,85 @@ Both guards above classify **block-line** syntax only. The *inline* half —
 `neutralize_inline_adoc_syntax`'s four scanners: attribute references,
 passthrough macros, inline macros, passthrough delimiters — is closed by
 `InlineBuffer` (`src/adoc/inline.rs`), the single buffer every inline emission
-path writes into. Each append is one **fragment**: an authored run the run
-neutralizer already inspected, or a renderer-generated construct the renderer
-means to be live. After every append the buffer runs
-`composed_inline_escape_offsets` (`src/adoc/escape.rs`) over the current block
-and applies one rule:
+path writes into. Rendered inline output is carried as a `Spanned`: text plus
+the **origin** of every byte of it, `Authored` (the post's HTML supplied it) or
+`Generated` (the renderer composed it). A rendered fragment is almost never
+uniformly one — an anchor is a generated `target[` prefix, an authored label and
+a generated `]`; a linked image is a generated `image:target[`, an authored alt
+and a generated `,link=target]` — and carrying that structure through nesting is
+the whole point. After every append the buffer runs
+`composed_inline_escape_offsets` (`src/adoc/escape.rs`) and applies a rule with
+two clauses, both required:
 
-> A construct one single fragment holds keeps exactly the meaning that
-> fragment's producer gave it. A construct no single fragment holds belongs to
-> no producer, and is escaped.
+> An escape may only ever be inserted at an offset whose origin is `Authored`;
+> and a construct that one single span holds outright keeps the meaning that
+> span's producer gave it, so it is left alone.
 
-Both halves follow from one property instead of a list of cases. The renderer
-emits each of its own constructs as one fragment, so a generated `image:`,
-`xref:`, `` `pass:c[]` `` or `{lj-archiver-post-link-prefix}` is always held and
-can never be escaped — over-claiming is structurally impossible, not merely
-untested. (Over-claiming is the failure that broke three earlier attempts at
-this: naively re-running the neutralizers over the composed line escapes the
-renderer's own link and image macros and breaks `tests/book_render_smoke.rs`.)
+The first clause bounds the damage: **no byte the renderer composed is ever
+rewritten**, so a macro name, a sanitized target and a `link=` attribute value
+cannot be corrupted however the authored text around them composes. That matters
+concretely — a same-journal `link=` value is a pending-link token, and a
+backslash spliced into it makes `validate_pending_links` fail on every namespace
+and drops the post from the archive. Be precise about what it does *not* say:
+it is a guarantee about *where* an escape may land, not about which constructs
+get recognized. Recognition is entirely the four scanners' vocabulary, and a
+construct outside it is still missed (see "Known Limitations").
+
+Boundary tracking alone is not enough for that clause, and a review round proved
+it: a candidate that *starts* inside a generated fragment and ends outside it is
+held by no single fragment, so a span-boundary-only rule spliced a backslash
+into the renderer's own `link=` attribute list. Origins are what distinguish a
+`<b>` wrapper's authored interior — which must stay escapable — from a
+renderer-composed target, which must not.
+
+The second clause keeps an authored run's own already-neutralized output, and
+the `pass:[:]` a description-list rewrite leaves inside it, from being escaped a
+second time.
+
 An authored construct that reaches across a boundary is by definition not held,
 so it is escaped whichever direction it composed in — and the splitter is very
 often the *empty* fragment `<i></i>` renders to.
 
-Four details are load-bearing:
+Six details are load-bearing:
 
-* **A rewritten line is one fragment.** `replace_from` is how the block-line
-  guards hand back a whole line, and the line they produce is theirs, so the
+* **A rewritten line is one span.** `replace_from` is how the block-line guards
+  hand back a whole line, and the line they produce is theirs, so the
   `pass:[:]` a description-list rewrite inserts is not re-escaped as a
   passthrough macro. The inline scan runs *before* those guards on each append,
-  so nothing that composed across the pre-rewrite fragments is lost by the merge.
-* **A blank line ends the scan window.** Block bytes are verbatim — a listing
-  keeps its source, a `++++` passthrough keeps its delimiters — so nothing is
-  rewritten inside them and no construct composes across them. Within the window
-  the three line-scoped scanners restrict themselves, while an inline `+++` pair
-  legitimately spans the hard breaks inside one paragraph and so is scanned
-  across them (`<p>+++<br>…<br>+++</p>` was a live passthrough).
+  so nothing that composed across the pre-rewrite spans is lost by the merge.
+* **The scan window is the current line, not the current block.** The three
+  line-scoped scanners cannot reach further (a reference needs its `}` before
+  the line break; a macro target stops at whitespace), and rescanning the block
+  on every append made a `<br>`-heavy body — the dominant LiveJournal shape —
+  quadratic: 241 KB took 2.7 s where the previous renderer took 9.8 ms.
+  `composed_scanning_stays_linear_in_body_size` pins the byte budget.
+* **A blank line ends the block.** Block bytes are verbatim — a listing keeps
+  its source, a `++++` passthrough keeps its delimiters — so nothing is
+  rewritten inside them and no construct composes across them. An inline `+++`
+  pair does legitimately span the hard breaks inside one paragraph
+  (`<p>+++<br>…<br>+++</p>` was a live passthrough), so it gets its own window,
+  which *resumes* from an unmatched delimiter rather than restarting.
 * **`name::target[]` is block vocabulary, not inline.** Every builtin inline
   macro excludes a leading `:` from its target, so mid-line the shape is inert
   and at a line start it is a block macro that `line_is_active_adoc_syntax`
   already owns. The inline scan skips it rather than racing that guard with a
   weaker remedy.
-* **A name run that reaches across a fragment is not a name.** Asciidoctor's
-  macro patterns carry no left word boundary, so `before` + `xref:1.adoc[t]`
-  composes a run our scanner would anchor at `beforexref`. Escaping there would
-  neither deactivate the (generated, legitimate) xref nor stay invisible, so a
-  candidate is dropped when the same construct re-anchored later in its run fits
-  inside one fragment. Likewise nothing inside a fragment-held `pass:…[…]` is
-  escaped: Asciidoctor extracts passthroughs before it substitutes anything.
+* **A name run that reaches across a span is not a name.** Asciidoctor's macro
+  patterns carry no left word boundary, so `before` + `xref:1.adoc[t]` composes
+  a run our scanner would anchor at `beforexref`. Escaping there would neither
+  deactivate the (generated, legitimate) xref nor stay invisible, so a candidate
+  is dropped when the same construct re-anchored later in its run fits inside
+  one span. Likewise nothing inside a span-held `pass:…[…]` is escaped:
+  Asciidoctor extracts passthroughs before it substitutes anything.
+* **The cost is new escapes on benign authored text.** Authored text that
+  composes a construct across a boundary now gains the escape its single-run
+  spelling has always had, even where the construct was never live:
+  `<p>See <b>foo:bar</b>[1]</p>` emits `See *\foo:bar*[1]`, and an escape
+  inside a generated macro's *label* dirties the label the same way. Inertness
+  wins over fidelity; `authored_text_gains_the_escape_its_single_run_spelling_has`
+  pins the cost and
+  `generated_inline_constructs_are_never_escaped_by_composition` pins that
+  renderer-generated bytes never gain one.
 
 This is also where R5's insertion offset was fixed. A dangling `pass:`/`pass:q`
 prefix that the next generated fragment's `[` completes is escaped immediately
