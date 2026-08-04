@@ -320,7 +320,7 @@ fn render_element(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     }
 }
 
-pub(super) fn has_unreviewed_element_descendant(element: ElementRef<'_>) -> bool {
+fn has_unreviewed_element_descendant(element: ElementRef<'_>) -> bool {
     element.descendants().skip(1).any(|descendant| {
         ElementRef::wrap(descendant)
             .is_some_and(|descendant| !passthrough_element_name_is_safe(descendant.value().name()))
@@ -1575,6 +1575,48 @@ mod tests {
             html_to_adoc(r#"<ul><li>a</li><table><tr><td>c</td></tr><li>F</li></table></ul>"#),
             "* a\n* F\n\n"
         );
+    }
+
+    /// A start tag says where a node *begins*, never what it contains, so an
+    /// element the source never closed has an unknown extent and must never be
+    /// suppressed. html5ever reconstructs an unclosed formatting element after
+    /// the `</table>` that popped it, and the reconstruction carries the same
+    /// synthetic identity — so suppressing on a start-tag range suppresses the
+    /// reconstruction too, and its subtree holds everything parsed after the
+    /// table. An unclosed `<font>` or `<b>` inside a table is ordinary
+    /// LiveJournal markup, so this would silently swallow whole post bodies.
+    #[test]
+    fn an_unclosed_element_inside_a_table_is_never_suppressed() {
+        for (html, survivors) in [
+            (
+                r#"<table><tr><td>c</td></tr><b>x</table>more"#,
+                ["x", "more"],
+            ),
+            (
+                concat!(
+                    r#"<table><tr><td>c</td></tr><font color="red">x</table>"#,
+                    r#"<p>para1</p><p>para2</p>"#,
+                ),
+                ["para1", "para2"],
+            ),
+            (
+                r#"<table><tr><td>c</td></tr><a href="/z">link</table>after"#,
+                ["link", "after"],
+            ),
+            (
+                r#"<blockquote><table><tr><td>c</td></tr><b>x</table>more</blockquote>"#,
+                ["x", "more"],
+            ),
+        ] {
+            let rendered = html_to_adoc(html);
+
+            for survivor in survivors {
+                assert!(
+                    rendered.contains(survivor),
+                    "{survivor:?} was dropped from {html}: {rendered}"
+                );
+            }
+        }
     }
 
     /// Known limitation: suppression is keyed on the scanner's start-tag

@@ -231,9 +231,12 @@ breakout lifts `<font>` out of `<svg>` or `<table>` out of `<math>`. Rendering
 both emits those bytes twice. `build_source_index` therefore runs a coverage
 pass: one DOM walk collects the elements
 `renders_as_source_preserving_passthrough` calls **owners**, then one
-source-order sweep with a stack of open owners resolves every identity against
-the innermost owner covering it. A covered DOM descendant needs nothing —
-recursion stops at the owner; a covered DOM sibling is marked **suppressed**, and
+source-order sweep with a stack of open owners resolves every *completed element
+range* against the innermost owner covering it. Only a completed range may be
+suppressed, and the walk classifies nothing inside an owner's subtree — both
+rules are load-bearing, see the two paragraphs below. A covered DOM descendant
+needs nothing — recursion stops at the owner; a covered DOM sibling is marked
+**suppressed**, and
 every loop that renders child elements (`html_to_adoc_with_links`,
 `render_inline_children_with_options`, `render_block_children`, and both of
 `render_list`'s) skips suppressed nodes, before `<br>` accumulation so a
@@ -256,6 +259,27 @@ or `<ol>` (`render_list` renders items through their content and drops all other
 children) own nothing. Suppression is keyed on start-tag identities, which only
 elements carry: foster-parented bare *text* has no source offsets and is still
 emitted twice, which is the recoverable direction.
+
+Never suppress a node whose *extent* is unknown. A start tag says where a node
+begins, not what it contains, so an element the source never closed is excluded
+from coverage entirely rather than treated as the width of its start tag — that
+width always ends inside the owner, so the interleaving check can never fire and
+the node would be suppressed unconditionally. It is not a corner case: html5ever
+reconstructs an unclosed formatting element (`<b>`, `<i>`, `<font>`, `<a>` — the
+staple of 2000s LiveJournal markup) *after* the `</table>` that popped it, and
+the reconstruction is a clone carrying the same synthetic identity, so it maps to
+the same rangeless entry while its subtree holds everything parsed after the
+table. Suppressing on start-tag width therefore deletes the remainder of the post
+body. Fenced by `an_unclosed_element_inside_a_table_is_never_suppressed`.
+
+The coverage walk classifies only elements *outside* every owner subtree, so it
+never does more work than rendering would: classification's last clause probes an
+element's whole subtree, so classifying each `<tr>`/`<td>` of a nested table is
+quadratic where rendering, which stops at the outermost table, is linear.
+Skipping is sound because nothing inside an owner can be the innermost owner of a
+node outside it — content escaping an inner owner lands inside the outer one and
+is already `inside_owner`. Fenced by `coverage_classifies_nothing_inside_an_owner`;
+nested `<div>`/`<span>` cannot fence it, as they short-circuit before the probe.
 
 The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 

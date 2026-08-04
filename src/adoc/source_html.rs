@@ -373,6 +373,28 @@ pub(crate) fn build_source_index(
     document: &Html,
     scanned: &crate::html_scan::ScannedHtml,
 ) -> SourceIndex {
+    build_source_index_impl(document, scanned, None)
+}
+
+/// [`build_source_index`], also reporting how many elements the coverage pass
+/// classified — the measure of its work, since classification is what probes an
+/// element's descendants.
+#[cfg(test)]
+fn build_source_index_with_classified_count(
+    document: &Html,
+    scanned: &crate::html_scan::ScannedHtml,
+) -> (SourceIndex, usize) {
+    let mut classified = 0;
+    let index = build_source_index_impl(document, scanned, Some(&mut classified));
+
+    (index, classified)
+}
+
+fn build_source_index_impl(
+    document: &Html,
+    scanned: &crate::html_scan::ScannedHtml,
+    classified: Option<&mut usize>,
+) -> SourceIndex {
     let attribute = scanned.source_identity_attribute();
     let fragment_root = document.root_element().id();
     let mut index = SourceIndex::default();
@@ -396,7 +418,7 @@ pub(crate) fn build_source_index(
         }
     }
 
-    mark_source_coverage(&mut index, document, scanned, fragment_root);
+    mark_source_coverage(&mut index, document, fragment_root, classified);
 
     index
 }
@@ -416,8 +438,8 @@ pub(crate) fn build_source_index(
 fn mark_source_coverage(
     index: &mut SourceIndex,
     document: &Html,
-    scanned: &crate::html_scan::ScannedHtml,
     fragment_root: NodeId,
+    mut classified: Option<&mut usize>,
 ) {
     // Pass A — one DOM walk. `owners` emit a whole source range as one block;
     // `inside_owner` are the nodes an owner's own subtree already covers, which
@@ -441,22 +463,38 @@ fn mark_source_coverage(
         if let Some(element) =
             ElementRef::wrap(node).filter(|element| element.id() != fragment_root)
         {
+            let range = index.range(element.id());
+
+            // Inside an owner, classification is skipped outright: the render
+            // walk never descends there, so nothing inside can be the innermost
+            // owner of a node outside — anything escaping an inner owner lands
+            // inside the outer one, and is `inside_owner` already. That is what
+            // keeps coverage's work proportional to rendering's own.
             if has_owner_ancestor {
                 inside_owner.insert(element.id());
-            }
-            // An element the source never closed has no range of its own, but
-            // its start tag still places it inside an owner.
-            if let Some(range) = index.range(element.id()).or_else(|| {
-                let identity = index.identity(element.id())?;
-                Some(scanned.start_tags().get(identity)?.source_range())
-            }) {
-                covered.push((element.id(), range));
-            }
-            if renders_as_source_preserving_passthrough(element) {
-                children_have_owner_ancestor = true;
-                if let Some(range) = index.range(element.id()) {
-                    owners.push((element.id(), range));
+            } else {
+                if let Some(count) = classified.as_deref_mut() {
+                    *count += 1;
                 }
+                if renders_as_source_preserving_passthrough(element) {
+                    // `render_passthrough` stops the render walk here even when
+                    // there is no range to own and it falls back to a listing.
+                    children_have_owner_ancestor = true;
+                    if let Some(range) = range.clone() {
+                        owners.push((element.id(), range));
+                    }
+                }
+            }
+
+            // Only an element the source *closed* may be suppressed. A start tag
+            // says where a node begins, never what it contains, so an unclosed
+            // element's extent is unknown — and html5ever reconstructs an
+            // unclosed formatting element after the `</table>` that popped it,
+            // giving the reconstruction the same identity and a subtree holding
+            // everything parsed after the table. Suppressing on a start tag
+            // alone would take all of that with it.
+            if let Some(range) = range {
+                covered.push((element.id(), range));
             }
         }
 
@@ -597,6 +635,39 @@ mod tests {
                 "----\n\n",
             )
         );
+    }
+
+    /// Coverage must not classify inside an owner's subtree. Classification is
+    /// where the work is: for a safe, non-block, non-inline name — `<tr>`,
+    /// `<td>`, `<caption>`, `<ruby>` — the last clause probes the whole subtree,
+    /// so classifying every node of a nested table is quadratic where rendering,
+    /// which stops at the outermost table, is linear. Nested `<div>` and `<span>`
+    /// cannot catch this: they short-circuit on `is_block` and
+    /// `is_supported_inline` before the probe.
+    #[test]
+    fn coverage_classifies_nothing_inside_an_owner() {
+        let depth = 200;
+        for html in [
+            format!(
+                "{}x{}",
+                "<table><tr><td>".repeat(depth),
+                "</td></tr></table>".repeat(depth)
+            ),
+            format!(
+                "<table><tr><td>{}x{}</td></tr></table>",
+                "<ul><li>".repeat(depth),
+                "</li></ul>".repeat(depth)
+            ),
+        ] {
+            let scanned = crate::html_scan::scan(&html).unwrap();
+            let fragment = Html::parse_fragment(&scanned.instrumented_html(&html));
+            let (_, classified) = build_source_index_with_classified_count(&fragment, &scanned);
+
+            assert_eq!(
+                classified, 1,
+                "only the outermost table is classified, not its {depth}-deep subtree"
+            );
+        }
     }
 
     #[test]
