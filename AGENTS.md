@@ -499,6 +499,18 @@ formats errors with `{error}` for the same reason.
 Discovery walks LiveJournal's own archive navigation, all served as static (no-JS) pages:
 
 - The journal `/calendar/` page links one page per year (`/YYYY/`), plus month pages (`/YYYY/MM/`) for the current year only. Each year page links that year's month pages, and each month page links individual post URLs. `src/discover.rs` walks `calendar → year → month → posts`, reading year links from the calendar only (every archive page repeats the year navigation, so recursing would re-crawl). Matching only `/YYYY/MM/` links off the calendar silently limits a journal to its current year — the year hop is required.
+- Archive navigation URLs are canonicalized before deduplication: query and
+  fragment are stripped, because LiveJournal's archive navigation is static and
+  path based, so `/2020/01/`, `/2020/01/?skip=20`, and `/2020/01/#top` are one
+  crawl page. Without that, each decorated spelling was fetched separately.
+  Month paths additionally require `01`–`12` for both URL schemes; the former
+  any-two-digits check crawled `/2020/00/` and `/2020/99/`. Post query and
+  fragment handling is unchanged — only navigation is canonicalized.
+- The walk is bounded at exactly 128 unique year pages and 1,536 unique month
+  pages (128 × 12), checked after the calendar parse and after each successful
+  year-page merge. Overflow is one discovery error before the excess requests,
+  never silent truncation and never thousands of partial fetches. Ordinary
+  failed-page resilience below the bounds is unchanged.
 - Discovery parses archive links against reqwest's final response URL. This matters because underscore-journal calendar URLs redirect to hyphen subdomains.
 - `DiscoveryTick.found` always means unique post IDs found so far. Year-page ticks keep the current post count unchanged; a successful month inserts its parsed IDs before emitting the next monotonic count. Never substitute month/page totals for this field.
 - Posts are archived oldest-first (discovered IDs are sorted ascending), so the smallest archived post ID reflects how far back a walk reached — useful when confirming a full walk. A full multi-year pull makes many sequential requests before the first post is written, and there is no request throttling.

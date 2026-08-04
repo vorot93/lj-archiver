@@ -11,6 +11,39 @@ use url::{Host, Url};
 static ANCHOR_HREF: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("a[href]").expect("static selector must parse"));
 
+/// Exact crawl bounds. LiveJournal has no journal with more than a century of
+/// archives, so exceeding either bound means the calendar is hostile or the
+/// navigation shape changed — either way, fail closed *before* the requests
+/// rather than emitting thousands of partial fetches or silently truncating.
+const MAX_DISCOVERY_YEAR_PAGES: usize = 128;
+const MAX_DISCOVERY_MONTH_PAGES: usize = MAX_DISCOVERY_YEAR_PAGES * 12;
+
+fn check_year_bound(journal: &str, count: usize) -> Result<()> {
+    if count > MAX_DISCOVERY_YEAR_PAGES {
+        return Err(discovery_error(
+            journal,
+            format!(
+                "archive navigation lists {count} unique year pages, \
+                 exceeding the {MAX_DISCOVERY_YEAR_PAGES}-page bound"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn check_month_bound(journal: &str, count: usize) -> Result<()> {
+    if count > MAX_DISCOVERY_MONTH_PAGES {
+        return Err(discovery_error(
+            journal,
+            format!(
+                "archive navigation lists {count} unique month pages, \
+                 exceeding the {MAX_DISCOVERY_MONTH_PAGES}-page bound"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub fn journal_calendar_url(journal: &str, base_url: &Url) -> Result<Url> {
     validate_journal(journal)?;
 
@@ -28,6 +61,21 @@ pub fn journal_calendar_url(journal: &str, base_url: &Url) -> Result<Url> {
     }
 }
 
+/// LiveJournal's documented archive navigation is static and path based, so a
+/// query or fragment on a year/month link addresses the same crawl page. Strip
+/// both *before* deduplication, or one page is fetched once per decorated
+/// spelling. Post URLs are unaffected — only archive navigation is canonicalized.
+fn canonical_archive_url(mut url: Url) -> Url {
+    url.set_query(None);
+    url.set_fragment(None);
+    url
+}
+
+fn dedup_archive_urls(urls: &mut Vec<Url>) {
+    urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    urls.dedup();
+}
+
 fn collect_archive_links(
     html: &str,
     base_url: &Url,
@@ -39,6 +87,7 @@ fn collect_archive_links(
         .select(&ANCHOR_HREF)
         .filter_map(|element| element.value().attr("href"))
         .filter_map(|href| base_url.join(href).ok())
+        .map(canonical_archive_url)
         .filter(|url| {
             if crate::net::is_loopback_test_server(base_url) {
                 same_origin(url, base_url)
@@ -49,8 +98,7 @@ fn collect_archive_links(
         .filter(|url| is_expected(url.path(), url, journal))
         .collect();
 
-    urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    urls.dedup();
+    dedup_archive_urls(&mut urls);
     urls
 }
 
@@ -103,6 +151,11 @@ pub async fn discover_post_ids(
     let mut month_urls = parse_month_links(&calendar_page.text, &calendar_page.final_url, journal);
     let year_urls = parse_year_links(&calendar_page.text, &calendar_page.final_url, journal);
 
+    // Checked after the calendar parse, before a single year page is fetched.
+    check_year_bound(journal, year_urls.len())?;
+    dedup_archive_urls(&mut month_urls);
+    check_month_bound(journal, month_urls.len())?;
+
     let mut ids = HashSet::new();
     let mut year_failed = 0usize;
     for year_url in year_urls {
@@ -113,6 +166,10 @@ pub async fn discover_post_ids(
                     &year_page.final_url,
                     journal,
                 ));
+                // Checked after each successful merge, so an overflowing walk
+                // stops at the year that caused it rather than after the last.
+                dedup_archive_urls(&mut month_urls);
+                check_month_bound(journal, month_urls.len())?;
                 progress.discovery_tick(year_page.final_url.path(), ids.len());
             }
             Err(error) => {
@@ -121,9 +178,6 @@ pub async fn discover_post_ids(
             }
         }
     }
-
-    month_urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    month_urls.dedup();
 
     if month_urls.is_empty() {
         if year_failed > 0 {
@@ -181,17 +235,21 @@ fn validate_journal(journal: &str) -> Result<()> {
 }
 
 fn is_month_path(path: &str) -> bool {
-    // Matches only the observed LiveJournal shape: /YYYY/MM/ (9 bytes total).
-    // Note: is_expected_month_path extends this to handle the users.livejournal.com
-    // prefix form (/journal/YYYY/MM/) where journal is part of the path. If a real
-    // calendar links month URLs in a different shape, this check would need widening.
+    // Matches only the observed LiveJournal shape: /YYYY/MM/ (9 bytes total),
+    // with MM an actual calendar month. is_expected_month_path extends this to
+    // the users.livejournal.com prefix form (/journal/YYYY/MM/).
     let bytes = path.as_bytes();
-    bytes.len() == 9
-        && bytes[0] == b'/'
-        && bytes[5] == b'/'
-        && bytes[8] == b'/'
-        && bytes[1..5].iter().all(|byte| byte.is_ascii_digit())
-        && bytes[6..8].iter().all(|byte| byte.is_ascii_digit())
+    if bytes.len() != 9
+        || bytes[0] != b'/'
+        || bytes[5] != b'/'
+        || bytes[8] != b'/'
+        || !bytes[1..5].iter().all(|byte| byte.is_ascii_digit())
+        || !bytes[6..8].iter().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+
+    matches!(path[6..8].parse::<u32>(), Ok(1..=12))
 }
 
 fn is_expected_month_path(path: &str, url: &Url, journal: &str) -> bool {
@@ -328,6 +386,95 @@ fn discovery_error(journal: &str, reason: impl Into<String>) -> LjError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn subdomain_base() -> Url {
+        Url::parse("https://news.livejournal.com/calendar").unwrap()
+    }
+
+    fn users_base() -> Url {
+        Url::parse("https://users.livejournal.com/example_user/calendar").unwrap()
+    }
+
+    #[test]
+    fn month_links_drop_query_and_fragment_before_deduplication() {
+        let html = concat!(
+            r#"<a href="/2020/01/">a</a>"#,
+            r#"<a href="/2020/01/?skip=20">b</a>"#,
+            r#"<a href="/2020/01/#top">c</a>"#,
+            r#"<a href="/2020/01/?skip=20#top">d</a>"#,
+        );
+
+        let months = parse_month_links(html, &subdomain_base(), "news");
+        assert_eq!(
+            months.iter().map(|url| url.as_str()).collect::<Vec<_>>(),
+            ["https://news.livejournal.com/2020/01/"]
+        );
+    }
+
+    #[test]
+    fn year_links_drop_query_and_fragment_for_both_url_schemes() {
+        let subdomain = parse_year_links(
+            r#"<a href="/2020/">a</a><a href="/2020/?x=1#f">b</a>"#,
+            &subdomain_base(),
+            "news",
+        );
+        assert_eq!(
+            subdomain.iter().map(Url::as_str).collect::<Vec<_>>(),
+            ["https://news.livejournal.com/2020/"]
+        );
+
+        let users = parse_year_links(
+            concat!(
+                r#"<a href="/example_user/2020/">a</a>"#,
+                r#"<a href="/example_user/2020/?x=1#f">b</a>"#,
+            ),
+            &users_base(),
+            "example_user",
+        );
+        assert_eq!(
+            users.iter().map(Url::as_str).collect::<Vec<_>>(),
+            ["https://users.livejournal.com/example_user/2020/"]
+        );
+    }
+
+    #[test]
+    fn month_links_require_a_real_calendar_month_for_both_url_schemes() {
+        let invalid = concat!(
+            r#"<a href="/2020/00/">a</a>"#,
+            r#"<a href="/2020/13/">b</a>"#,
+            r#"<a href="/2020/99/">c</a>"#,
+        );
+        assert!(parse_month_links(invalid, &subdomain_base(), "news").is_empty());
+
+        let users_invalid = concat!(
+            r#"<a href="/example_user/2020/00/">a</a>"#,
+            r#"<a href="/example_user/2020/13/">b</a>"#,
+        );
+        assert!(parse_month_links(users_invalid, &users_base(), "example_user").is_empty());
+
+        let valid = r#"<a href="/2020/01/">a</a><a href="/2020/12/">b</a>"#;
+        assert_eq!(parse_month_links(valid, &subdomain_base(), "news").len(), 2);
+    }
+
+    #[test]
+    fn discovery_bounds_are_exact() {
+        assert!(check_year_bound("news", MAX_DISCOVERY_YEAR_PAGES).is_ok());
+        let error = check_year_bound("news", MAX_DISCOVERY_YEAR_PAGES + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("128"), "{error}");
+
+        assert!(check_month_bound("news", MAX_DISCOVERY_MONTH_PAGES).is_ok());
+        let error = check_month_bound("news", MAX_DISCOVERY_MONTH_PAGES + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1536") || error.contains("1,536"), "{error}");
+    }
+
+    #[test]
+    fn month_page_bound_is_twelve_times_the_year_page_bound() {
+        assert_eq!(MAX_DISCOVERY_MONTH_PAGES, MAX_DISCOVERY_YEAR_PAGES * 12);
+    }
 
     #[test]
     fn parses_month_links_from_calendar() {
@@ -1078,5 +1225,42 @@ mod tests {
             matches!(result, Err(LjError::Discovery { .. })),
             "reaching no month pages because all year pages failed must be a discovery error"
         );
+    }
+
+    #[tokio::test]
+    async fn a_calendar_past_the_year_bound_fails_before_fetching_year_pages() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path, path_regex},
+        };
+
+        let server = MockServer::start().await;
+        let links = (0..=MAX_DISCOVERY_YEAR_PAGES)
+            .map(|offset| format!(r#"<a href="/{}/">y</a>"#, 1900 + offset))
+            .collect::<String>();
+        Mock::given(method("GET"))
+            .and(path("/news/calendar"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(links))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No mock answers a year-page path (`/YYYY/`); this one exists only to
+        // turn "the walk never fetches a year page" into a checked expectation
+        // instead of an unmocked request that would merely 404 silently.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/\d{4}/$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = LjClient::new(None).unwrap();
+        let base = Url::parse(&server.uri()).unwrap();
+        let error = discover_post_ids(&client, "news", &base, &Progress::hidden())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("128"), "{error}");
     }
 }
