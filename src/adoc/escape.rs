@@ -1072,16 +1072,31 @@ fn line_is_anchored_active_adoc_syntax(line: &str) -> bool {
 /// line needs no change.
 ///
 /// One case only: the line-start neutralizer replaced a trailing `::` with
-/// `:pass:[:]` because it read as a description-list marker, and the fragment
-/// about to be appended makes `::` ineligible as one. Restore the delimiter and
-/// take the escape a block macro needs instead.
+/// `:pass:[:]` because it read as a description-list marker, and `fragment`
+/// makes `::` ineligible as one. Restore the delimiter and take the escape a
+/// block macro needs instead.
+///
+/// A marker needs its `::` followed by whitespace or the line end, so only a
+/// fragment that starts with a visible character disqualifies it. An empty
+/// fragment (`<p>term::<i></i></p>`) or one that opens with a space
+/// (`<p>term::<b> x </b></p>`) leaves the marker eligible, and restoring `::`
+/// there hands back the `<dl>` the rewrite existed to prevent — a leading
+/// backslash does not deactivate a marker, because a marker is positional
+/// rather than anchored.
 ///
 /// A *dangling* macro prefix — `pass:`, `pass:q`, `name::` — that the appended
 /// fragment's own `[` completes needs no handling here: the composed-fragment
 /// scan sees the finished construct and escapes it immediately before its name,
 /// which is where the escape belongs mid-line and coincides with the line start
 /// when the name starts the line.
-pub(crate) fn neutralize_pending_plain_text_before_generated_inline(line: &str) -> Option<String> {
+pub(crate) fn neutralize_pending_plain_text_before_generated_inline(
+    line: &str,
+    fragment: &str,
+) -> Option<String> {
+    if !fragment.starts_with(|character: char| !character.is_whitespace()) {
+        return None;
+    }
+
     let prefix = line.strip_suffix(":pass:[:]")?;
 
     is_block_macro_prefix(prefix).then(|| format!("\\{prefix}::"))

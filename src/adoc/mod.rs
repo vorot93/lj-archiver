@@ -814,7 +814,9 @@ fn skip_suppressed(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> bool {
 /// delimiters newly completed active block syntax. Every generated-inline
 /// append must go through here — appending directly reopens finding 1.
 fn append_generated_inline(output: &mut InlineBuffer, fragment: &str) {
-    if let Some(pending) = neutralize_pending_plain_text_before_generated_inline(output.line()) {
+    if let Some(pending) =
+        neutralize_pending_plain_text_before_generated_inline(output.line(), fragment)
+    {
         let line_start = output.line_start();
         output.replace_from(line_start, &pending);
     }
@@ -3837,6 +3839,95 @@ mod tests {
 
             assert_eq!(split, control, "{name}");
             assert!(split.starts_with('\\'), "{name} was left live in {split:?}");
+        }
+    }
+
+    /// A generated wrapper's delimiters are the renderer's, but its *interior*
+    /// is authored, so authored text inside one composes with authored text
+    /// outside it across the wrapper's own boundary. The fragment rule covers
+    /// this with no extra case — the escape lands at the construct's name, which
+    /// is inside the generated fragment, because that is where it has to go.
+    #[test]
+    fn authored_text_inside_a_generated_wrapper_cannot_compose_with_text_outside() {
+        for (html, expected) in [
+            // A raw `<script>` through a split passthrough pair.
+            (
+                "<p><b>+++</b>&lt;script&gt;alert(1)&lt;/script&gt;+++</p>",
+                "*\\+++*<script>alert(1)</script>+++\n\n",
+            ),
+            // The archive's own post-link prefix, hijacked from inside an <em>.
+            (
+                "<p><em>{set:lj-archiver-post-link-prefix:javascript:alert(1)//</em>}</p>",
+                "_\\{set:lj-archiver-post-link-prefix:javascript:alert(1)//_}\n\n",
+            ),
+            // ... and from outside, closed by authored text after the wrapper.
+            (
+                "<p>{set:lj-archiver-post-link-prefix:javascript:alert(1)//<b>x</b>}</p>",
+                "\\{set:lj-archiver-post-link-prefix:javascript:alert(1)//*x*}\n\n",
+            ),
+            // A remote fetch on every read.
+            (
+                "<p><b>image:https://evil.example/track.png</b>[x]</p>",
+                "*\\image:\\https://evil.example/track.png*[x]\n\n",
+            ),
+            // An anchor with no href emits its authored label raw, so the whole
+            // "generated" fragment is authored text.
+            (
+                "<p><a>link:javascript</a>:alert(1)[click]</p>",
+                "\\link:\\javascript:alert(1)[click]\n\n",
+            ),
+            // A code span is a passthrough: Asciidoctor extracts it before it
+            // substitutes anything, so nothing inside one needs escaping and
+            // nothing inside one may be escaped.
+            (
+                "<p><code>link:javascript</code>:alert(1)[click]</p>",
+                "`pass:c[link:javascript]`:alert(1)[click]\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    /// A description-list marker is positional, so a leading backslash does not
+    /// deactivate it and the `pass:[:]` rewrite is the only remedy. Restoring
+    /// the `::` before a generated fragment is therefore right only when that
+    /// fragment makes the marker ineligible — which needs a visible character
+    /// immediately after the delimiter.
+    #[test]
+    fn a_description_marker_is_only_restored_when_the_fragment_disqualifies_it() {
+        for (html, expected) in [
+            // Empty and space-leading fragments leave the marker eligible.
+            ("<p>term::<i></i></p>", "term:pass:[:]\n\n"),
+            ("<p>term::<b> x </b></p>", "term:pass:[:] *x*\n\n"),
+            // A fragment that starts with a visible character disqualifies it,
+            // and the block macro underneath takes its own escape.
+            (
+                r#"<p>include::<a href="x">y</a></p>"#,
+                "\\include::x[y]\n\n",
+            ),
+            (
+                "<p>include::<strong>secret[]</strong></p>",
+                "\\include::*secret[]*\n\n",
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "{html}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn a_restored_description_delimiter_does_not_convert_to_a_definition_list() {
+        for html in [
+            "<p>term::<i></i></p>",
+            "<p>term::<b> x </b></p>",
+            r#"<p>include::<a href="x">y</a></p>"#,
+        ] {
+            let converted = convert_with_asciidoctor(&html_to_adoc(html));
+
+            assert!(
+                !converted.contains("<dl"),
+                "authored text became a definition list for {html}: {converted}"
+            );
         }
     }
 
