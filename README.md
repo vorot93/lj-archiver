@@ -198,10 +198,15 @@ are never emitted as image macros.
 Unsupported HTML is preserved as raw HTML only when every element, attribute,
 and URL belongs to a reviewed inert subset. Active HTML and custom, namespaced,
 or otherwise unknown capabilities remain visible in source listings instead of
-being emitted as raw HTML. Preserved HTML is always the post's original bytes,
-never a re-serialization of the parsed document, so markup the archive cannot
-delimit in the original — an element the post never closes — also stays a
-visible source listing rather than being emitted with parser-invented tags.
+being emitted as raw HTML. Preserved HTML is copied verbatim out of the post
+body `lj-archiver` extracted from the page; the renderer never re-serializes it
+a second time, so markup it cannot delimit in that body — an element the post
+never closes — stays a visible source listing rather than being emitted with
+renderer-invented tags. That extracted body is itself a serialization of the
+fetched page, which is why the preserved HTML can differ from the bytes the
+server sent in exactly the ways an HTML parser normalizes: an implied `<tbody>`
+appears inside a table, and each element's attributes are written in
+alphabetical order. Nothing is added, removed, or re-encoded beyond that.
 Post text that would read as an AsciiDoc preprocessor directive — a line
 starting with `include::`, `ifdef::`, `ifndef::`, `ifeval::`, or `endif::` —
 never reaches converter output as a live directive, wherever it is preserved.
@@ -211,8 +216,16 @@ conditional directives instead keeps that content out of raw HTML entirely,
 falling back to an escaped source listing. Otherwise converting an archive
 would let a post read a local file into the output, or silently discard the
 rest of the document.
-Inline code and preserved source may use deliberate inert AsciiDoc encodings;
-when converted, the visible result retains the text authored in the post.
+Inline code and preserved source may use deliberate inert AsciiDoc encodings.
+Most are invisible once converted, and the visible result is the text authored
+in the post. One is not: where a whole line of post text would otherwise read as
+AsciiDoc block syntax — a list marker, a heading, `[...]` block metadata, an
+admonition label, a document attribute, a line comment, something shaped like a
+block macro — the line is deactivated with a leading backslash, and Asciidoctor
+consumes that backslash only for a genuine preprocessor directive. For every
+other such line the converted output shows the authored text with one extra `\`
+in front of it (`\* item`, `\= Heading`, `\[pass]`). The text is complete and in
+the right place; it just carries a visible escape.
 Archive paths written into AsciiDoc always use portable forward slashes.
 An image that links to another exported post also stays local: its click target
 resolves correctly both from a standalone file in `posts/` and when that post
@@ -248,8 +261,10 @@ the `../assets/...` references used by included standalone posts. The internal
 post-link prefix similarly preserves click targets on images that link to
 other archived posts.
 
-Tables, embedded frames, and other structures the converter preserves as raw
-HTML have their links and image sources localized for wherever they are read.
+Tables and the other structures preserved as raw HTML have their links and image
+sources localized for wherever they are read. (Embedded frames are not among
+them: `iframe` is outside the reviewed inert subset, so an embed always stays a
+visible source listing, with nothing to localize.)
 A link to another archived post of the same journal becomes `<id>.html` in a
 standalone post page and `posts/<id>.html` in the assembled book; a downloaded
 image stays `../assets/<name>` standalone and becomes `assets/<name>` in the

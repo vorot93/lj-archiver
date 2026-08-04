@@ -23,7 +23,8 @@ The current tool is public-content only. Do not add login, private-content acces
 - `src/net.rs` provides shared network helpers — normalized DNS hosts, loopback/local test-server detection, `affirmation_cookie_jar()` (the age-affirmation cookie jar scoped to `livejournal.com` and installed on every production client), and `configured_client_builder(user_agent)`, which applies that jar, the shared TLS config, and an optional `User-Agent` (both `LjClient` and the media client build on it). Restricted IP-literal validation belongs to `src/media.rs`.
 - `src/tls.rs` builds the shared rustls `ClientConfig` applied to every HTTP client (see HTTP And Media Safety).
 - `src/discover.rs` finds journal post IDs by walking the calendar, per-year pages, and month archive pages.
-- `src/parser.rs` parses LiveJournal HTML into post and comment models.
+- `src/js_scan.rs` is a focused iterative JavaScript lexical scanner. It exists so `Site.entry` is located in code a browser would actually execute, not in a comment, string, template literal, or regex literal that merely contains those bytes. It is deliberately not a general JavaScript parser and pulls in no dependency.
+- `src/parser.rs` parses LiveJournal HTML into post and comment models. It scans for `Site.entry` only inside `<script>` elements a browser would run: `is_executable_script` accepts an absent, empty, or JavaScript `type` (the WHATWG MIME-essence allowlist in `JAVASCRIPT_SCRIPT_TYPES`, plus `module`, ASCII case-insensitive after trimming) and rejects any script nested at any depth inside a `<template>`, whose content is an inert `DocumentFragment` that `scraper`'s `select` nevertheless walks into.
 - `src/links.rs` resolves references against each delivered post URL and records typed active same-journal link spans for resolution and trusted retained-post upgrades.
 - `src/link_metadata.rs` validates, serializes, and applies digest-bound active-link metadata for retained posts without scanning their source for link-like text.
 - `src/media.rs` finds inline media, canonicalizes safe sources even when downloads are disabled, downloads allowed assets, rewrites HTML references, validates redirects, and rejects unsafe media URLs based on scheme, host presence, literal `localhost` hosts, and restricted IP literals.
@@ -37,6 +38,8 @@ The current tool is public-content only. Do not add login, private-content acces
 - `tests/fixtures/journal_calendar.html` covers journal calendar discovery.
 - `tests/fixtures/journal_month.html` covers month archive discovery.
 - `tests/cli_smoke.rs` contains end-to-end CLI tests using local HTTP servers.
+- `tests/book_render_smoke.rs` converts assembled `book.adoc` output with Asciidoctor (ignored by default; CI runs it explicitly).
+- `tests/release_workflow.rs` asserts the release workflow's step ordering statically and executes the publisher against a fake `gh` binary.
 
 ## GUI And Packaging
 
@@ -375,8 +378,14 @@ instead of quietly reopening the disclosure. (`debug_assert!`, because for
 hostile content in release the caller's fail-closed listing is the right answer
 and a panic is not.)
 
-Direct conversion without a `LinkRewriter` invents no archive context at all:
-references stay exactly as delivered.
+Direct conversion without a `LinkRewriter` invents no archive context: it never
+resolves a reference against a delivered page, never localizes one to an archive
+path, and never emits a `xref:`. That is exact for *raw passthrough*, where the
+bytes stay as delivered. It is not a claim that a reference reaches the output
+untouched everywhere else: a macro target still goes through `direct_target`,
+which drops a `javascript:`, `data:`, `file:`, `mailto:`, `ftp:`, malformed, or
+hostless reference entirely, and through `sanitize_macro_target`, which
+percent-encodes the characters that would otherwise escape the macro.
 
 `LinkRewriter::raw_post_html_filename` deliberately records **no** pending link,
 unlike the macro-target helpers. A raw block whose URL depends on context is
@@ -435,8 +444,11 @@ with a colon otherwise composes a spurious colon run once spliced — a linked
 image's single-colon `image:` prefix plus a `:foo` target reads as the
 block-macro prefix `image::` (reopening the "never a block macro inside link
 brackets" invariant above), and a bare image's `image::` prefix plus the same
-target reads as the malformed `image:::`. Only the leading colon is encoded;
-every other colon in the target (a URL scheme, a port, …) stays untouched.
+target reads as the malformed `image:::`. It is not the only colon the function
+touches, and the neighbouring rules must not be dropped as redundant: a `::`
+that would read as a block-macro separator becomes `%3A%3A`, and the colon of a
+`pass:`-shaped prefix becomes `%3A`. Every remaining colon — a URL scheme, a
+port, anything past position zero that composes nothing — stays untouched.
 
 Attribute-reference neutralization includes Asciidoctor's state-changing
 `{set:...}`, `{counter:...}`, and `{counter2:...}` forms, not only simple
@@ -510,7 +522,7 @@ visible text (see the direct/archive target policy under Known Limitations).
 
 The composed document ends with exactly one newline **by construction**, not a post-hoc trim: each block ends with a single `\n` (`push_body`) and the blank-line separator is inserted *before* each block (`render_post`, `render_comment`). Do not switch to per-block `\n\n` plus a trailing trim.
 
-The optional `book.adoc` (opt-in initially via `--book` or the GUI checkbox, both setting `RunOptions::generate_book`) is assembled by `archive::Archive::write_book`, called after `write_index` in both run paths (`archive_post`, `archive_journal`) from the **same sorted `&[ArchivedPost]` slice** — so it lists exactly what `index.adoc` lists, oldest-first. Once a validated archive already has a book, every later successful update rewrites it even when the current run omits the option; otherwise generation remains opt-in. Its output is byte-exact and asserted like the rest of `archive.rs` (the `write_book` unit tests pin the exact bytes): a `= <journal> Archive` title carrying `:doctype: book`, `:toc:`, `:imagesdir: posts`, and `:lj-archiver-post-link-prefix: posts/`, then `include::index.adoc[leveloffset=+1]`, then one include for each post's surviving actual path. Two load-bearing invariants: a blank line precedes **every** include (block separation — without it an included post's now-`==` chapter title is absorbed into the preceding post's trailing paragraph), and the file ends with exactly one newline. `leveloffset=+1` demotes each standalone post's level-0 `= Title` to a `==` chapter under `:doctype: book`, and `:toc:` supplies in-document navigation; the included `index.adoc`'s path-based `xref:` links deliberately resolve to the sibling post files, not in-book anchors (they need no existing target, so no converter warning). `:imagesdir: posts` is load-bearing for downloaded media: included post targets such as `../assets/<hash>.<ext>` then render as archive-root `assets/...` paths when converter output is written beside `book.adoc`. The internal post-link prefix is independently load-bearing for linked images whose click target is another archived post: standalone posts default it to empty (for example, `01.adoc`), while the book keeps it as `posts/` (for example, `posts/01.adoc`). `write_book` shares `ensure_root()` (archive-root creation) with `write_index`; `write_post` keeps its own controlled post-only write path for a different purpose — do not merge those. Apart from those context attributes, book assembly emits only include directives and leaves the rendered post body unchanged. Ubuntu CI explicitly runs the ignored library Asciidoctor tests for renderer semantics and the ignored `book_render_smoke` integration tests for assembled output; normal Rust test runs remain converter-independent.
+The optional `book.adoc` (opt-in initially via `--book` or the GUI checkbox, both setting `RunOptions::generate_book`) is assembled by `archive::Archive::write_book`, called after `write_index` in both run paths (`archive_post`, `archive_journal`) from the **same sorted `&[ArchivedPost]` slice** — so it lists exactly what `index.adoc` lists, oldest-first. Once a validated archive already has a book, every later successful update rewrites it even when the current run omits the option; otherwise generation remains opt-in. Its output is byte-exact and asserted like the rest of `archive.rs` (the `write_book` unit tests pin the exact bytes): a `= <journal> Archive` title carrying, in this order, `:doctype: book`, `:toc:`, `:lj-archiver-book:`, `:imagesdir: posts`, and `:lj-archiver-post-link-prefix: posts/`, then `include::index.adoc[leveloffset=+1]`, then one include for each post's surviving actual path. Two load-bearing invariants: a blank line precedes **every** include (block separation — without it an included post's now-`==` chapter title is absorbed into the preceding post's trailing paragraph), and the file ends with exactly one newline. `leveloffset=+1` demotes each standalone post's level-0 `= Title` to a `==` chapter under `:doctype: book`, and `:toc:` supplies in-document navigation; the included `index.adoc`'s path-based `xref:` links deliberately resolve to the sibling post files, not in-book anchors (they need no existing target, so no converter warning). `:imagesdir: posts` is load-bearing for downloaded media: included post targets such as `../assets/<hash>.<ext>` then render as archive-root `assets/...` paths when converter output is written beside `book.adoc`. The internal post-link prefix is independently load-bearing for linked images whose click target is another archived post: standalone posts default it to empty (for example, `01.adoc`), while the book keeps it as `posts/` (for example, `posts/01.adoc`). `:lj-archiver-book:` is load-bearing too and must never be dropped from that header while "restoring the documented bytes": it is the flag every conditional raw-passthrough block selects on, so without it a book renders the *standalone* variant of every localized table — `../assets/...` and `<id>.html` targets that do not resolve from the archive root. `write_book` shares `ensure_root()` (archive-root creation) with `write_index`; `write_post` keeps its own controlled post-only write path for a different purpose — do not merge those. Apart from those context attributes, book assembly emits only include directives and leaves the rendered post body unchanged. Ubuntu CI explicitly runs the ignored library Asciidoctor tests for renderer semantics and the ignored `book_render_smoke` integration tests for assembled output; normal Rust test runs remain converter-independent.
 
 `Archive::new` is deliberately inexpensive and infallible (callers build one just
 to compute paths), so every *public write boundary* validates instead:
@@ -672,12 +684,15 @@ and referenced as `../assets/<hash>.<ext>`).
 
 Fetched posts are parsed against the delivered final response URL, which is
 preserved as `Post.url` for rendering and downstream processing. Before media
-requests or writes, the parsed post ID must match the requested post; a
-recognizable final LiveJournal journal must alias the requested journal even
-when its path is not a recognizable post path, and an independently
-recognizable final post ID must match the requested ID. A loopback test URL
-only validates its numeric final path segment (with optional `.html`) against
-the requested ID. Identity mismatches fail only that row during journal exports
+requests or writes, the delivered page must prove its identity: the final URL
+must *be recognized* as a LiveJournal journal aliasing the request — an
+unrecognizable destination fails, it does not pass for want of a contradiction —
+any post ID the final URL carries must match, the parsed post ID must match, and
+the parsed journal must alias the request too. A loopback test URL is excused
+only from *final journal* identity, because its host is never a LiveJournal
+form; its numeric final path segment (with optional `.html`) and its parsed
+journal are still checked. See `run::validate_requested_post_identity` below for
+the exact seams. Identity mismatches fail only that row during journal exports
 and fail the whole run for a single-post target; no file is staged or written
 under the returned wrong ID.
 
@@ -805,6 +820,53 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   mechanism. Raw blocks cannot use that mechanism (see "Implementation
   Guidance"), and always absolutizing instead would make intra-archive raw links
   useless in every real run, since production always uses a pending rewriter.
+- **Bug, not a trade-off:** `render_list` (`src/adoc/mod.rs`) drops every direct
+  child of a `ul`/`ol` that is not an `li`. `<ul><div>x</div></ul>` renders as
+  the empty string, and `<ul><li>a</li><div>x</div><li>b</li></ul>` renders
+  `* a\n* b` with `x` gone. That is real content loss, pre-existing, and it
+  contradicts the never-drop-content property the source-coverage work is built
+  on. It is deliberately not fixed here because the coverage classifier *depends*
+  on it: `renders_as_source_preserving_passthrough`
+  (`src/adoc/source_html.rs`) returns `false` for **every** direct child of a
+  `ul`/`ol`, with the stated reason that the list renderer never reaches it. Fix
+  the drop alone and a table inside a list starts emitting source bytes the
+  classifier just said it does not own; fix the classifier alone and the content
+  stays dropped. The two must change together, splitting that function into a
+  standalone "is this element a source-span owner" question and a separate
+  dispatch decision.
+- A `<script>` anywhere in a **post body** can still set `:lj-poster:` and
+  `:lj-date:`. `site_entry` selects every executable `<script>` in the document,
+  body included, and trusts the first object whose `ditemid` equals the resolved
+  post id — which an author of that post knows. Verified attacker-reachable. The
+  forgeable `journal` field is *not* a residual risk: delivered-post identity
+  validation requires the parsed journal to alias the request, so a forged
+  journal fails the run. What is left is two cosmetic attributes carrying
+  attacker-chosen text. Narrowing the scan to scripts outside the post body is
+  the fix if this ever matters. Two smaller gaps in the same helper:
+  `is_executable_script` ignores `src`, so the inline text of a
+  `<script src=…>x</script>` — which a browser never runs — is still scanned;
+  and the lexer has no HTML Annex B `<!-- -->` handling, so script content using
+  that legacy comment form is lexed as ordinary JavaScript.
+- Escaping a whole line of active block syntax leaves a **visible backslash** in
+  converted output. Asciidoctor consumes a leading `\` only for a genuine
+  preprocessor directive (`\include::x[]` converts to `include::x[]`); for a list
+  marker, a heading, `[...]` block metadata, an admonition label, a document
+  attribute, a line comment, or an over-matched block macro the backslash is
+  rendered (`\* item`, `\= Heading`, `\[pass]`, `\foo::bar[baz]`). Verified on
+  2.0.26. The renderer already avoids this where it can — `&#N;` numeric
+  references for an indented marker, and the `pass:[]` line guard, are both
+  invisible — but the plain line-start escape is not one of those cases.
+  `README.md` states the limitation for users.
+- Discovery canonicalization (`canonical_archive_url`, `src/discover.rs`) strips
+  the query and the fragment, and nothing else. Userinfo and a trailing DNS root
+  dot survive, and `dedup_archive_urls` compares URL strings, so
+  `https://a@news.livejournal.com/2020/01/` and `https://news.livejournal.com./2020/01/`
+  are each distinct from the plain spelling and from each other — all three pass
+  `is_journal_archive_url`, which normalizes the host for the *check* but not in
+  the value it keeps. The effect is request amplification only: the same month is
+  fetched more than once. It is bounded by the 1536-page month cap
+  (`MAX_DISCOVERY_MONTH_PAGES`), and post IDs are deduplicated downstream, so no
+  duplicate work reaches the archive.
 - Comments on modern LiveJournal are JavaScript-loaded and absent from static HTML, so a static fetch cannot archive comment threads.
 - `:lj-author:` is the journal name, not the poster — the canonical account name from `Site.entry.journal` when its `ditemid` matches (e.g. `evo_lutio`, not the `evo-lutio` subdomain spelling, and never `users` for `users.livejournal.com` posts). The real poster is captured separately as `:lj-poster:` from `Site.entry`; for personal journals the poster equals the journal name.
 
