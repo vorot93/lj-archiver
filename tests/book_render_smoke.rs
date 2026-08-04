@@ -188,39 +188,45 @@ fn raw_media_resolves_in_both_standalone_and_book_contexts() {
     archive.write_book(&posts).unwrap();
 
     // Standalone: converted next to posts/, so ../assets/ reaches the asset.
-    let standalone = convert(&root, "posts/1.adoc");
+    convert(&root, "posts/1.adoc");
     let standalone_html = fs::read_to_string(root.join("posts/1.html")).unwrap();
     assert_eq!(
         first_image_src(&standalone_html),
         Some("../assets/sample.svg"),
-        "standalone conversion emitted the wrong raw <img src>:\n{standalone}\n{}",
+        "standalone conversion emitted the wrong raw <img src>:\n{}",
+        bounded_diagnostic(standalone_html.as_bytes())
+    );
+    assert_eq!(
+        standalone_html.matches("<img").count(),
+        1,
+        "exactly one conditional variant may survive:\n{}",
         bounded_diagnostic(standalone_html.as_bytes())
     );
     assert!(root.join("posts/../assets/sample.svg").is_file());
 
     // Book: converted at the archive root, so the asset is a direct child.
-    let book = convert(&root, "book.adoc");
+    convert(&root, "book.adoc");
     let book_html = fs::read_to_string(root.join("book.html")).unwrap();
     assert_eq!(
         first_image_src(&book_html),
         Some("assets/sample.svg"),
-        "book conversion emitted the wrong raw <img src>:\n{book}\n{}",
+        "book conversion emitted the wrong raw <img src>:\n{}",
         bounded_diagnostic(book_html.as_bytes())
     );
-    assert!(root.join("assets/sample.svg").is_file());
     assert_eq!(
         book_html.matches("<img").count(),
         1,
         "exactly one conditional variant may survive:\n{}",
         bounded_diagnostic(book_html.as_bytes())
     );
+    assert!(root.join("assets/sample.svg").is_file());
 }
 
-/// Converts `input` inside `root`, returning Asciidoctor's diagnostics. A
+/// Converts `input` inside `root`, asserting Asciidoctor said nothing at all. A
 /// preprocessor complaint about a generated conditional is only ever reported as
-/// an `ERROR` line — the process still exits zero — so an empty stderr is the
-/// assertion that matters.
-fn convert(root: &Path, input: &str) -> String {
+/// an `ERROR` line — the process still exits zero — so an empty stderr, not the
+/// exit status, is the assertion that matters.
+fn convert(root: &Path, input: &str) {
     let output = Command::new("asciidoctor")
         .arg(input)
         .current_dir(root)
@@ -236,8 +242,6 @@ fn convert(root: &Path, input: &str) -> String {
         diagnostics.is_empty(),
         "asciidoctor diagnosed {input}: {diagnostics}"
     );
-
-    diagnostics
 }
 
 #[test]

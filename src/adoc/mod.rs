@@ -4793,6 +4793,12 @@ mod tests {
         );
     }
 
+    /// Escaping and revalidation cover different halves of one attack. A
+    /// *quoted* value is held by the escaper alone: `"` becomes `&quot;`, so the
+    /// hostile filename stays one value. An *unquoted* value is not — the
+    /// escaper leaves whitespace alone, so the same replacement splits into a
+    /// second attribute, and only rescanning the spliced variant catches the
+    /// `onerror` that appears.
     #[test]
     fn raw_passthrough_cannot_be_broken_out_of_by_a_hostile_post_filename() {
         let rewriter = LinkRewriter::with_targets(
@@ -4803,14 +4809,24 @@ mod tests {
             )])),
             Url::parse("https://news.livejournal.com/166511.html").unwrap(),
         );
-        let html = r#"<table><tr><td><img src="/166512.html" alt="a"></td></tr></table>"#;
-        let rendered = html_to_adoc_with_links(html, Some(&rewriter));
 
+        let quoted = r#"<table><tr><td><img src="/166512.html" alt="a"></td></tr></table>"#;
+        let rendered = html_to_adoc_with_links(quoted, Some(&rewriter));
         assert!(
             rendered.contains(r#"src="x&quot; onerror=&quot;alert(1).html""#),
             "the replacement must stay inside its quoting: {rendered}"
         );
         assert!(!rendered.contains("onerror=\""), "{rendered}");
+
+        let unquoted = "<table><tr><td><img src=/166512.html alt=a></td></tr></table>";
+        let rendered = html_to_adoc_with_links(unquoted, Some(&rewriter));
+        assert_eq!(
+            rendered,
+            format!("[subs=specialcharacters]\n----\n{unquoted}\n----\n\n"),
+            "an unquoted value the replacement would split into a second \
+             attribute must fail closed"
+        );
+        assert!(!rendered.contains("++++"), "{rendered}");
     }
 
     #[test]

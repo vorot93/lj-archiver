@@ -301,13 +301,27 @@ activate attribute references — which is why context is selected with outer
 conditionals instead. One hard-won constraint: Asciidoctor evaluates
 `ifdef`/`ifndef`/`ifeval`/`endif` lines **inside** `++++` blocks (verified on
 2.0.26 — an `endif::[]` inside a passthrough raises "unmatched preprocessor
-directive", and an unmatched `ifdef::` silently discards the rest of the
-document), so raw HTML containing such a line fails closed to a listing. That
-check covers *every* emitted fragment, not only the ones a generated conditional
-wraps, because the lone-block case loses content too. `include::` inside a
-passthrough is likewise honoured by Asciidoctor and is **not** yet covered — see
-"Known Limitations". Direct conversion without a `LinkRewriter` invents no
-archive context at all: references stay exactly as delivered.
+directive", and an unmatched `ifdef::` discards the rest of the document at exit
+status 0), so raw HTML containing such a line fails closed to a listing.
+
+**That fallback does not neutralize the directive**, and no note here should
+claim it does. The preprocessor runs inside `[subs=specialcharacters]\n----`
+blocks exactly as it does inside `++++`: an unmatched `ifdef::` truncates the
+*listing* and still discards everything after it, and an `endif::[]` is dropped
+from the listing's own content — a content loss in the very path that exists to
+preserve content inertly. Both verified on 2.0.26; see "Known Limitations" for
+the reproductions and for the `include::` disclosure of the same family, which
+is likewise **not** covered. The check's real and only guarantee is narrower:
+no *generated* conditional can be closed by authored bytes. It is nevertheless
+applied to every emitted fragment rather than only to the ones a conditional
+wraps, on a different ground — a truncated `++++` splices unbalanced raw markup
+into the document as live HTML, while a truncated listing stays escaped and
+inert. Actually neutralizing authored directive lines is a separate, approved
+piece of work covering both directive families across listings *and*
+passthrough.
+
+Direct conversion without a `LinkRewriter` invents no archive context at all:
+references stay exactly as delivered.
 
 `LinkRewriter::raw_post_html_filename` deliberately records **no** pending link,
 unlike the macro-target helpers. A raw block whose URL depends on context is
@@ -623,16 +637,26 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   the image macro) and retain only the sanitized visible label. Do not add a
   per-call-site fallback that sanitizes an href without consulting this policy —
   that is exactly the regression these helpers exist to prevent.
-- Asciidoctor's preprocessor also honours `include::` **inside** a `++++`
-  passthrough block, and the `asciidoctor` CLI's default safe mode is `unsafe`,
-  so an authored `include::<path>[]` line inside reviewed raw HTML would splice
-  a local file into the converted output. Reviewed passthrough currently fails
-  closed only on the four *conditional* directives (see "Implementation
-  Guidance"); extending that set to `include::` is a separate, wanted change
-  that needs its own test and README pass. Reproduce with
-  `printf 'x\n++++\n<p>a</p>\ninclude::secret.adoc[]\n++++\n' | asciidoctor --embedded -`
-  (a `../` path outside the base directory is included too, confirming the
-  default safe mode).
+- **Authored AsciiDoc preprocessor lines inside archived content are not
+  neutralized anywhere.** Asciidoctor's preprocessor runs inside `++++`
+  passthrough blocks *and* inside `[subs=specialcharacters]\n----` listings, so
+  the renderer's fail-closed listing is not an escape hatch — it merely trades a
+  truncated passthrough for a truncated listing. All verified on 2.0.26, every
+  one exiting 0:
+  - `printf 'x\n++++\n<p>a</p>\ninclude::secret.adoc[]\n++++\n' | asciidoctor --embedded -`
+    splices the file in. A `../` path outside the base directory works too,
+    confirming the CLI's default safe mode is `unsafe`.
+  - `printf 'before\n[subs=specialcharacters]\n----\n<td>\nifdef::never-defined[]\n</td>\n----\n\nAFTER\n' | asciidoctor --embedded -`
+    truncates the listing *and* discards `AFTER`.
+  - The same listing with `endif::[]` instead keeps the surrounding lines but
+    silently drops the `endif::[]` line from the listing's own content.
+
+  Reviewed passthrough fails closed on the four *conditional* directives, which
+  guarantees only that a generated `ifndef::lj-archiver-book[]` conditional
+  cannot be closed by authored bytes (see "Implementation Guidance"). A
+  dedicated task is approved to actually neutralize these, covering both
+  directive families across listings and passthrough; do not patch it piecemeal
+  here.
 - A link inside reviewed raw HTML that points at a post the run then *fails* to
   archive stays a relative `<id>.html` / `posts/<id>.html` and dangles, where
   the equivalent `xref:` degrades to the hosted URL through the pending-link
