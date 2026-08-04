@@ -305,10 +305,16 @@ directive", and an unmatched `ifdef::` silently discards the rest of the
 document), so raw HTML containing such a line fails closed to a listing. That
 check covers *every* emitted fragment, not only the ones a generated conditional
 wraps, because the lone-block case loses content too. `include::` inside a
-passthrough is likewise honoured by Asciidoctor and is **not** yet covered —
-see the standing note in the security section. Direct conversion without a
-`LinkRewriter` invents no archive context at all: references stay exactly as
-delivered.
+passthrough is likewise honoured by Asciidoctor and is **not** yet covered — see
+"Known Limitations". Direct conversion without a `LinkRewriter` invents no
+archive context at all: references stay exactly as delivered.
+
+`LinkRewriter::raw_post_html_filename` deliberately records **no** pending link,
+unlike the macro-target helpers. A raw block whose URL depends on context is
+emitted twice, and `validate_pending_links` requires each token to occur exactly
+once, so a token cannot represent two local spellings. The consequence is
+recorded under "Known Limitations": a raw link to a post that ultimately fails
+stays a relative `<id>.html` rather than degrading to the hosted URL.
 
 The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
@@ -624,7 +630,15 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   closed only on the four *conditional* directives (see "Implementation
   Guidance"); extending that set to `include::` is a separate, wanted change
   that needs its own test and README pass. Reproduce with
-  `printf 'x\n++++\n<p>a</p>\ninclude::secret.adoc[]\n++++\n' | asciidoctor --embedded -`.
+  `printf 'x\n++++\n<p>a</p>\ninclude::secret.adoc[]\n++++\n' | asciidoctor --embedded -`
+  (a `../` path outside the base directory is included too, confirming the
+  default safe mode).
+- A link inside reviewed raw HTML that points at a post the run then *fails* to
+  archive stays a relative `<id>.html` / `posts/<id>.html` and dangles, where
+  the equivalent `xref:` degrades to the hosted URL through the pending-link
+  mechanism. Raw blocks cannot use that mechanism (see "Implementation
+  Guidance"), and always absolutizing instead would make intra-archive raw links
+  useless in every real run, since production always uses a pending rewriter.
 - Comments on modern LiveJournal are JavaScript-loaded and absent from static HTML, so a static fetch cannot archive comment threads.
 - `:lj-author:` is the journal name, not the poster — the canonical account name from `Site.entry.journal` when its `ditemid` matches (e.g. `evo_lutio`, not the `evo-lutio` subdomain spelling, and never `users` for `users.livejournal.com` posts). The real poster is captured separately as `:lj-poster:` from `Site.entry`; for personal journals the poster equals the journal name.
 
