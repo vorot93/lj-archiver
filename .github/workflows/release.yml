@@ -30,8 +30,8 @@ jobs:
           tag_commit="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
           test "$tag_commit" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          git fetch --no-tags origin master
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/master
+          git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/master
 
   gates:
     needs: validate
@@ -183,6 +183,31 @@ jobs:
           done
           test "$tag_type" = commit
           test "$tag_sha" = "$GITHUB_SHA"
+          master_object="$(gh api "repos/$GH_REPO/git/ref/heads/master" --jq '[.object.type, .object.sha] | @tsv')"
+          IFS=$'\t' read -r master_type master_sha <<< "$master_object"
+          test "$master_type" = commit
+          printf '%s' "$master_sha" | grep -Eqx '[0-9a-f]{40}'
+          # Unpaginated compare: GitHub guarantees the last entry of .commits is
+          # the true head of the whole comparison here. That guarantee only
+          # holds without per_page/page, so this call must never add --paginate.
+          comparison="$(gh api "repos/$GH_REPO/compare/$GITHUB_SHA...$master_sha" --jq '[.status, .base_commit.sha, .merge_base_commit.sha, (.commits | length), (.commits | last | .sha // "")] | @tsv')"
+          IFS=$'\t' read -r compare_status base_sha merge_base_sha commit_count head_sha <<< "$comparison"
+          test "$base_sha" = "$GITHUB_SHA"
+          test "$merge_base_sha" = "$GITHUB_SHA"
+          case "$compare_status" in
+            identical)
+              test "$commit_count" -eq 0
+              test "$master_sha" = "$GITHUB_SHA"
+              ;;
+            ahead)
+              test "$commit_count" -ge 1
+              test "$head_sha" = "$master_sha"
+              ;;
+            *)
+              echo "release commit is not currently an ancestor of master (status: $compare_status)" >&2
+              exit 1
+              ;;
+          esac
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "release already exists" >&2
             exit 1

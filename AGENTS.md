@@ -46,6 +46,36 @@ holds the iced 0.14 desktop GUI. CI keeps them apart: the `ci` job lints/tests
 `-p lj-archiver` (fast, no iced), the `gui` job lints, tests, and builds the GUI, and
 `cargo fmt --all` covers both.
 
+Release provenance is checked twice, on purpose. The `validate` job proves at
+checkout time that the tag names the workspace version, that the tag commit is
+`$GITHUB_SHA`, and that `$GITHUB_SHA` is an ancestor of master — fetching master
+through the explicit refspec `+refs/heads/master:refs/remotes/origin/master` and
+comparing against `refs/remotes/origin/master`, because a bare
+`git fetch --no-tags origin master` only updates `FETCH_HEAD` and can leave a
+stale `origin/master`. The `publish` job is the sole contents-write step, and it
+rechecks live state immediately before the single `gh release create`: it peels
+the remote tag to a commit and binds it to `$GITHUB_SHA`, then queries
+`refs/heads/master` through `gh api`, requires an exact 40-character lowercase
+commit SHA, and calls the Compare Commits API with **exact commit identities**
+(`$GITHUB_SHA...$master_sha`, never a mutable branch name) requiring the base
+and merge-base commits to equal `$GITHUB_SHA`, the head commit to equal the
+queried master SHA, and the status to be `ahead` or `identical`. That compare
+call is deliberately unpaginated: per GitHub's REST API docs, without a
+`per_page`/`page` argument the last entry of `.commits` is guaranteed to be the
+true head of the whole comparison, a guarantee that stops holding once you
+paginate — so this call must never gain a `--paginate`/`per_page`/`page`
+argument. Missing, malformed, ambiguous, diverged, behind, and API-error states
+all abort under `set -euo pipefail`. The publisher stays checkout-free.
+`tests/release_workflow.rs` keeps the static sole-writer, fan-in,
+repository-binding, artifact-cardinality, and ordering assertions **and**
+executes the shipped run block (in a `#[cfg(unix)]`-gated module, since the
+harness needs `bash` and Unix permission bits) against a controlled fake `gh` —
+grep-only assertions cannot catch a logic error in the script, so do not
+replace the behavioral tests with more string matching. A further test runs the
+shipped `--jq` filter itself through real `jq` against a Compare-Commits-shaped
+fixture, since the fake `gh` hands back pre-rendered TSV and never exercises
+the filter.
+
 Reuse seam (in the core, additive, CLI behavior unchanged):
 - `run::run_archive(target, &RunOptions, &Progress) -> Result<RunOutcome>` is the
   shared entry point. It returns `Ok` even when some journal posts/pages failed
