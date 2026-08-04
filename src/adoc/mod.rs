@@ -446,16 +446,7 @@ fn render_link(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
                 return text;
             }
 
-            let macro_target = ctx.link_rewriter.map_or_else(
-                || Some(sanitize_macro_target(href)),
-                |rewriter| {
-                    rewriter
-                        .xref_target(href)
-                        .or_else(|| rewriter.absolute_target(href))
-                },
-            );
-
-            let Some(macro_target) = macro_target else {
+            let Some(macro_target) = link_macro_target(href, LinkTargetKind::Anchor, ctx) else {
                 return sanitize_rendered_macro_label(&text);
             };
 
@@ -484,21 +475,53 @@ fn render_image(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     }
 }
 
+/// Which click target an anchor or a linked image resolves to. Anchors resolve
+/// same-journal posts through `xref:`; linked images resolve them through the
+/// `link=` attribute prefix.
+#[derive(Clone, Copy)]
+enum LinkTargetKind {
+    Anchor,
+    ImageLink,
+}
+
 fn image_macro_target(src: &str, ctx: RenderCtx<'_>) -> Option<String> {
     match ctx.link_rewriter {
         Some(_) if src.starts_with("../assets/") => Some(sanitize_macro_target(src)),
         Some(rewriter) => rewriter.absolute_target(src),
-        None => match Url::parse(src) {
-            Ok(_) if explicit_image_scheme_is_allowed(src) => Some(sanitize_macro_target(src)),
-            Err(url::ParseError::RelativeUrlWithoutBase) => Some(sanitize_macro_target(src)),
-            _ => None,
-        },
+        None => direct_target(src),
     }
 }
 
-fn explicit_image_scheme_is_allowed(src: &str) -> bool {
-    Url::parse(src)
-        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+/// The click target of an anchor or linked image, decided beside
+/// [`image_macro_target`] so both the image source and its click target answer
+/// to one policy. Archive runs with a `LinkRewriter` keep their stricter
+/// resolution (same-journal posts become local targets; everything else must
+/// resolve to hosted HTTP(S) against the delivered page).
+fn link_macro_target(href: &str, kind: LinkTargetKind, ctx: RenderCtx<'_>) -> Option<String> {
+    match ctx.link_rewriter {
+        Some(rewriter) => {
+            let local = match kind {
+                LinkTargetKind::Anchor => rewriter.xref_target(href),
+                LinkTargetKind::ImageLink => rewriter.image_link_target(href),
+            };
+            local.or_else(|| rewriter.absolute_target(href))
+        }
+        None => direct_target(href),
+    }
+}
+
+/// A direct (no-rewriter) macro target. Active only for a hosted absolute
+/// HTTP(S) URL or a syntactically valid scheme-less reference, which stays
+/// source-relative. Explicit `javascript:`, `data:`, `file:`, `mailto:`,
+/// `ftp:`, malformed absolute, and hostless HTTP(S) references lose the link
+/// and keep only their sanitized visible label or image.
+fn direct_target(reference: &str) -> Option<String> {
+    match Url::parse(reference) {
+        Ok(url) => (matches!(url.scheme(), "http" | "https") && url.has_host())
+            .then(|| sanitize_macro_target(reference)),
+        Err(url::ParseError::RelativeUrlWithoutBase) => Some(sanitize_macro_target(reference)),
+        Err(_) => None,
+    }
 }
 
 /// The sole `<img>` an anchor wraps, ignoring whitespace-only text. Returns
@@ -544,16 +567,7 @@ fn render_linked_image(image: ElementRef<'_>, href: &str, ctx: RenderCtx<'_>) ->
         };
     };
 
-    let link = ctx.link_rewriter.map_or_else(
-        || Some(sanitize_macro_target(href)),
-        |rewriter| {
-            rewriter
-                .image_link_target(href)
-                .or_else(|| rewriter.absolute_target(href))
-        },
-    );
-
-    let Some(link) = link else {
+    let Some(link) = link_macro_target(href, LinkTargetKind::ImageLink, ctx) else {
         return format!("image:{target}[{alt}]");
     };
     let link = link.replace(',', "%2C");
@@ -1007,6 +1021,63 @@ mod tests {
         assert!(
             html_to_adoc(r#"<img src="https://cdn.example/pic.png" alt="remote">"#)
                 .contains("image::https://cdn.example/pic.png[remote]")
+        );
+    }
+
+    #[test]
+    fn direct_anchor_and_linked_image_reject_unsafe_href_targets() {
+        for href in [
+            "javascript:alert(1)",
+            "data:text/html,%3Cscript%3Ealert(1)%3C/script%3E",
+            "file:///etc/passwd",
+            "mailto:user@example.test",
+            "ftp://example.test/f",
+            "http://",
+            "https://",
+        ] {
+            assert_eq!(
+                html_to_adoc(&format!(r#"<p><a href="{href}">label</a></p>"#)),
+                "label\n\n",
+                "anchor {href}"
+            );
+            assert_eq!(
+                html_to_adoc(&format!(
+                    concat!(
+                        r#"<p><a href="{}">"#,
+                        r#"<img src="https://cdn.example.test/p.png" alt="a"></a></p>"#,
+                    ),
+                    href
+                )),
+                "image:https://cdn.example.test/p.png[a]\n\n",
+                "linked image {href}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_anchor_and_linked_image_keep_safe_relative_and_hosted_targets() {
+        assert_eq!(
+            html_to_adoc(r#"<p><a href="/local/page.html">label</a></p>"#),
+            "/local/page.html[label]\n\n"
+        );
+        assert_eq!(
+            html_to_adoc(r#"<p><a href="deeper/page.html">label</a></p>"#),
+            "deeper/page.html[label]\n\n"
+        );
+        assert_eq!(
+            html_to_adoc(r#"<p><a href="https://example.test/p">label</a></p>"#),
+            "https://example.test/p[label]\n\n"
+        );
+        assert_eq!(
+            html_to_adoc(r#"<p><a href="http://example.test/p">label</a></p>"#),
+            "http://example.test/p[label]\n\n"
+        );
+        assert_eq!(
+            html_to_adoc(concat!(
+                r#"<p><a href="/local/page.html">"#,
+                r#"<img src="https://cdn.example.test/p.png" alt="a"></a></p>"#,
+            )),
+            "image:https://cdn.example.test/p.png[a,link=/local/page.html]\n\n"
         );
     }
 
@@ -2006,11 +2077,11 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_link_targets_with_dotted_block_macro_names() {
+    fn rejects_explicit_non_http_link_schemes_with_dotted_names() {
         let adoc = html_to_adoc(r#"<p><a href="foo.bar::x">t</a></p>"#);
 
         assert!(!adoc.contains("foo.bar::x[t]"));
-        assert_eq!(adoc, "foo.bar%3A%3Ax[t]\n\n");
+        assert_eq!(adoc, "t\n\n");
     }
 
     #[test]
@@ -4576,6 +4647,40 @@ mod tests {
             !["data:", "javascript:", "file:", "mailto:"]
                 .iter()
                 .any(|scheme| src.to_ascii_lowercase().starts_with(scheme))
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn explicit_non_http_anchor_schemes_are_not_emitted_after_conversion() {
+        let html = concat!(
+            r#"<p><a href="javascript:alert(1)">javascript</a></p>"#,
+            r#"<p><a href="data:text/html,x">data</a></p>"#,
+            r#"<p><a href="file:///etc/passwd">file</a></p>"#,
+            r#"<p><a href="mailto:user@example.test">mailto</a></p>"#,
+            r#"<p><a href="ftp://example.test/f">ftp</a></p>"#,
+            r#"<p><a href="relative/page.html">relative</a></p>"#,
+            r#"<p><a href="https://example.test/p">remote</a></p>"#,
+        );
+        let converted = convert_with_asciidoctor(&html_to_adoc(html));
+        let document = Html::parse_document(&converted);
+        let targets = document
+            .select(&Selector::parse("a").unwrap())
+            .filter_map(|anchor| anchor.attr("href"))
+            .collect::<Vec<_>>();
+
+        // The relative href converts to inert, non-hyperlinked text, not an
+        // `<a>` element: Asciidoctor's bare `target[text]` autolink
+        // recognition requires a URI scheme (unlike the explicit `link:` or
+        // `xref:` macro forms used elsewhere in this renderer), and a
+        // scheme-less reference keeps that inert shape both before and after
+        // this policy change. Only the hosted HTTP(S) target survives as a
+        // real link.
+        assert_eq!(targets, ["https://example.test/p"]);
+        assert!(targets.iter().all(|href| {
+            !["javascript:", "data:", "file:", "mailto:", "ftp:"]
+                .iter()
+                .any(|scheme| href.to_ascii_lowercase().starts_with(scheme))
         }));
     }
 

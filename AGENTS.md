@@ -285,10 +285,11 @@ as the minimum). Listings preserve source terminal newlines by construction:
 append the separator newline only when the source lacks one. Do not restore a
 candidate-by-candidate rescan ladder.
 
-Without a `LinkRewriter`, image macro targets retain scheme-less references and
-hosted HTTP(S) URLs only; explicit non-HTTP(S) or malformed absolute schemes
-fall back to inert visible text. `LinkRewriter`-controlled asset and absolute
-target branches are unchanged.
+Without a `LinkRewriter`, an image `src`, an anchor href, and a linked-image
+`link=` target alike retain scheme-less references and hosted HTTP(S) URLs
+only; explicit non-HTTP(S) or malformed absolute schemes fall back to inert
+visible text (see the direct/archive target policy under Known Limitations).
+`LinkRewriter`-controlled asset and absolute target branches are unchanged.
 
 The composed document ends with exactly one newline **by construction**, not a post-hoc trim: each block ends with a single `\n` (`push_body`) and the blank-line separator is inserted *before* each block (`render_post`, `render_comment`). Do not switch to per-block `\n\n` plus a trailing trim.
 
@@ -483,6 +484,16 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
 
 ## Known Limitations
 
+- Direct conversion (`html_to_adoc`, no `LinkRewriter`) and archive conversion
+  answer to one target policy, decided in `link_macro_target` /
+  `image_macro_target` / `direct_target` in `src/adoc/mod.rs`. Without a
+  rewriter, an anchor href, a linked-image `link=` target, and an image `src`
+  are active only when they are hosted absolute HTTP(S) or a syntactically
+  valid scheme-less reference; `javascript:`, `data:`, `file:`, `mailto:`,
+  `ftp:`, malformed absolute, and hostless HTTP(S) references drop the link (or
+  the image macro) and retain only the sanitized visible label. Do not add a
+  per-call-site fallback that sanitizes an href without consulting this policy —
+  that is exactly the regression these helpers exist to prevent.
 - Comments on modern LiveJournal are JavaScript-loaded and absent from static HTML, so a static fetch cannot archive comment threads.
 - `:lj-author:` is the journal name, not the poster — the canonical account name from `Site.entry.journal` when its `ditemid` matches (e.g. `evo_lutio`, not the `evo-lutio` subdomain spelling, and never `users` for `users.livejournal.com` posts). The real poster is captured separately as `:lj-poster:` from `Site.entry`; for personal journals the poster equals the journal name.
 
