@@ -456,7 +456,7 @@ fn rewrite_img_sources(
     for (target, replacement) in targets.iter().zip(replacements) {
         output.push_str(&html[cursor..target.value_range.start]);
         if let Some(target) = replacement {
-            push_html_attribute_escaped(&mut output, target);
+            output.push_str(&crate::html_scan::escaped_attribute_value(target));
         } else {
             output.push_str(&html[target.value_range.clone()]);
         }
@@ -465,19 +465,6 @@ fn rewrite_img_sources(
 
     output.push_str(&html[cursor..]);
     output
-}
-
-fn push_html_attribute_escaped(output: &mut String, value: &str) {
-    for character in value.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '"' => output.push_str("&quot;"),
-            '\'' => output.push_str("&#39;"),
-            character => output.push(character),
-        }
-    }
 }
 
 #[cfg(test)]

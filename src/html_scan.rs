@@ -159,6 +159,30 @@ impl ScannedAttribute {
     }
 }
 
+/// Encodes `value` for splicing back into a [`ScannedAttribute::value_range`],
+/// the inverse of the decoding [`ScannedAttribute::decoded_value`] reports.
+///
+/// Both quote styles are encoded, so the result is safe inside either quoting
+/// the source used — and safe unquoted too, as long as the value carries no
+/// whitespace, which is true of the paths and serialized URLs the callers
+/// substitute.
+pub(crate) fn escaped_attribute_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            character => escaped.push(character),
+        }
+    }
+
+    escaped
+}
+
 struct RawAttribute {
     normalized_name: String,
     qualified: bool,
