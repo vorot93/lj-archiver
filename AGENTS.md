@@ -883,6 +883,31 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   mechanism. Raw blocks cannot use that mechanism (see "Implementation
   Guidance"), and always absolutizing instead would make intra-archive raw links
   useless in every real run, since production always uses a pending rewriter.
+- A description-list marker whose `::` comes from a *generated* fragment still
+  converts to a `<dl>`. `<p>term<b>:: def</b></p>` renders
+  `pass:[]term*\:: def*`, which Asciidoctor 2.0.26 parses as a definition list
+  with the term `term*\` and the description `def*` — content mangling, not
+  injection: no macro, attribute, passthrough or directive becomes live. The
+  `pass:[]` line guard cannot help, because a marker is positional rather than
+  anchored, and the `pass:[:]` marker rewrite that handles the authored case
+  must not be extended to generated fragments — it would corrupt
+  `` `pass:c[a:: b]` `` and would break a macro attribute list outright
+  (`https://x[a:pass:[:] b]` closes at the rewrite's own `]`). Narrowing the
+  rewrite to markers outside fragment-held passthroughs fixes the first of those
+  and not the second, so the whole remedy is left alone. The *authored* half of
+  the same shape is closed (see "The composed-fragment rule").
+- A `NAME::` prefix followed mid-line by a generated fragment stays a live
+  inline macro with a colon-prefixed target. `<p>hi image::<a href="x">y</a></p>`
+  renders `hi image:pass:[:]x[y]`, which converts to `<img src=":x">`. The cause
+  predates and is independent of the split-run class: the description-list
+  neutralizer's own `pass:[:]` supplies a `[` that the macro scanner reads as
+  the completing bracket, while Asciidoctor extracts the passthrough first and
+  uses the *next* one. Not a security issue — the resulting target always begins
+  with `:`, so it can never be absolute, remote, or `javascript:`, and nothing
+  escapes `direct_target`/`sanitize_macro_target`. Closing it would mean
+  teaching the composed-fragment scan Asciidoctor's passthrough-extraction order
+  in its bracket search, which trades this wart for a visible backslash on the
+  `include::` spelling of the same shape.
 - **Bug, not a trade-off:** `render_list` (`src/adoc/mod.rs`) drops every direct
   child of a `ul`/`ol` that is not an `li`. `<ul><div>x</div></ul>` renders as
   the empty string, and `<ul><li>a</li><div>x</div><li>b</li></ul>` renders
