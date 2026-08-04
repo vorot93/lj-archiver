@@ -123,7 +123,9 @@ impl ScannedStartTag {
         &self.name
     }
 
-    #[allow(dead_code)] // Consumed by the passthrough coverage pass.
+    /// The original byte range of the start tag itself. Unlike
+    /// [`ScannedHtml::element_range`] it is known even for an element the source
+    /// never closed, which is what bounds that element's fail-closed listing.
     pub(crate) fn source_range(&self) -> Range<usize> {
         self.source_range.clone()
     }

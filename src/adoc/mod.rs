@@ -187,6 +187,7 @@ pub fn html_to_adoc_with_links(html: &str, link_rewriter: Option<&LinkRewriter>)
     let mut plain_text = String::new();
     let ctx = RenderCtx {
         source_html: html,
+        scanned: &scanned,
         source_index: &source_index,
         depth: 0,
         list_depth: 0,
@@ -257,6 +258,7 @@ const MAX_RENDER_DEPTH: usize = 256;
 #[derive(Clone, Copy)]
 struct RenderCtx<'a> {
     source_html: &'a str,
+    scanned: &'a crate::html_scan::ScannedHtml,
     source_index: &'a SourceIndex,
     depth: usize,
     list_depth: usize,
@@ -1403,27 +1405,62 @@ mod tests {
         );
     }
 
+    /// html5ever foster-parents `<div>FOSTER</div>` out of the table to *before*
+    /// it, so the DOM's first child is the fostered div while the source's first
+    /// div is the cell one. It must carry its own bytes. (It is still emitted
+    /// twice — once alone, once inside the table's passthrough — because
+    /// coverage suppression is a separate task.)
     #[test]
     fn foster_parented_same_name_elements_keep_their_own_source_bytes() {
         let html = r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#;
-        let rendered = html_to_adoc(html);
 
-        assert!(
-            !rendered.contains("<div>CELL</div>\n++++\n\n++++\n<table>"),
-            "foster-parented div was emitted with the cell div's bytes: {rendered}"
+        assert_eq!(
+            html_to_adoc(html),
+            concat!(
+                "++++\n<div>FOSTER</div>\n++++\n\n",
+                "++++\n<table><tr><td><div>CELL</div></td></tr>",
+                "<div>FOSTER</div></table>\n++++\n\n",
+            )
         );
     }
 
     #[test]
     fn synthetic_source_identity_never_reaches_output() {
-        for html in [
-            r#"<table><tr><td>c</td></tr></table>"#,
-            r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#,
-            r#"<div><span>text</span><table><tr><td>x</td></tr></table></div>"#,
-            r#"<div/>trailing<table><tr><td>c</td></tr></table>"#,
-            r#"<pre><table><tr><td>c</td></tr></table></pre>"#,
+        for (html, expected) in [
+            (
+                r#"<table><tr><td>c</td></tr></table>"#,
+                "++++\n<table><tr><td>c</td></tr></table>\n++++\n\n",
+            ),
+            (
+                r#"<table><tr><td><div>CELL</div></td></tr><div>FOSTER</div></table>"#,
+                concat!(
+                    "++++\n<div>FOSTER</div>\n++++\n\n",
+                    "++++\n<table><tr><td><div>CELL</div></td></tr>",
+                    "<div>FOSTER</div></table>\n++++\n\n",
+                ),
+            ),
+            (
+                r#"<div><span>text</span><table><tr><td>x</td></tr></table></div>"#,
+                concat!(
+                    "++++\n<div><span>text</span>",
+                    "<table><tr><td>x</td></tr></table></div>\n++++\n\n",
+                ),
+            ),
+            (
+                r#"<div/>trailing<table><tr><td>c</td></tr></table>"#,
+                concat!(
+                    "[subs=specialcharacters]\n----\n",
+                    "<div/>trailing<table><tr><td>c</td></tr></table>\n----\n\n",
+                ),
+            ),
+            (
+                r#"<pre><table><tr><td>c</td></tr></table></pre>"#,
+                "[subs=specialcharacters]\n----\nc\n----\n\n",
+            ),
         ] {
             let rendered = html_to_adoc(html);
+
+            assert_eq!(rendered, expected, "for {html}");
             assert!(
                 !rendered.contains("lj-archiver-source-id"),
                 "synthetic identity leaked for {html}: {rendered}"
@@ -1459,12 +1496,52 @@ mod tests {
     /// `</html>`.
     #[test]
     fn an_authored_html_element_never_becomes_an_enclosing_source_range() {
-        let adoc = html_to_adoc(r#"<html>a</html><div/>b"#);
-
-        assert!(
-            adoc.contains("<div/>b"),
-            "content after an authored </html> was dropped: {adoc}"
+        assert_eq!(
+            html_to_adoc(r#"<html>a</html><div/>b"#),
+            "a\n\n[subs=specialcharacters]\n----\n<div/>b\n----\n\n"
         );
+    }
+
+    /// A node the source never closed has no range of its own, so it is emitted
+    /// as an inert listing bounded by what the scanner does know. That listing
+    /// must start at the element's *own* start tag: an enclosing range also
+    /// covers the element's preceding siblings, which the renderer has already
+    /// emitted, and can cover LiveJournal chrome that `is_stripped_chrome`
+    /// deliberately removed.
+    #[test]
+    fn unclosed_element_listing_starts_at_its_own_start_tag() {
+        for (html, expected) in [
+            (
+                r#"<div class="lj-like something">x</div><div/>y"#,
+                "[subs=specialcharacters]\n----\n<div/>y\n----\n\n",
+            ),
+            (
+                r#"<p>intro</p><div class="cut">rest of the post"#,
+                concat!(
+                    "intro\n\n[subs=specialcharacters]\n----\n",
+                    "<div class=\"cut\">rest of the post\n----\n\n",
+                ),
+            ),
+            (
+                r#"<p>x</p><div/>a"#,
+                "x\n\n[subs=specialcharacters]\n----\n<div/>a\n----\n\n",
+            ),
+            // With a known enclosing range the listing still starts at the
+            // element's own start tag, and ends where that range ends — which
+            // trails the enclosing element's own closing tag into the inert
+            // listing. Over-emitting one closing tag is the conservative side:
+            // stopping earlier would need a content-end offset the scanner does
+            // not record, and guessing one risks dropping content.
+            (
+                r#"<blockquote>q<div/>inner</blockquote>after"#,
+                concat!(
+                    "[quote]\n____\nq[subs=specialcharacters]\n----\n",
+                    "<div/>inner</blockquote>\n----\n____\n\nafter\n\n",
+                ),
+            ),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "for {html}");
+        }
     }
 
     #[test]

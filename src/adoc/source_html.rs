@@ -12,11 +12,21 @@ use url::Url;
 #[derive(Debug, Default)]
 pub(crate) struct SourceIndex {
     ranges: HashMap<NodeId, Range<usize>>,
+    identities: HashMap<NodeId, usize>,
 }
 
 impl SourceIndex {
+    /// The original byte range of the whole element the node was parsed from,
+    /// present only when the source closed it.
     pub(crate) fn range(&self, node: NodeId) -> Option<Range<usize>> {
         self.ranges.get(&node).cloned()
+    }
+
+    /// The source identity the node was parsed from. Present whenever the source
+    /// opened the element — including when it never closed it, so there is no
+    /// [`Self::range`] but the start tag's own offset is still known.
+    pub(crate) fn identity(&self, node: NodeId) -> Option<usize> {
+        self.identities.get(&node).copied()
     }
 }
 
@@ -218,18 +228,42 @@ fn source_preserving_html<'a>(element: ElementRef<'_>, ctx: RenderCtx<'a>) -> Op
         .map(|range| &ctx.source_html[range])
 }
 
+/// The original byte offset of the start tag this node was parsed from. Unlike
+/// [`SourceIndex::range`] it survives an element the source never closed, which
+/// is exactly when the caller needs it.
+fn source_start_offset(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> Option<usize> {
+    let identity = ctx.source_index.identity(element.id())?;
+
+    Some(ctx.scanned.start_tags().get(identity)?.source_range().start)
+}
+
 /// A node with no scanner-owned range must never be re-serialized: the
 /// serialization would carry the synthetic identity attribute and would not be
-/// the archived bytes. Emit the smallest enclosing original source range that is
-/// known instead, as one inert listing — the same fail-closed response the
-/// renderer already gives to scanner ambiguity.
+/// the archived bytes. Emit original bytes running from the element's own start
+/// tag to the end of the nearest enclosing known range instead, as one inert
+/// listing — the same fail-closed response the renderer already gives to scanner
+/// ambiguity.
+///
+/// Starting at the element's *own* start tag is load-bearing. An enclosing range
+/// begins before the element, so listing all of it re-emits preceding siblings
+/// the renderer has already rendered, and prints LiveJournal chrome that
+/// [`is_stripped_chrome`] deliberately removed. An unclosed or self-closed
+/// non-void `<div>` is ordinary in real post bodies, so this path is routine
+/// rather than exotic.
 fn render_enclosing_source_listing(element: ElementRef<'_>, ctx: RenderCtx<'_>) -> String {
     let enclosing = element
         .ancestors()
-        .find_map(|ancestor| ctx.source_index.range(ancestor.id()))
-        .map_or(ctx.source_html, |range| &ctx.source_html[range]);
+        .find_map(|ancestor| ctx.source_index.range(ancestor.id()));
+    let start = source_start_offset(element, ctx)
+        .or_else(|| enclosing.as_ref().map(|range| range.start))
+        .unwrap_or(0);
+    // A range that does not cover the start tag cannot bound it: run to the end
+    // of the input rather than emit an empty listing and lose the content.
+    let end = enclosing
+        .filter(|range| range.contains(&start))
+        .map_or(ctx.source_html.len(), |range| range.end);
 
-    render_source_listing(enclosing)
+    render_source_listing(&ctx.source_html[start..end])
 }
 
 /// Builds the DOM-node → original-source index from the instrumented parse with
@@ -237,14 +271,15 @@ fn render_enclosing_source_listing(element: ElementRef<'_>, ctx: RenderCtx<'_>) 
 /// passthrough (which was O(n^2) for deeply nested content).
 ///
 /// The instrumented copy adds one synthetic identity attribute per *source*
-/// start tag, so a node carries an identity exactly when the source opened it.
-/// Parser-inserted nodes (`<tbody>`) carry none and get no entry; a source
-/// element the document never closed — which includes a self-closing non-void
-/// tag such as `<div/>`, since html5ever nests the following flow content inside
-/// it rather than closing it — has an identity but no completed range, and also
-/// gets no entry. Both cases fail closed in [`render_passthrough`] rather than
-/// falling back to re-serialization, because a re-serialized node would carry
-/// the synthetic attribute and would not be the archived bytes.
+/// start tag, so a node gets an identity exactly when the source opened it.
+/// Parser-inserted nodes (`<tbody>`) carry none and get no entry at all. A
+/// source element the document never closed — which includes a self-closing
+/// non-void tag such as `<div/>`, since html5ever nests the following flow
+/// content inside it rather than closing it — keeps its identity but gets no
+/// *range*, so [`render_passthrough`] fails closed to a listing rather than
+/// re-serializing a node whose serialization would carry the synthetic attribute
+/// and would not be the archived bytes. The identity is still what bounds that
+/// listing at the element's own start tag, so it is recorded either way.
 ///
 /// The fragment parser's own `<html>` root is skipped: it is not an archived
 /// element, but an authored `<html>` start tag merges its attributes — including
@@ -264,16 +299,18 @@ pub(crate) fn build_source_index(
         else {
             continue;
         };
-        let Some(range) = element
+        let Some(identity) = element
             .value()
             .attr(attribute)
             .and_then(|identity| identity.parse::<usize>().ok())
-            .and_then(|identity| scanned.element_range(identity))
         else {
             continue;
         };
 
-        index.ranges.insert(element.id(), range);
+        index.identities.insert(element.id(), identity);
+        if let Some(range) = scanned.element_range(identity) {
+            index.ranges.insert(element.id(), range);
+        }
     }
 
     index

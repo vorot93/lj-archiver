@@ -209,10 +209,20 @@ Only tags the scanner recovered are instrumented, so raw-text/RCDATA payloads,
 comments, and attribute values are never rewritten. Two rules keep the synthetic
 attribute invisible: only the original input is ever sliced for output
 (`ctx.source_html`), and a node with no scanner-owned range is **never**
-re-serialized — it falls back to an inert listing of the smallest enclosing
-known source range, because `element.html()` would both carry the synthetic
-attribute and invent markup the archive never had (an inserted `<tbody>`, a
-synthesized closing tag, a normalized `<div/>`).
+re-serialized, because `element.html()` would both carry the synthetic attribute
+and invent markup the archive never had (an inserted `<tbody>`, a synthesized
+closing tag, a normalized `<div/>`). Such a node falls back to an inert listing
+running from **its own start tag** — recovered through
+`SourceIndex::identity` and `ScannedStartTag::source_range`, which survive an
+element the source never closed — to the end of the nearest enclosing known
+range, or the end of the input. Both bounds are load-bearing. Listing a whole
+enclosing range instead would re-emit the element's preceding siblings, which
+the renderer has already rendered, and would print LiveJournal chrome that
+`is_stripped_chrome` deliberately removed; unclosed and self-closed non-void
+`<div>`s are ordinary in real post bodies, so this path is routine. The listing
+does trail the enclosing element's own closing tag; over-emitting one inert
+closing tag is deliberate, because stopping earlier needs a content-end offset
+the scanner does not record and guessing one risks dropping content.
 
 The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized across inline boundaries so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
