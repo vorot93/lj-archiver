@@ -1495,6 +1495,27 @@ mod tests {
     }
 
     #[test]
+    fn manifest_writes_reject_a_valid_then_invalid_batch_without_writing_anything() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("archive");
+        let archive = Archive::new(&root, "news");
+        // The invalid descriptor comes *after* a valid one so that an
+        // implementation which wrote each descriptor as it validated, rather than
+        // validating the whole batch before writing anything, would already have
+        // written the first entry by the time it rejected the second.
+        let posts = [
+            descriptor(1, root.join("posts/1.adoc")),
+            descriptor(2, root.join("posts/3.adoc")),
+        ];
+
+        assert!(archive.write_index(&posts).is_err());
+        assert!(root_entries(&root).is_empty());
+
+        assert!(archive.write_book(&posts).is_err());
+        assert!(root_entries(&root).is_empty());
+    }
+
+    #[test]
     fn manifest_writes_accept_zero_padded_numeric_aliases() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("archive");
