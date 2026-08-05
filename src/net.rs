@@ -257,7 +257,11 @@ fn ipv4_from_low32(segments: [u16; 8]) -> Ipv4Addr {
 /// only to the addresses this returns and never re-resolves, it both blocks and
 /// *pins* the destination — there is no window to rebind between validation and
 /// connect. IP-literal hosts never reach a resolver, so the loopback test
-/// affordance and every `127.0.0.1` fixture are unaffected.
+/// affordance and every `127.0.0.1` fixture are unaffected. (Corollary for
+/// tests: a loopback media fixture must use a `127.0.0.1` literal, never the
+/// `localhost` name — the literal bypasses this resolver, whereas `localhost`
+/// resolves to loopback and is dropped here even though `target_is_allowed`
+/// permits it in loopback-page mode.)
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PublicUnicastDnsResolver;
 

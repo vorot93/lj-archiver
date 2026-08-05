@@ -38,7 +38,11 @@ impl LjClient {
                     return attempt
                         .error(format!("refused redirect into restricted target {blocked}"));
                 }
-                if attempt.previous().len() >= 10 {
+                // Preserve the prior `Policy::limited(10)` budget exactly:
+                // reqwest refuses when `previous().len() > max`, so `> 10`
+                // follows up to 10 hops (matching the media fetcher's
+                // MEDIA_REDIRECT_LIMIT), not 9.
+                if attempt.previous().len() > 10 {
                     let last = attempt.url().clone();
                     return attempt.error(format!("exceeded redirect limit reaching {last}"));
                 }
