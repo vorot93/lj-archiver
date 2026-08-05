@@ -35,6 +35,12 @@ pub enum LjError {
     InvalidArchive { path: PathBuf, reason: String },
     #[error("archive at {path} is being updated by another lj-archiver process")]
     ArchiveBusy { path: PathBuf },
+    #[error("could not lock {path}: {source}")]
+    Lock {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("could not write {path}: {source}")]
     Write {
         path: PathBuf,

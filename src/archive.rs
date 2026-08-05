@@ -15,6 +15,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+/// Rejection reason shared by the two post-id gates (`write_post` and the
+/// manifest descriptor check), which must reject `0` identically.
+const POST_ID_MUST_BE_POSITIVE: &str = "post id must be positive";
+
 #[derive(Debug, Clone)]
 pub struct Archive {
     root: PathBuf,
@@ -196,14 +200,14 @@ impl Archive {
             Err(fs::TryLockError::WouldBlock) => Err(LjError::ArchiveBusy {
                 path: self.root.clone(),
             }),
-            Err(fs::TryLockError::Error(source)) => Err(LjError::Write { path, source }),
+            Err(fs::TryLockError::Error(source)) => Err(LjError::Lock { path, source }),
         }
     }
 
     pub fn write_post(&self, id: u64, contents: &str) -> Result<PathBuf> {
         self.validate_journal()?;
         if id == 0 {
-            return Err(invalid_archive(&self.root, "post id must be positive"));
+            return Err(invalid_archive(&self.root, POST_ID_MUST_BE_POSITIVE));
         }
         let path = self.post_path(id);
         self.write_post_at(&path, contents)
@@ -385,7 +389,7 @@ impl Archive {
     /// non-UTF-8, zero, and mismatched paths are rejected.
     fn validated_manifest_path(&self, post: &ArchivedPost) -> Result<PathBuf> {
         if post.id == 0 {
-            return Err(invalid_archive(&post.path, "post id must be positive"));
+            return Err(invalid_archive(&post.path, POST_ID_MUST_BE_POSITIVE));
         }
 
         let relative = post
@@ -1514,17 +1518,6 @@ mod tests {
         }
     }
 
-    fn root_entries(root: &Path) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(root) else {
-            return Vec::new();
-        };
-        let mut names = entries
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    }
-
     #[test]
     fn manifest_writes_reject_invalid_descriptors_without_writing_anything() {
         let dir = tempdir().unwrap();
@@ -1555,10 +1548,9 @@ mod tests {
                 post.path
             );
             assert!(
-                root_entries(&root).is_empty(),
-                "rejected descriptor {:?} still touched the archive root: {:?}",
-                post.path,
-                root_entries(&root)
+                !root.exists(),
+                "rejected descriptor {:?} created the archive root before validation",
+                post.path
             );
         }
     }
@@ -1578,10 +1570,16 @@ mod tests {
         ];
 
         assert!(archive.write_index(&posts).is_err());
-        assert!(root_entries(&root).is_empty());
+        assert!(
+            !root.exists(),
+            "write_index created the archive root before validation"
+        );
 
         assert!(archive.write_book(&posts).is_err());
-        assert!(root_entries(&root).is_empty());
+        assert!(
+            !root.exists(),
+            "write_book created the archive root before validation"
+        );
     }
 
     #[test]
@@ -1603,7 +1601,7 @@ mod tests {
         let archive = Archive::new(&root, "news");
 
         assert!(archive.write_post(0, "= T\n").is_err());
-        assert!(root_entries(&root).is_empty());
+        assert!(!root.exists(), "a rejected write created the archive root");
     }
 
     #[test]
@@ -1616,7 +1614,7 @@ mod tests {
         assert!(archive.write_post(1, "= T\n").is_err());
         assert!(archive.write_index(&posts).is_err());
         assert!(archive.write_book(&posts).is_err());
-        assert!(root_entries(&root).is_empty());
+        assert!(!root.exists(), "a rejected write created the archive root");
     }
 
     #[test]
