@@ -2793,6 +2793,46 @@ mod tests {
         assert_eq!(html_to_adoc(r"<p>\pass:[x]</p>"), "\\pass:[x]\n\n");
     }
 
+    /// Asciidoctor's `pass:` macro emits *raw HTML* and carries no left word
+    /// boundary, so a name abutting a preceding byte still fires — stored XSS.
+    /// The escape must sit immediately before `pass`, across the qualifier forms.
+    #[test]
+    fn neutralizes_name_continuation_prefixed_passthrough_macros() {
+        for (input, expected) in [
+            (
+                "<p>xpass:[&lt;script&gt;a&lt;/script&gt;]</p>",
+                "x\\pass:[<script>a</script>]\n\n",
+            ),
+            (
+                "<p>9pass:[&lt;img onerror=x&gt;]</p>",
+                "9\\pass:[<img onerror=x>]\n\n",
+            ),
+            ("<p>_pass:c[&lt;b&gt;]</p>", "_\\pass:c[<b>]\n\n"),
+            ("<p>-pass:a,q[y]</p>", "-\\pass:a,q[y]\n\n"),
+        ] {
+            assert_eq!(html_to_adoc(input), expected, "{input}");
+        }
+    }
+
+    /// Parenthesized index terms carry no left word boundary; the concealed
+    /// `(((x)))` form *deletes* its text. Encoding every second `(` of a run
+    /// breaks the `((` doublet while rendering identically, preserving the text.
+    #[test]
+    fn neutralizes_parenthesized_index_terms_preserving_text() {
+        for (input, expected) in [
+            (
+                "<p>before (((hugs))) after</p>",
+                "before (&#40;(hugs))) after\n\n",
+            ),
+            ("<p>a ((visible)) b</p>", "a (&#40;visible)) b\n\n"),
+            ("<p>a ((((deep)))) b</p>", "a (&#40;(&#40;deep)))) b\n\n"),
+            // A single paren is ordinary text.
+            ("<p>a (one) b</p>", "a (one) b\n\n"),
+        ] {
+            assert_eq!(html_to_adoc(input), expected, "{input}");
+        }
+    }
+
     #[test]
     fn does_not_double_escape_preescaped_inline_passthrough_delimiters() {
         assert_eq!(html_to_adoc(r"<p>\+++x+++</p>"), "\\+++x+++\n\n");
@@ -6584,7 +6624,10 @@ mod tests {
     /// Covers every builtin inline-macro name × every name-continuation prefix
     /// byte × a `javascript:`, a remote `https:`, and each macro's own natural
     /// target; the targetless math/index family (whose `indexterm` deletes text);
-    /// and authored attribute references in prose. Inline anchors `[[id]]` and
+    /// the raw-HTML `pass:` passthrough macro across every prefix × qualifier ×
+    /// a `<script>` and an `<img onerror>` payload; the parenthesized index terms
+    /// (concealed `(((x)))` deletes text) including a cross-fragment split; and
+    /// authored attribute references in prose. Inline anchors `[[id]]` and
     /// angle-xrefs `<<id>>` are a documented residual (see `AGENTS.md` Known
     /// Limitations): they cannot fetch, script, or delete a following construct's
     /// text, which is all this asserts of them.
@@ -6640,6 +6683,51 @@ mod tests {
                     "targetless {name:?} deleted its text: {converted}"
                 );
             }
+        }
+
+        // Prefixed `pass:` — the passthrough macro emits RAW HTML and carries no
+        // left word boundary, so a prefixed name is stored XSS. Every prefix byte
+        // × qualifier form × a `<script>` and an `<img onerror>` payload must
+        // render inert (HTML-escaped), never a live tag. (The renderer's OWN
+        // generated `pass:c[]` code spans stay live — book_render_smoke.)
+        let pass_qualifiers = ["", "c", "q", "a", "c,q"];
+        let pass_payloads = [
+            "&lt;script&gt;alert(1)&lt;/script&gt;",
+            "&lt;img src=x onerror=alert(1)&gt;",
+        ];
+        for prefix in PREFIXES {
+            for qualifier in pass_qualifiers {
+                for payload in pass_payloads {
+                    let html = format!("<p>{prefix}pass:{qualifier}[{payload}]</p>");
+                    let converted = convert_with_asciidoctor(&html_to_adoc(&html));
+                    for live in ["<script", "<img", "<svg", "<iframe"] {
+                        assert!(
+                            !converted.contains(live),
+                            "pass: {html:?} emitted raw {live:?}: {converted}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Parenthesized index terms — no left word boundary; the concealed
+        // `(((x)))` form *deletes* its text. The sentinel must survive (no
+        // deletion) and nothing active may render, for the flow/concealed/deep
+        // forms, a name-continuation prefix, and a cross-fragment `((` split.
+        for html in [
+            "<p>lead (((SENTINELtext))) tail</p>",
+            "<p>lead ((SENTINELtext)) tail</p>",
+            "<p>lead ((((SENTINELtext)))) tail</p>",
+            "<p>lead word(((SENTINELtext))) tail</p>",
+            "<p>lead ((SENTINELtext, secondary)) tail</p>",
+            "<p>lead (<b></b>(SENTINELtext)) tail</p>",
+        ] {
+            let converted = convert_with_asciidoctor(&html_to_adoc(html));
+            assert!(
+                converted.contains("SENTINELtext"),
+                "paren index term deleted its text {html:?}: {converted}"
+            );
+            assert_no_live_inline_construct(&converted, &format!("paren {html:?}"));
         }
 
         // H4 (documented residual) — inline anchors and angle-xrefs. They cannot
