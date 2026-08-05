@@ -985,19 +985,31 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   **raw HTML** (the `pass:` macro across every qualifier, and the `+++…+++`
   delimiter) and **text deletion** (`indexterm:`, the concealed `(((…)))`, and an
   `anchor:`/`[[id]]`'s consumed label). Everything else Asciidoctor still treats
-  as active is neither: the quote marks `*bold*`/`_italic_`/`` `mono` ``/`^sup^`/
-  `~sub~`/`#mark#` and an inline role `[.class]#text#` **format** their content or
-  add a span class (no script, no navigation, no href/src); the constrained
-  passthroughs `+…+`/`++…++`/`$$…$$` **specialchar-escape** their content (so a
-  `<script>` inside becomes inert text) and merely consume their own delimiters;
-  and the replacements `(C)`/`(TM)`/`--`/`…` are cosmetic. All preserve the
-  author's text (no deletion) and cannot inject a fetch, a script, or a
-  `javascript:`/`data:` sink. They are a fidelity residual, not a security one:
-  a literal `*hugs*` renders bold and a ` +x+ ` loses its plus signs. Closing
-  them would need the renderer's own generated formatting (its `*bold*` for
-  `<strong>`, its `` `pass:c[]` `` code spans) kept live by provenance while the
-  authored marks are escaped — a large, benign, separate change, out of scope for
-  the injection-neutralization work.
+  as active is neither, and falls into two benign residual kinds:
+  - **Formatting / cosmetic** — no href, no navigation, no script: the quote
+    marks `*bold*`/`_italic_`/`` `mono` ``/`^sup^`/`~sub~`/`#mark#` and an inline
+    role `[.class]#text#` **format** their content or add a span class; the
+    constrained passthroughs `+…+`/`++…++`/`$$…$$` **specialchar-escape** their
+    content (so a `<script>` inside becomes inert text) and merely consume their
+    own delimiters; the replacements `(C)`/`(TM)`/`--`/`…` are cosmetic glyphs.
+    All preserve the author's text.
+  - **Navigational** — a bare `http`/`https`/`ftp`/`irc`/`file` URL in prose
+    (not an `<a href>`, which the link policy already governs) autolinks to a
+    live `<a href="…" class="bare">`. This is a click-only link, **not** an
+    auto-fetch, so it does not defeat `--no-media`, and the URL text is preserved.
+    It is safe because the dangerous schemes `javascript:`, `data:` and
+    `vbscript:` do **not** autolink on 2.0.26 — they stay inert text — so no
+    script or `javascript:`/`data:` sink can be smuggled this way; a bare hosted
+    URL is only what the author could have written as an ordinary link anyway.
+
+  Neither kind can inject a fetch, a script, or a `javascript:`/`data:` sink, and
+  none deletes text. They are fidelity/navigation residuals, not security ones:
+  a literal `*hugs*` renders bold, ` +x+ ` loses its plus signs, and a pasted URL
+  becomes clickable. Neutralizing the formatting marks would need the renderer's
+  own generated formatting (its `*bold*` for `<strong>`, its `` `pass:c[]` ``
+  code spans) kept live by provenance while the authored marks are escaped — a
+  large, benign, separate change, out of scope for the injection-neutralization
+  work.
 - **Bug, not a trade-off:** `render_list` (`src/adoc/mod.rs`) drops every direct
   child of a `ul`/`ol` that is not an `li`. `<ul><div>x</div></ul>` renders as
   the empty string, and `<ul><li>a</li><div>x</div><li>b</li></ul>` renders
