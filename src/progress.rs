@@ -211,17 +211,20 @@ impl Progress {
     }
 
     pub fn post_done(&self, id: u64, title: &str) {
+        // Sanitize once, at the source, so every sink — the channel (a GUI) as
+        // well as the terminal — receives a title free of control and bidi
+        // spoofing characters, never the raw remote value.
+        let title = sanitize_display_text(title);
         self.emit(ProgressEvent::PostDone {
             id,
-            title: title.to_string(),
+            title: title.clone(),
         });
         let done = self.inner.completed.fetch_add(1, Ordering::Relaxed) + 1;
-        let terminal_title = sanitize_terminal_text(title);
         match self.inner.mode {
-            Mode::Interactive => self.bar_step(&format!("{id}  \"{terminal_title}\"")),
+            Mode::Interactive => self.bar_step(&format!("{id}  \"{title}\"")),
             Mode::Plain => {
                 let total = self.inner.total.load(Ordering::Relaxed);
-                eprintln!("{}", plain_post_line(done, total, id, &terminal_title));
+                eprintln!("{}", plain_post_line(done, total, id, &title));
             }
             Mode::Quiet => {}
         }
@@ -324,7 +327,12 @@ fn plain_post_line(done: usize, total: usize, id: u64, title: &str) -> String {
     format!("[{done}/{total}] archived {id}  \"{title}\"")
 }
 
-fn sanitize_terminal_text(text: &str) -> String {
+/// Strips control characters and bidi/zero-width formatting from `text`, leaving
+/// printable content intact. Medium-agnostic: no terminal escape sequence
+/// survives and no bidi-spoofing or invisible character does either, so every
+/// progress sink — the terminal and the semantic channel a GUI consumes — can
+/// share one sanitized title.
+fn sanitize_display_text(text: &str) -> String {
     text.chars()
         .filter(|character| {
             !character.is_control()
@@ -404,10 +412,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_text_sanitizer_removes_controls_and_bidi_formatting_only() {
+    fn display_text_sanitizer_removes_controls_and_bidi_formatting_only() {
         let hostile = "safe\u{1b}]0;owned\u{7} text\u{85}\u{202e}spoof\u{2066}x\u{2069}";
 
-        assert_eq!(sanitize_terminal_text(hostile), "safe]0;owned textspoofx");
+        assert_eq!(sanitize_display_text(hostile), "safe]0;owned textspoofx");
     }
 
     #[test]
@@ -481,6 +489,31 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn channel_sink_sanitizes_the_post_title_before_emitting() {
+        use futures::StreamExt;
+
+        let (tx, rx) = futures::channel::mpsc::channel(16);
+        let progress = Progress::channel(tx);
+        // A hostile remote title carrying a terminal OSC escape and a bidi
+        // override must not reach the channel sink (a future GUI renderer) raw:
+        // it is sanitized at the source, once, for every sink.
+        progress.post_done(7, "a\u{1b}]0;pwn\u{7}b\u{202e}c");
+        drop(progress);
+
+        let events: Vec<ProgressEvent> = futures::executor::block_on(rx.collect());
+        let ProgressEvent::PostDone { title, .. } = &events[0] else {
+            panic!("expected PostDone, got {:?}", events[0]);
+        };
+        assert!(
+            !title
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}')),
+            "raw control/bidi characters reached the channel sink: {title:?}"
+        );
+        assert_eq!(title, "a]0;pwnbc");
     }
 
     #[test]
