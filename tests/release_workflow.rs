@@ -38,6 +38,18 @@ fn ci_workflow_pins_every_external_action_to_a_full_sha() {
 }
 
 #[test]
+fn ci_workflow_pins_the_cff_validator_version() {
+    // The CFF validator is fetched from PyPI in CI; a floating `latest` would
+    // pull unreviewed code on every run. Assert the `==` pin without binding
+    // to a specific version, so a deliberate bump stays green.
+    let workflow = include_str!("../.github/workflows/main.yml");
+    assert!(
+        workflow.contains("pip install cffconvert=="),
+        "the CFF validator must be installed at a pinned version, not floating latest"
+    );
+}
+
+#[test]
 fn publisher_revalidates_and_peels_the_remote_tag_before_the_sole_create() {
     let workflow = include_str!("../.github/workflows/release.yml");
     assert_eq!(workflow.matches("gh release create").count(), 1);

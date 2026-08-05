@@ -23,7 +23,7 @@ jobs:
       - name: Install CFF validator
         run: |
           python3 -m venv /tmp/lj-archiver-cff-validator
-          /tmp/lj-archiver-cff-validator/bin/pip install cffconvert
+          /tmp/lj-archiver-cff-validator/bin/pip install cffconvert==2.0.0
       - name: Validate citation metadata
         run: /tmp/lj-archiver-cff-validator/bin/cffconvert --validate
       - run: cargo fmt --all --check -- --config=imports_granularity=Crate
