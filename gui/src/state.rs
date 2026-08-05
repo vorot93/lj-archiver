@@ -210,10 +210,19 @@ impl App {
     }
 
     fn apply_progress(&mut self, event: &ProgressEvent) {
-        // Task::batch polls the progress stream and the terminal Finished
-        // concurrently (no ordering guarantee), so a late/trailing event must
-        // never clobber a terminal Done/Error back into Running.
-        if !matches!(self.state, State::Running(_)) {
+        // Only a run that has passed validation reacts to progress — two guards
+        // in one. A late/trailing event must never clobber a terminal Done/Error
+        // back into Running (Task::batch polls the progress stream and the
+        // terminal Finished concurrently, with no ordering guarantee). And a
+        // progress event must never advance the phase out of Validating: that
+        // transition belongs to ValidationFinished, so an early or stray
+        // progress event cannot skip the validation gate.
+        if !matches!(
+            self.state,
+            State::Running(
+                Phase::Discovering { .. } | Phase::FetchingPost | Phase::Archiving { .. }
+            )
+        ) {
             return;
         }
         match event {
@@ -514,6 +523,29 @@ mod tests {
         });
         assert_eq!(format!("{:?}", app.state), before);
         assert_eq!(app.active_run_id(), Some(active));
+    }
+
+    #[test]
+    fn progress_before_validation_finishes_cannot_skip_the_validating_phase() {
+        let mut app = App::default();
+        let run_id = start_run(&mut app);
+        assert!(matches!(app.state, State::Running(Phase::Validating)));
+
+        // A progress event for the active run arriving while still Validating
+        // must not advance the phase: that transition belongs to
+        // ValidationFinished, which the sole prod caller applies first. If a
+        // stray/early progress event could jump the phase, it would bypass that
+        // gate.
+        app.update_state(&Message::Progress {
+            run_id,
+            event: ProgressEvent::DiscoveryStarted,
+        });
+
+        assert!(
+            matches!(app.state, State::Running(Phase::Validating)),
+            "progress advanced the phase out of Validating: {:?}",
+            app.state
+        );
     }
 
     #[test]
