@@ -93,7 +93,7 @@ const JAVASCRIPT_SCRIPT_TYPES: &[&str] = &[
 /// rendered document, so scripts in it never run even though `scraper`'s
 /// `select` walks into them like any other descendant.
 fn is_executable_script(script: ElementRef<'_>) -> bool {
-    let script_type = script.attr("type").map(str::trim).unwrap_or("");
+    let script_type = script.attr("type").map(str::trim_ascii).unwrap_or("");
     let is_javascript = script_type.is_empty()
         || JAVASCRIPT_SCRIPT_TYPES
             .iter()
@@ -1090,6 +1090,11 @@ Site.entry = {"ditemid":7,"poster":"real"};"#,
             format!(r#"<script type="importmap">{EVIL_ENTRY}</script>"#),
             // Case/whitespace variants of a non-JavaScript type still reject.
             format!(r#"<script type=" APPLICATION/JSON ">{EVIL_ENTRY}</script>"#),
+            // A leading non-breaking space (U+00A0) is Unicode whitespace but
+            // *not* ASCII whitespace. The HTML spec strips only ASCII
+            // whitespace from `type`, so the browser sees the non-JavaScript
+            // essence `"\u{a0}text/javascript"` and never runs it.
+            format!("<script type=\"\u{a0}text/javascript\">{EVIL_ENTRY}</script>"),
             // `<template>` content is an inert DocumentFragment, never part of
             // the rendered document, so a script inside one never runs — even
             // though scraper's `select` walks into it like any other element.
