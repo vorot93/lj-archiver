@@ -208,7 +208,60 @@ fn neutralize_inline_adoc_syntax(text: &str) -> String {
     let text = neutralize_inline_attribute_references(text);
     let text = neutralize_inline_passthrough_macros(&text);
     let text = neutralize_inline_macros(&text);
+    let text = neutralize_inline_paren_index_terms(&text);
     neutralize_inline_passthrough_delimiters(&text)
+}
+
+/// Neutralizes Asciidoctor's parenthesized index terms — the flow form
+/// `((visible))` and the *concealed* form `(((hidden)))`, which **deletes** its
+/// text (`(((hugs)))` → nothing; ubiquitous benign period-LiveJournal content).
+/// Both need a run of two adjacent `(`, carry no left word boundary, and nest
+/// (`(((x)))` contains `((x))`).
+///
+/// Encoding every second `(` of a run as `&#40;` leaves no two literal `(`
+/// adjacent — so no index term can open — while rendering identically, which
+/// preserves the author's exact visible text (the required rule, as for
+/// `indexterm:`). The closing `)` run needs no change: with no opener, it is
+/// inert. Confirmed on Asciidoctor 2.0.26.
+fn neutralize_inline_paren_index_terms(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'(' {
+            let run_end = open_paren_run_end(bytes, cursor);
+            if run_end - cursor >= 2 {
+                for (offset, _) in (cursor..run_end).enumerate() {
+                    if offset % 2 == 1 {
+                        output.push_str("&#40;");
+                    } else {
+                        output.push('(');
+                    }
+                }
+                cursor = run_end;
+                continue;
+            }
+        }
+
+        let character = text[cursor..]
+            .chars()
+            .next()
+            .expect("cursor should remain on a character boundary");
+        output.push(character);
+        cursor += character.len_utf8();
+    }
+
+    output
+}
+
+/// The end of the maximal run of `(` beginning at `start`.
+fn open_paren_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut cursor = start;
+    while bytes.get(cursor) == Some(&b'(') {
+        cursor += 1;
+    }
+    cursor
 }
 
 fn neutralize_inline_attribute_references(text: &str) -> String {
@@ -679,13 +732,14 @@ fn starts_inline_passthrough_macro(text: &str, start: usize) -> bool {
 
 /// The position of the `[` that opens the passthrough macro beginning at
 /// `start`, or `None` when no passthrough macro begins there.
+///
+/// Like Asciidoctor's `InlinePassMacroRx`, this carries **no left word
+/// boundary**: `xpass:[<script>…]`, `9pass:[…]`, `_pass:[…]` all fire and emit
+/// raw HTML, so `pass:` is recognized at any offset and the neutralizing escape
+/// (inserted immediately before `pass`) breaks recognition wherever it abuts a
+/// preceding byte — the same rule the other inline macros follow.
 fn inline_passthrough_macro_bracket(text: &str, start: usize) -> Option<usize> {
     let bytes = text.as_bytes();
-
-    if !is_inline_passthrough_token_boundary(bytes, start) {
-        return None;
-    }
-
     let mut cursor = start + "pass:".len();
 
     if bytes.get(cursor) == Some(&b'[') {
@@ -1205,14 +1259,14 @@ fn is_block_macro_prefix(text: &str) -> bool {
 ///   a macro name, a sanitized target, a `link=` attribute value, a guard — are
 ///   never rewritten however the authored text around them composes. This is a
 ///   guarantee about *where* an escape may land; it says nothing about which
-///   constructs get recognized, which is entirely the four scanners' job.
+///   constructs get recognized, which is entirely the five scanners' job.
 /// * `contained` answers "does one single emitted span hold this whole byte
 ///   range?". A construct one span holds keeps exactly the meaning its producer
 ///   gave it, which is what stops an authored run's already-neutralized output
 ///   — and the `pass:[:]` a description-list rewrite leaves inside it — from
 ///   being escaped a second time.
 ///
-/// Coverage is by vocabulary rather than by case: this walks exactly the four
+/// Coverage is by vocabulary rather than by case: this walks exactly the five
 /// scanners of [`neutralize_inline_adoc_syntax`], so an authored construct is
 /// caught whichever direction it composed in (authored then generated,
 /// generated then authored, or authored around a generated fragment, including
@@ -1242,6 +1296,7 @@ pub(crate) fn composed_inline_escape_offsets(
             composed_attribute_reference_escapes(window, record);
             composed_inline_passthrough_macro_escapes(window, record);
             composed_inline_macro_escapes(window, holds, record);
+            composed_inline_paren_index_term_escapes(window, record);
             0
         },
     );
@@ -1466,6 +1521,27 @@ fn composed_inline_macro_escapes(
         }
 
         record(cursor, bracket + 1);
+    }
+}
+
+/// Escapes a parenthesized index term whose opening `((` composes across a
+/// fragment boundary — an authored `(` abutting another `(` the run neutralizer
+/// never saw as a pair. A `\` immediately before the doublet escapes the flow
+/// term (`\((x))` → literal `((x))` on 2.0.26); the run neutralizer's per-run
+/// `&#40;` encoding already handles every `((` a single fragment holds, and the
+/// origin gate keeps a generated `(` (a `(bar)` inside a target) from being
+/// paired against authored prose.
+fn composed_inline_paren_index_term_escapes(text: &str, record: &mut dyn FnMut(usize, usize)) {
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+
+    while cursor + 1 < bytes.len() {
+        if bytes[cursor] == b'(' && bytes[cursor + 1] == b'(' {
+            record(cursor, cursor + 2);
+            cursor += 2;
+        } else {
+            cursor += 1;
+        }
     }
 }
 
