@@ -6624,8 +6624,9 @@ mod tests {
     /// Covers every builtin inline-macro name × every name-continuation prefix
     /// byte × a `javascript:`, a remote `https:`, and each macro's own natural
     /// target; the targetless math/index family (whose `indexterm` deletes text);
-    /// the raw-HTML `pass:` passthrough macro across every prefix × qualifier ×
-    /// a `<script>` and an `<img onerror>` payload; the parenthesized index terms
+    /// both raw-HTML passthroughs — the `pass:` macro across every prefix ×
+    /// qualifier, and the `+++…+++` delimiter across every prefix — each with a
+    /// `<script>` and an `<img onerror>` payload; the parenthesized index terms
     /// (concealed `(((x)))` deletes text) including a cross-fragment split; and
     /// authored attribute references in prose. Inline anchors `[[id]]` and
     /// angle-xrefs `<<id>>` are a documented residual (see `AGENTS.md` Known
@@ -6706,6 +6707,22 @@ mod tests {
                             "pass: {html:?} emitted raw {live:?}: {converted}"
                         );
                     }
+                }
+            }
+        }
+
+        // The `+++…+++` inline passthrough — the other raw-HTML construct. It too
+        // carries no left word boundary, so bare and every name-continuation
+        // prefix must render inert (the `<script>`/`<img>` HTML-escaped).
+        for prefix in PREFIXES {
+            for payload in pass_payloads {
+                let html = format!("<p>{prefix}+++{payload}+++</p>");
+                let converted = convert_with_asciidoctor(&html_to_adoc(&html));
+                for live in ["<script", "<img", "<svg", "<iframe"] {
+                    assert!(
+                        !converted.contains(live),
+                        "+++ {html:?} emitted raw {live:?}: {converted}"
+                    );
                 }
             }
         }
