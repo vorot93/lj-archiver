@@ -1014,20 +1014,32 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   code spans) kept live by provenance while the authored marks are escaped — a
   large, benign, separate change, out of scope for the injection-neutralization
   work.
-- **Bug, not a trade-off:** `render_list` (`src/adoc/mod.rs`) drops every direct
-  child of a `ul`/`ol` that is not an `li`. `<ul><div>x</div></ul>` renders as
-  the empty string, and `<ul><li>a</li><div>x</div><li>b</li></ul>` renders
-  `* a\n* b` with `x` gone. That is real content loss, pre-existing, and it
-  contradicts the never-drop-content property the source-coverage work is built
-  on. It is deliberately not fixed here because the coverage classifier *depends*
-  on it: `renders_as_source_preserving_passthrough`
-  (`src/adoc/source_html.rs`) returns `false` for **every** direct child of a
-  `ul`/`ol`, with the stated reason that the list renderer never reaches it. Fix
-  the drop alone and a table inside a list starts emitting source bytes the
-  classifier just said it does not own; fix the classifier alone and the content
-  stays dropped. The two must change together, splitting that function into a
-  standalone "is this element a source-span owner" question and a separate
-  dispatch decision.
+- `render_list` (`src/adoc/mod.rs`) now preserves **every** direct child of a
+  `ul`/`ol`, not just its `<li>`s (R8-F1). It used to silently drop the rest, so
+  `<ul><div>x</div></ul>` rendered empty and
+  `<ul><li>a</li><div>x</div><li>b</li></ul>` lost the `x` — real content loss
+  that contradicted the never-drop-content property the source-coverage work is
+  built on. A non-`<li>` child is stray content html5ever left directly inside
+  the list, handled the same safe way `render_block_children` handles a mixed
+  child sequence: significant text is neutralized as its own line through an
+  isolated `InlineBuffer` (`append_plain_text_fragment` — never pushed raw,
+  which would reopen the injection class), a non-`<li>` element goes through
+  `render_element` after a `skip_suppressed` check, and `push_stray_list_block`
+  emits each as its own block so it can never fold into an item's line. No
+  classifier change was needed, and this is safe by construction:
+  `renders_as_source_preserving_passthrough` (`src/adoc/source_html.rs`) still
+  returns `false` for **every** direct child of a `ul`/`ol`, so such a child is
+  never a source-span owner — it suppresses nothing (an `<li>` html5ever
+  fostered out of a `<table>` inside the list still renders) and `render_element`
+  emits it from its *content*, escaped, never as raw source bytes, so nothing is
+  double-emitted. A well-formed list (only `<li>` children plus whitespace) never
+  reaches the new paths and is byte-for-byte unchanged. Two content-preserving
+  residuals: a stray block between two items **fragments the list** (it ends one
+  and starts another rather than spanning the interruption), and a normally
+  source-preserving element there (a `<table>`) is flattened to its escaped text
+  rather than kept as a structured passthrough. The "split the source-span-owner
+  question from the dispatch decision" refactor the classifier's `ul`/`ol` rule
+  still invites is now only about that structural fidelity, not content survival.
 - A `<script>` anywhere in a **post body** can still set `:lj-poster:` and
   `:lj-date:`. `site_entry` selects every executable `<script>` in the document,
   body included, and trusts the first object whose `ditemid` equals the resolved

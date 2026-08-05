@@ -696,40 +696,65 @@ fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> Spa
     let marker = marker.repeat(ctx.list_depth + 1);
 
     for child in element.children() {
-        let Some(child_node) = child.value().as_element() else {
-            continue;
-        };
-
-        if child_node.name() == "li" {
-            let Some(child_element) = ElementRef::wrap(child) else {
-                continue;
-            };
-            if skip_suppressed(child_element, ctx) {
-                continue;
+        match child.value() {
+            // Significant text sitting directly inside the list — never an
+            // `<li>`, so it is stray content the author wrote. Preserve it,
+            // escaped exactly as `render_block_children` escapes a mixed
+            // sequence's text (R8-F1): an isolated `InlineBuffer` neutralizes it
+            // as its own line, then it is emitted as its own block.
+            Node::Text(text) => {
+                if !text.trim().is_empty() {
+                    let mut escaped = InlineBuffer::new();
+                    append_plain_text_fragment(&mut escaped, text);
+                    push_stray_list_block(&mut output, &escaped.into_spanned());
+                }
             }
-
-            output.push_str(&marker);
-            output.push(' ');
-            output.push_str(&trim_trailing_hard_breaks(
-                render_inline_children_with_options(child_element, ctx, true).trim_start(),
-            ));
-            output.push('\n');
-
-            for list_child in child_element.children() {
-                let Some(list_element) = ElementRef::wrap(list_child) else {
+            Node::Element(_) => {
+                let Some(child_element) = ElementRef::wrap(child) else {
                     continue;
                 };
-                if skip_suppressed(list_element, ctx) {
+                if skip_suppressed(child_element, ctx) {
                     continue;
                 }
 
-                match list_element.value().name() {
-                    "ul" | "ol" => {
-                        output.push_str(&render_element(list_element, ctx.in_list().deeper()));
+                // A non-`<li>` element is stray content too. Render it through
+                // the ordinary element path — which already neutralizes its
+                // interior and, because `renders_as_source_preserving_passthrough`
+                // returns `false` for every direct child of a list, never emits
+                // its raw source bytes — and keep it out of any list-item line by
+                // emitting it as its own block.
+                if child_element.value().name() != "li" {
+                    push_stray_list_block(
+                        &mut output,
+                        &render_element(child_element, ctx.deeper()),
+                    );
+                    continue;
+                }
+
+                output.push_str(&marker);
+                output.push(' ');
+                output.push_str(&trim_trailing_hard_breaks(
+                    render_inline_children_with_options(child_element, ctx, true).trim_start(),
+                ));
+                output.push('\n');
+
+                for list_child in child_element.children() {
+                    let Some(list_element) = ElementRef::wrap(list_child) else {
+                        continue;
+                    };
+                    if skip_suppressed(list_element, ctx) {
+                        continue;
                     }
-                    _ => {}
+
+                    match list_element.value().name() {
+                        "ul" | "ol" => {
+                            output.push_str(&render_element(list_element, ctx.in_list().deeper()));
+                        }
+                        _ => {}
+                    }
                 }
             }
+            _ => {}
         }
     }
 
@@ -738,6 +763,29 @@ fn render_list(element: ElementRef<'_>, marker: &str, ctx: RenderCtx<'_>) -> Spa
     }
 
     Spanned::generated(output)
+}
+
+/// Emit one of a list's non-`<li>` children as its own block: close whatever
+/// list precedes it with a blank line and leave a blank line after, so a later
+/// `<li>` opens a fresh list rather than folding this content into an item's
+/// line. Only significant stray text and non-`<li>` elements ever reach here,
+/// so a well-formed list (only `<li>` children plus insignificant whitespace)
+/// never runs this and renders byte-for-byte as before.
+fn push_stray_list_block(output: &mut String, fragment: &str) {
+    let fragment = fragment.trim();
+    if fragment.is_empty() {
+        return;
+    }
+
+    if !output.is_empty() && !output.ends_with("\n\n") {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+
+    output.push_str(fragment);
+    output.push_str("\n\n");
 }
 
 fn render_heading(element: ElementRef<'_>, name: &str, ctx: RenderCtx<'_>) -> Spanned {
@@ -1686,15 +1734,175 @@ mod tests {
     }
 
     /// Suppression may only credit an owner that actually emits the bytes.
-    /// `render_list` renders a list item through its content and drops every
-    /// other child of a list, so a table directly inside a list emits nothing
-    /// and the item html5ever fostered out of it must still render.
+    /// `renders_as_source_preserving_passthrough` returns `false` for every
+    /// direct child of a list, so a `<table>` there is never a source-span
+    /// owner and suppresses nothing — the `<li>` html5ever fostered out of it
+    /// still renders. R8-F1: the table is no longer *dropped* either. Because
+    /// it is not an owner, `render_list`'s non-`<li>` path renders it through
+    /// the ordinary element path (its cell text, escaped, as its own block)
+    /// rather than as raw source bytes, so the fostered item and the cell
+    /// content each survive exactly once and nothing is double-emitted.
     #[test]
     fn a_list_owns_nothing_so_an_item_fostered_out_of_it_survives() {
+        let rendered =
+            html_to_adoc(r#"<ul><li>a</li><table><tr><td>c</td></tr><li>F</li></table></ul>"#);
+
+        assert_eq!(rendered, "* a\n* F\n\nc\n\n");
+        assert_eq!(rendered.matches('F').count(), 1, "{rendered}");
+        assert_eq!(rendered.matches('c').count(), 1, "{rendered}");
+    }
+
+    /// R8-F1: `render_list` used to drop every direct child of a `<ul>`/`<ol>`
+    /// that was not an `<li>`, silently losing authored content. Each stray
+    /// child now survives, emitted as its own block that fragments the list
+    /// (a block between items ends one list and starts another) rather than
+    /// folding into an item's line.
+    #[test]
+    fn preserves_stray_non_list_item_children() {
+        for (html, expected) in [
+            ("<ul><div>x</div></ul>", "x\n\n"),
+            (
+                "<ul><li>a</li><div>x</div><li>b</li></ul>",
+                "* a\n\nx\n\n* b\n\n",
+            ),
+            (
+                "<ol><li>a</li><p>x</p><li>b</li></ol>",
+                ". a\n\nx\n\n. b\n\n",
+            ),
+            ("<ul>foo<li>bar</li></ul>", "foo\n\n* bar\n\n"),
+        ] {
+            assert_eq!(html_to_adoc(html), expected, "for {html}");
+        }
+    }
+
+    /// The load-bearing safety property: a well-formed list — only `<li>`
+    /// element children plus insignificant whitespace — never reaches the
+    /// stray-child paths, so it renders byte-for-byte as it did before R8-F1.
+    #[test]
+    fn well_formed_list_is_byte_identical_after_stray_child_fix() {
         assert_eq!(
-            html_to_adoc(r#"<ul><li>a</li><table><tr><td>c</td></tr><li>F</li></table></ul>"#),
-            "* a\n* F\n\n"
+            html_to_adoc("<ul>\n  <li>one</li>\n  <li>two</li>\n</ul>"),
+            "* one\n* two\n\n"
         );
+        assert_eq!(
+            html_to_adoc("<ol><li>a<ul><li>b</li></ul></li></ol>"),
+            ". a\n** b\n\n"
+        );
+    }
+
+    /// Stray list content is authored, so its active AsciiDoc syntax is
+    /// neutralized by the very escaper `render_block_children` uses — the fix
+    /// must not reopen the injection class by pushing raw text. An `image:`
+    /// or `pass:` macro, in a stray `<div>` or in stray text, is emitted with
+    /// the escaping backslash immediately before its name; nothing survives as
+    /// a live macro. The visible content is preserved.
+    #[test]
+    fn escapes_inline_macros_in_stray_list_content() {
+        for html in [
+            "<ul><li>a</li><div>image:evil.png[] pass:[boom]</div></ul>",
+            "<ul>image:evil.png[] pass:[boom]<li>a</li></ul>",
+        ] {
+            let rendered = html_to_adoc(html);
+
+            assert!(
+                rendered.contains("evil.png") && rendered.contains("boom"),
+                "stray content lost for {html}: {rendered}"
+            );
+            for macro_name in ["image:", "pass:"] {
+                for (index, _) in rendered.match_indices(macro_name) {
+                    assert!(
+                        index > 0 && rendered.as_bytes()[index - 1] == b'\\',
+                        "unescaped {macro_name:?} reached the output for {html}: {rendered}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `+++...+++` inline passthrough in stray content is neutralized by
+    /// escaping its opening run, so no live passthrough survives while the
+    /// authored text does.
+    #[test]
+    fn escapes_inline_passthrough_in_stray_list_content() {
+        let rendered = html_to_adoc("<ul><li>a</li><div>+++alert+++</div><li>b</li></ul>");
+
+        assert!(rendered.contains("alert"), "content lost: {rendered}");
+        assert!(
+            rendered.contains("\\+++"),
+            "passthrough not escaped: {rendered}"
+        );
+    }
+
+    /// R8-F1 end to end: the malformed-list output is driven through a real
+    /// asciidoctor subprocess and every stray fragment's text is present in the
+    /// converted document — proof the emitted AsciiDoc round-trips without
+    /// dropping the content the renderer just recovered.
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn stray_list_content_survives_asciidoctor_conversion() {
+        for (html, survivors) in [
+            ("<ul><div>x</div></ul>", &["x"] as &[&str]),
+            (
+                "<ul><li>alpha</li><div>stray</div><li>beta</li></ul>",
+                &["alpha", "stray", "beta"],
+            ),
+            (
+                "<ol><li>alpha</li><p>para</p><li>beta</li></ol>",
+                &["alpha", "para", "beta"],
+            ),
+            ("<ul>lead<li>item</li></ul>", &["lead", "item"]),
+        ] {
+            let converted = convert_with_asciidoctor(&html_to_adoc(html));
+            let text = Html::parse_document(&converted)
+                .root_element()
+                .text()
+                .collect::<String>();
+
+            for survivor in survivors {
+                assert!(
+                    text.contains(survivor),
+                    "{survivor:?} was dropped converting {html}: {converted}"
+                );
+            }
+        }
+    }
+
+    /// R8-F1 must not turn recovered stray content into an injection vector.
+    /// An authored `pass:`/`+++` passthrough or `image:` macro sitting directly
+    /// inside a list is escaped, so a real asciidoctor conversion of the
+    /// malformed list emits it inert — no live `<script>`/`<img>` element and
+    /// no `javascript:` target reaches the reader.
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn stray_list_content_cannot_inject_live_markup_through_asciidoctor() {
+        for html in [
+            r#"<ul><li>a</li><div>pass:[&lt;script&gt;alert(document.domain)&lt;/script&gt;]</div></ul>"#,
+            r#"<ul><li>a</li><div>+++&lt;img src=x onerror=alert(1)&gt;+++</div></ul>"#,
+            r#"<ul>image:javascript:alert(1)[x]<li>a</li></ul>"#,
+            r#"<ul><li>a</li><div>link:javascript:alert(1)[CLICK]</div></ul>"#,
+        ] {
+            let converted = convert_with_asciidoctor(&html_to_adoc(html));
+            let document = Html::parse_document(&converted);
+
+            assert!(
+                !converted.contains("<script"),
+                "raw script reached the converted output for {html}: {converted}"
+            );
+            assert!(
+                document
+                    .select(&Selector::parse("img").unwrap())
+                    .next()
+                    .is_none(),
+                "an injected <img> reached the converted output for {html}: {converted}"
+            );
+            assert!(
+                document
+                    .select(&Selector::parse("a").unwrap())
+                    .filter_map(|anchor| anchor.attr("href"))
+                    .all(|href| !href.to_ascii_lowercase().starts_with("javascript:")),
+                "a javascript: target reached the converted output for {html}: {converted}"
+            );
+        }
     }
 
     /// A start tag says where a node *begins*, never what it contains, so an
