@@ -30,7 +30,8 @@ fn ci_workflow_pins_every_external_action_to_a_full_sha() {
     // main.yml is invoked as the release `gates` job (workflow_call), so its
     // Actions are part of the release supply chain and must be SHA-pinned too
     // — release.yml's own pins are covered by the publisher test below.
-    let checked = assert_external_actions_use_full_shas(include_str!("../.github/workflows/main.yml"));
+    let checked =
+        assert_external_actions_use_full_shas(include_str!("../.github/workflows/main.yml"));
     assert!(
         checked >= 1,
         "main.yml exposed no external Actions to verify; the pin check passed vacuously"
