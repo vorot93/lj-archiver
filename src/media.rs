@@ -116,6 +116,11 @@ fn media_client(user_agent: Option<&str>) -> Result<reqwest::Client> {
     crate::net::configured_client_builder(user_agent)
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
+        // Media URLs come from untrusted post HTML, so a hostname could resolve
+        // to an internal address (DNS rebinding) that the literal-only URL check
+        // cannot see. This resolver drops every non-public-unicast resolved
+        // address and pins the connection to the survivors.
+        .dns_resolver(std::sync::Arc::new(crate::net::PublicUnicastDnsResolver))
         .build()
         .map_err(|source| LjError::Http {
             url: "media client builder".to_string(),

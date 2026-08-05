@@ -1,7 +1,7 @@
 use crate::error::LjError;
 use reqwest::cookie::Jar;
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 use url::{Host, Url};
@@ -246,6 +246,35 @@ fn ipv4_from_low32(segments: [u16; 8]) -> Ipv4Addr {
     )
 }
 
+/// A `reqwest` DNS resolver that resolves through the system resolver, then
+/// drops every address that is not a public unicast IP before handing the
+/// survivors to reqwest.
+///
+/// This closes DNS rebinding, which the literal-only [`is_restricted_target`]
+/// check cannot: a hostname in untrusted media (`<img src>`) that resolves to a
+/// loopback, private, or link-local address (e.g. `metadata.example` →
+/// `169.254.169.254`) yields no connectable address. Because reqwest connects
+/// only to the addresses this returns and never re-resolves, it both blocks and
+/// *pins* the destination — there is no window to rebind between validation and
+/// connect. IP-literal hosts never reach a resolver, so the loopback test
+/// affordance and every `127.0.0.1` fixture are unaffected.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublicUnicastDnsResolver;
+
+impl reqwest::dns::Resolve for PublicUnicastDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let resolved = tokio::net::lookup_host((name.as_str(), 0)).await?;
+            let public: Vec<SocketAddr> = resolved
+                .filter(|addr| is_public_unicast_ip_literal(addr.ip()))
+                .collect();
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                Box::new(public.into_iter()) as reqwest::dns::Addrs
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +508,24 @@ mod tests {
         // not blanket access to every restricted target.
         let private = Url::parse("http://10.0.0.1/next.html").unwrap();
         assert!(!redirect_hop_allowed(&origin, &private));
+    }
+
+    #[tokio::test]
+    async fn dns_resolver_drops_names_that_resolve_to_loopback() {
+        use reqwest::dns::{Name, Resolve};
+        use std::str::FromStr;
+        // `localhost` resolves locally (no external DNS) to 127.0.0.1 and/or
+        // ::1 — all loopback — so the validating resolver must return zero
+        // connectable addresses. This is the DNS-rebind case the literal-only
+        // URL check cannot catch.
+        let resolved = PublicUnicastDnsResolver
+            .resolve(Name::from_str("localhost").unwrap())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert!(
+            resolved.is_empty(),
+            "localhost resolved to non-loopback addresses: {resolved:?}"
+        );
     }
 }
