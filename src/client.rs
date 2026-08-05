@@ -23,7 +23,27 @@ impl LjClient {
     pub fn new(user_agent: Option<&str>) -> Result<Self> {
         let client = crate::net::configured_client_builder(user_agent)
             .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                // Refuse to follow a redirect from a production origin into a
+                // restricted target (loopback, a private range, or a non-HTTP
+                // scheme). The delivered URL becomes the post-identity key
+                // (run.rs) and the discovery crawl base (discover.rs), so an
+                // unchecked hop into loopback would rest both on attacker-served
+                // content. A loopback test origin keeps its loopback affordance.
+                // Mirrors the media fetcher's per-hop re-validation.
+                if let Some(original) = attempt.previous().first()
+                    && !crate::net::redirect_hop_allowed(original, attempt.url())
+                {
+                    let blocked = attempt.url().clone();
+                    return attempt
+                        .error(format!("refused redirect into restricted target {blocked}"));
+                }
+                if attempt.previous().len() >= 10 {
+                    let last = attempt.url().clone();
+                    return attempt.error(format!("exceeded redirect limit reaching {last}"));
+                }
+                attempt.follow()
+            }))
             .build()
             .map_err(|source| LjError::Http {
                 url: "client builder".to_string(),

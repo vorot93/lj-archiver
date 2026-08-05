@@ -7,13 +7,12 @@ use reqwest::header::LOCATION;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ops::Range,
     path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::time::sleep;
-use url::{Host, Url};
+use url::Url;
 
 const MEDIA_DOWNLOAD_RETRIES: usize = 2;
 const MEDIA_REDIRECT_LIMIT: usize = 10;
@@ -80,7 +79,7 @@ async fn rewrite_inline_media_configured(
         }
 
         let absolute_target = url.to_string();
-        if !download || !media_url_is_allowed(&url, loopback_page_mode) {
+        if !download || !crate::net::target_is_allowed(&url, loopback_page_mode) {
             downloads.insert(url, absolute_target.clone());
             replacements.push(Some(absolute_target));
             continue;
@@ -122,140 +121,6 @@ fn media_client(user_agent: Option<&str>) -> Result<reqwest::Client> {
             url: "media client builder".to_string(),
             source,
         })
-}
-
-fn is_restricted_media_url(url: &Url) -> bool {
-    if !matches!(url.scheme(), "http" | "https") {
-        return true;
-    }
-
-    let Some(host) = url.host() else {
-        return true;
-    };
-
-    match host {
-        Host::Domain(host) => host.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
-        Host::Ipv4(address) => !is_public_unicast_ip_literal(IpAddr::V4(address)),
-        Host::Ipv6(address) => !is_public_unicast_ip_literal(IpAddr::V6(address)),
-    }
-}
-
-fn media_url_is_allowed(url: &Url, loopback_page_mode: bool) -> bool {
-    !is_restricted_media_url(url) || loopback_page_mode && crate::net::is_loopback_test_server(url)
-}
-
-fn is_public_unicast_ip_literal(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => is_public_unicast_ipv4(address),
-        IpAddr::V6(address) => {
-            if let Some(embedded) = embedded_ipv4(address) {
-                return is_public_unicast_ipv4(embedded);
-            }
-            is_public_unicast_ipv6(address)
-        }
-    }
-}
-
-fn is_public_unicast_ipv4(address: Ipv4Addr) -> bool {
-    let [first, second, third, fourth] = address.octets();
-    let is_shared = first == 100 && (second & 0xc0) == 0x40;
-    let is_special_use = first == 192 && second == 0 && third == 0 && fourth != 9 && fourth != 10;
-    let is_benchmarking = first == 198 && (second & 0xfe) == 18;
-    let is_reserved = (first & 0xf0) == 0xf0 && !address.is_broadcast();
-
-    // Rust 1.97's `Ipv4Addr::is_global` remains unstable. Mirror its current
-    // IANA-based classification with stable predicates, then exclude multicast
-    // and broadcast to require a routable unicast destination.
-    first != 0
-        && !address.is_private()
-        && !is_shared
-        && !address.is_loopback()
-        && !address.is_link_local()
-        && !is_special_use
-        && !address.is_documentation()
-        && !is_benchmarking
-        && !is_reserved
-        && !address.is_multicast()
-        && !address.is_broadcast()
-}
-
-fn is_public_unicast_ipv6(address: Ipv6Addr) -> bool {
-    let [first, second, third, fourth, fifth, sixth, seventh, eighth] = address.segments();
-    let is_documentation =
-        (first == 0x2001 && second == 0x0db8) || (first == 0x3fff && second <= 0x0fff);
-    let is_benchmarking = first == 0x2001 && second == 2 && third == 0;
-    let is_site_local = (first & 0xffc0) == 0xfec0;
-    let is_local_use_translation = first == 0x0064 && second == 0xff9b && third == 1;
-    let is_discard_only = first == 0x0100 && second == 0 && third == 0 && fourth == 0;
-    let is_ietf_assignment = first == 0x2001
-        && second < 0x0200
-        && !matches!(
-            [first, second, third, fourth, fifth, sixth, seventh, eighth],
-            // Port Control Protocol and TURN anycast addresses.
-            [0x2001, 1, 0, 0, 0, 0, 0, 1 | 2]
-                // AMT and AS112-v6.
-                | [0x2001, 3, _, _, _, _, _, _]
-                | [0x2001, 4, 0x112, _, _, _, _, _]
-                // ORCHIDv2 and Drone Remote ID Protocol Entity Tags.
-                | [0x2001, 0x20..=0x3f, _, _, _, _, _, _]
-        );
-    let is_segment_routing = first == 0x5f00;
-
-    // Rust 1.97's `Ipv6Addr::is_global` remains unstable. Mirror its current
-    // IANA-based classification with stable predicates, then exclude IPv6
-    // site-local addresses to require a public-routable unicast destination.
-    !address.is_multicast()
-        && !address.is_loopback()
-        && !address.is_unicast_link_local()
-        && !address.is_unique_local()
-        && !address.is_unspecified()
-        && !is_documentation
-        && !is_benchmarking
-        && !is_site_local
-        && !is_local_use_translation
-        && !is_discard_only
-        && !is_ietf_assignment
-        && !is_segment_routing
-}
-
-/// Extracts an embedded IPv4 address from IPv6 forms that carry one:
-/// IPv4-mapped (`::ffff:0:0/96`), NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`),
-/// and IPv4-compatible (`::/96`, excluding `::` and `::1`).
-fn embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
-    if let Some(v4) = address.to_ipv4_mapped() {
-        return Some(v4);
-    }
-    let s = address.segments();
-    // NAT64 well-known prefix 64:ff9b::/96
-    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
-        return Some(ipv4_from_low32(s));
-    }
-    // 6to4 2002::/16 — embedded IPv4 is segments 1..3
-    if s[0] == 0x2002 {
-        return Some(Ipv4Addr::new(
-            (s[1] >> 8) as u8,
-            (s[1] & 0xff) as u8,
-            (s[2] >> 8) as u8,
-            (s[2] & 0xff) as u8,
-        ));
-    }
-    // IPv4-compatible ::/96 (deprecated), excluding :: and ::1
-    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
-        let v4 = ipv4_from_low32(s);
-        if !v4.is_unspecified() && v4 != Ipv4Addr::new(0, 0, 0, 1) {
-            return Some(v4);
-        }
-    }
-    None
-}
-
-fn ipv4_from_low32(segments: [u16; 8]) -> Ipv4Addr {
-    Ipv4Addr::new(
-        (segments[6] >> 8) as u8,
-        (segments[6] & 0xff) as u8,
-        (segments[7] >> 8) as u8,
-        (segments[7] & 0xff) as u8,
-    )
 }
 
 struct ImageTarget {
@@ -331,7 +196,7 @@ async fn fetch_media_bytes(
     loopback_page_mode: bool,
     max_bytes: usize,
 ) -> std::result::Result<Option<Vec<u8>>, reqwest::Error> {
-    if !media_url_is_allowed(url, loopback_page_mode) {
+    if !crate::net::target_is_allowed(url, loopback_page_mode) {
         return Ok(None);
     }
 
@@ -349,7 +214,7 @@ async fn fetch_media_bytes(
                 return Ok(None);
             };
 
-            if !media_url_is_allowed(&redirect_url, loopback_page_mode) {
+            if !crate::net::target_is_allowed(&redirect_url, loopback_page_mode) {
                 return Ok(None);
             }
 
@@ -812,7 +677,10 @@ mod tests {
             "http://[::ffff:10.0.0.1]/private.jpg",
         ] {
             let url = Url::parse(url).unwrap();
-            assert!(is_restricted_media_url(&url), "{url} should be restricted");
+            assert!(
+                crate::net::is_restricted_target(&url),
+                "{url} should be restricted"
+            );
         }
     }
 
@@ -846,7 +714,7 @@ mod tests {
             "http://[3fff::1]/pic.jpg",
         ] {
             assert!(
-                is_restricted_media_url(&Url::parse(value).unwrap()),
+                crate::net::is_restricted_target(&Url::parse(value).unwrap()),
                 "{value}"
             );
         }
@@ -866,7 +734,7 @@ mod tests {
             "http://[::8.8.8.8]/pic.jpg",
         ] {
             assert!(
-                !is_restricted_media_url(&Url::parse(value).unwrap()),
+                !crate::net::is_restricted_target(&Url::parse(value).unwrap()),
                 "{value}"
             );
         }
@@ -924,7 +792,7 @@ mod tests {
             "http://[5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff]/pic.jpg",
         ] {
             assert!(
-                is_restricted_media_url(&Url::parse(value).unwrap()),
+                crate::net::is_restricted_target(&Url::parse(value).unwrap()),
                 "{value}"
             );
         }
@@ -964,57 +832,10 @@ mod tests {
             "http://[5f01::]/pic.jpg",
         ] {
             assert!(
-                !is_restricted_media_url(&Url::parse(value).unwrap()),
+                !crate::net::is_restricted_target(&Url::parse(value).unwrap()),
                 "{value}"
             );
         }
-    }
-
-    #[test]
-    fn pins_embedded_ipv4_classifier_boundaries() {
-        assert_eq!(
-            embedded_ipv4("64:ff9b::".parse().unwrap()),
-            Some(Ipv4Addr::UNSPECIFIED)
-        );
-        assert_eq!(
-            embedded_ipv4("64:ff9b::ffff:ffff".parse().unwrap()),
-            Some(Ipv4Addr::BROADCAST)
-        );
-        assert_eq!(
-            embedded_ipv4("64:ff9a:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()),
-            None
-        );
-        assert_eq!(embedded_ipv4("64:ff9b:0:1::".parse().unwrap()), None);
-
-        assert_eq!(
-            embedded_ipv4("2002::".parse().unwrap()),
-            Some(Ipv4Addr::UNSPECIFIED)
-        );
-        assert_eq!(
-            embedded_ipv4("2002:ffff:ffff::".parse().unwrap()),
-            Some(Ipv4Addr::BROADCAST)
-        );
-        assert_eq!(
-            embedded_ipv4("2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()),
-            None
-        );
-        assert_eq!(embedded_ipv4("2003::".parse().unwrap()), None);
-
-        assert_eq!(embedded_ipv4("::".parse().unwrap()), None);
-        assert_eq!(embedded_ipv4("::1".parse().unwrap()), None);
-        assert_eq!(
-            embedded_ipv4("::2".parse().unwrap()),
-            Some(Ipv4Addr::new(0, 0, 0, 2))
-        );
-        assert_eq!(
-            embedded_ipv4("::8.8.8.8".parse().unwrap()),
-            Some(Ipv4Addr::new(8, 8, 8, 8))
-        );
-        assert_eq!(
-            embedded_ipv4("::ffff:ffff".parse().unwrap()),
-            Some(Ipv4Addr::BROADCAST)
-        );
-        assert_eq!(embedded_ipv4("::1:0:0".parse().unwrap()), None);
     }
 
     #[tokio::test]
@@ -1040,7 +861,7 @@ mod tests {
             "http://[::1]:8080/pic.jpg",
         ] {
             let url = Url::parse(allowed).unwrap();
-            assert!(media_url_is_allowed(&url, true), "{allowed}");
+            assert!(crate::net::target_is_allowed(&url, true), "{allowed}");
         }
 
         for blocked in [
@@ -1052,7 +873,7 @@ mod tests {
             "https://127.0.0.1:8080/pic.jpg",
         ] {
             let url = Url::parse(blocked).unwrap();
-            assert!(!media_url_is_allowed(&url, true), "{blocked}");
+            assert!(!crate::net::target_is_allowed(&url, true), "{blocked}");
         }
     }
 
@@ -2199,7 +2020,10 @@ mod tests {
             "[::127.0.0.1]",        // IPv4-compatible -> 127.0.0.1 (loopback)
         ] {
             let url = Url::parse(&format!("http://{host}/x.jpg")).unwrap();
-            assert!(is_restricted_media_url(&url), "{host} must be blocked");
+            assert!(
+                crate::net::is_restricted_target(&url),
+                "{host} must be blocked"
+            );
         }
     }
 
@@ -2207,21 +2031,7 @@ mod tests {
     fn allows_ipv6_embedded_public_ipv4() {
         // NAT64 -> 93.184.216.34 (public) must stay allowed (no over-blocking).
         let url = Url::parse("http://[64:ff9b::5db8:d822]/x.jpg").unwrap();
-        assert!(!is_restricted_media_url(&url));
-    }
-
-    #[test]
-    fn ipv4_compatible_unspecified_and_loopback_have_no_embedded_ipv4() {
-        // `::` (unspecified) and `::1` (loopback) sit in the IPv4-compatible ::/96
-        // range but must NOT decode to an embedded IPv4: `::1` -> 0.0.0.1 would be
-        // an SSRF-bypass, and `::` is the unspecified address. Pins the
-        // `!v4.is_unspecified() && v4 != 0.0.0.1` exclusion in embedded_ipv4's
-        // ::/96 branch against a future refactor.
-        assert_eq!(
-            embedded_ipv4("::".parse::<std::net::Ipv6Addr>().unwrap()),
-            None
-        );
-        assert_eq!(embedded_ipv4("::1".parse().unwrap()), None);
+        assert!(!crate::net::is_restricted_target(&url));
     }
 
     #[tokio::test]
