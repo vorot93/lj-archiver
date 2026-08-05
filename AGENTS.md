@@ -385,7 +385,15 @@ bytes stay as delivered. It is not a claim that a reference reaches the output
 untouched everywhere else: a macro target still goes through `direct_target`,
 which drops a `javascript:`, `data:`, `file:`, `mailto:`, `ftp:`, malformed, or
 hostless reference entirely, and through `sanitize_macro_target`, which
-percent-encodes the characters that would otherwise escape the macro.
+percent-encodes every byte that would otherwise re-activate against the target:
+`[` and `]` (the attribute-list delimiters), `{` and `}` (an AsciiDoc attribute
+reference — the `url` crate leaves both intact in a URL fragment/query/path, so
+an authored `{set:lj-archiver-post-link-prefix:javascript:…}` would otherwise
+reach Asciidoctor live and hijack a later localized image link), whitespace and
+control bytes, and a leading `:`, `::`, `pass:` or `+++` prefix. The renderer's
+own `{lj-archiver-post-link-prefix}` reference is composed **outside** this
+function (`links.rs`, `link_metadata.rs`), so encoding `{`/`}` here cannot break
+localization.
 
 `LinkRewriter::raw_post_html_filename` deliberately records **no** pending link,
 unlike the macro-target helpers. A raw block whose URL depends on context is
@@ -394,7 +402,7 @@ once, so a token cannot represent two local spellings. The consequence is
 recorded under "Known Limitations": a raw link to a post that ultimately fails
 stays a relative `<id>.html` rather than degrading to the hosted URL.
 
-The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized both within a run and across the fragment boundaries a run composes over (see "The composed-fragment rule" below), so macro, attribute, heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stays inert. Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
+The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized both within a run and across the fragment boundaries a run composes over (see "The composed-fragment rule" below), so inline macros — the target-form builtins `image`/`icon`/`link`/`xref`/`mailto`/`anchor` **and** the targetless math/index family `footnote`/`stem`/`latexmath`/`asciimath`/`indexterm`/`indexterm2` (`indexterm` deletes its text if left live), each escaped immediately before its name so a name-continuation prefix cannot re-anchor it (`word.image:…`, `9xref:…`) — plus attribute references (including `{set:…}`/`{counter:…}`), heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stay inert. The one inline vocabulary deliberately **not** neutralized is a mid-line inline anchor `[[id]]` or angle-bracket xref `<<id>>` — see "Known Limitations". Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
 Renderer-owned inline output (strong, emphasis, code, anchors, linked images) is
 appended through the single `append_generated_inline` path in `src/adoc/mod.rs`.
@@ -506,12 +514,26 @@ Six details are load-bearing:
   and at a line start it is a block macro that `line_is_active_adoc_syntax`
   already owns. The inline scan skips it rather than racing that guard with a
   weaker remedy.
-* **A name run that reaches across a span is not a name.** Asciidoctor's macro
-  patterns carry no left word boundary, so `before` + `xref:1.adoc[t]` composes
-  a run our scanner would anchor at `beforexref`. Escaping there would neither
-  deactivate the (generated, legitimate) xref nor stay invisible, so a candidate
-  is dropped when the same construct re-anchored later in its run fits inside
-  one span. Likewise nothing inside a span-held `pass:…[…]` is escaped:
+* **A builtin macro has no left word boundary, so its escape sits before the
+  name.** Asciidoctor's `image`/`icon`/`link`/`xref`/`mailto`/`anchor` regexes
+  (and the targetless `footnote`/`stem`/`latexmath`/`asciimath`/`indexterm`/
+  `indexterm2`) fire even when the name abuts a preceding letter, digit, `_`, `.`
+  or `-` — `word.image:…[x]`, `9xref:…[z]`, `a-link:javascript:…[c]` are all
+  live. `firing_inline_macro_bracket` therefore recognizes the fixed builtin
+  vocabulary at *any* offset and escapes immediately before the name, where
+  Asciidoctor's own `\?` anchor sits; an escape at the surrounding token boundary
+  is one byte too far left and leaves the macro live. A leading backslash at the
+  boundary does **not** neutralize it — confirmed against 2.0.26. The generic
+  `name:target[…]` boundary scan (the safe over-approximation that also covers
+  bare URLs) stands aside whenever a builtin is its suffix, so the two never
+  double-escape.
+* **A generated macro a span holds stays live.** The same no-left-boundary shape
+  also lets an authored word abut the renderer's *own* macro: `before` +
+  generated `xref:1.adoc[t]` composes a run anchored at `beforexref`. Escaping
+  the boundary would neither deactivate the legitimate xref nor stay invisible,
+  so a candidate is dropped when the same construct re-anchored later in its run
+  fits inside one span, and the origin gate independently refuses any escape on a
+  generated byte. Likewise nothing inside a span-held `pass:…[…]` is escaped:
   Asciidoctor extracts passthroughs before it substitutes anything.
 * **The cost is new escapes on benign authored text.** Authored text that
   composes a construct across a boundary now gains the escape its single-run
@@ -941,6 +963,21 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   teaching the composed-fragment scan Asciidoctor's passthrough-extraction order
   in its bracket search, which trades this wart for a visible backslash on the
   `include::` spelling of the same shape.
+- A mid-line inline anchor `[[id]]` or angle-bracket xref `<<id>>` in authored
+  prose is **not** neutralized: `text [[id]] more` converts to an empty
+  `<a id="id">` (its bracket text consumed), and `text <<id>> more` to a broken
+  internal link `<a href="#id">[id]</a>`. Both are inert against the threats this
+  renderer defends — no remote fetch, no `javascript:`/`data:` sink, no
+  `<script>`, and no attribute-hijack of a following localized `xref:`/image
+  link (an `<a id>`/`#id` cannot redefine `{lj-archiver-post-link-prefix}`) — so
+  the harm is confined to a stray anchor id or a dangling `#fragment`. Closing it
+  cleanly would mean replicating Asciidoctor's NCName-strict id/xref regexes to
+  avoid a visible `\` on the far more common benign `[[…]]`/`<<…>>` prose, judged
+  not worth the regression risk on a security-critical path. The *line-start*
+  block forms are already handled: `<<<`/`'''` by the active-line scan and a
+  `[[id]]` alone on a line by the block-metadata escape. The adversarial gate
+  `adversarial_differential_inline_injection_class_is_closed` includes both
+  constructs and asserts exactly the inertness above.
 - **Bug, not a trade-off:** `render_list` (`src/adoc/mod.rs`) drops every direct
   child of a `ul`/`ol` that is not an `li`. `<ul><div>x</div></ul>` renders as
   the empty string, and `<ul><li>a</li><div>x</div><li>b</li></ul>` renders
