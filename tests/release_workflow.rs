@@ -1,4 +1,8 @@
-fn assert_external_actions_use_full_shas(workflow: &str) {
+/// Asserts every non-local `uses:` in `workflow` is pinned to a full 40-hex
+/// commit SHA, and returns how many external Actions were checked so callers
+/// can reject a vacuous pass (a wrong path or a parse that matched nothing).
+fn assert_external_actions_use_full_shas(workflow: &str) -> usize {
+    let mut checked = 0;
     for line in workflow.lines().filter(|line| line.contains("uses:")) {
         let target = line.split_once("uses:").unwrap().1.trim();
         if target.starts_with("./") {
@@ -16,7 +20,21 @@ fn assert_external_actions_use_full_shas(workflow: &str) {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
             "{target}"
         );
+        checked += 1;
     }
+    checked
+}
+
+#[test]
+fn ci_workflow_pins_every_external_action_to_a_full_sha() {
+    // main.yml is invoked as the release `gates` job (workflow_call), so its
+    // Actions are part of the release supply chain and must be SHA-pinned too
+    // — release.yml's own pins are covered by the publisher test below.
+    let checked = assert_external_actions_use_full_shas(include_str!("../.github/workflows/main.yml"));
+    assert!(
+        checked >= 1,
+        "main.yml exposed no external Actions to verify; the pin check passed vacuously"
+    );
 }
 
 #[test]
@@ -93,7 +111,10 @@ fn publisher_revalidates_and_peels_the_remote_tag_before_the_sole_create() {
     assert!(workflow.contains(r#"test "${#msi[@]}" -eq 1"#));
     assert!(workflow.contains(r#"test "${#expected[@]}" -eq "${#all[@]}""#));
 
-    assert_external_actions_use_full_shas(workflow);
+    assert!(
+        assert_external_actions_use_full_shas(workflow) >= 1,
+        "release.yml exposed no external Actions to verify; the pin check passed vacuously"
+    );
 
     assert!(
         workflow
@@ -356,10 +377,22 @@ exit 1
                 ],
                 vec![],
             ),
-            // The tag no longer points at the release commit.
+            // The tag no longer points at the release commit. Same trap as the
+            // cases above: register the master and compare responses the script
+            // would reach if the tag-equality guard were missing, so this case
+            // fails *because that guard fired* — with a consistent, otherwise
+            // release-worthy master ahead of the tag — not because the fake `gh`
+            // rejects an unregistered path.
             (
                 "tag mismatch",
-                vec![(TAG_REF, tag_response("eeee"))],
+                vec![
+                    (TAG_REF, tag_response("eeee")),
+                    (MASTER_REF, tag_response(MASTER_SHA)),
+                    (
+                        compare_path.as_str(),
+                        compare_response("ahead", RELEASE_SHA, RELEASE_SHA, 1, MASTER_SHA),
+                    ),
+                ],
                 vec![],
             ),
         ];
