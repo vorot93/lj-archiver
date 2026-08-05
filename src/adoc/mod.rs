@@ -2702,6 +2702,27 @@ mod tests {
         );
     }
 
+    /// An authored `{`/`}` in a macro target would otherwise reach Asciidoctor as
+    /// a live attribute reference — `{set:…}` could redefine the post-link prefix
+    /// and hijack a later localized image link. The `url` crate leaves both bytes
+    /// untouched in a URL fragment/query/path, so `sanitize_macro_target`
+    /// percent-encodes them. (H1.)
+    #[test]
+    fn percent_encodes_attribute_reference_braces_in_macro_targets() {
+        assert_eq!(
+            sanitize_macro_target("https://x.example/#{set:lj-archiver-post-link-prefix:x}"),
+            "https://x.example/#%7Bset:lj-archiver-post-link-prefix:x%7D"
+        );
+        assert_eq!(
+            html_to_adoc(r##"<p><a href="https://x.example/#{set:a:b}">t</a></p>"##),
+            "https://x.example/#%7Bset:a:b%7D[t]\n\n"
+        );
+        assert_eq!(
+            html_to_adoc(r#"<p><img src="../assets/{counter:c}.jpg" alt="x"></p>"#),
+            "image::../assets/%7Bcounter:c%7D.jpg[x]\n\n"
+        );
+    }
+
     #[test]
     fn neutralizes_plain_text_that_looks_like_include_macro() {
         let adoc = html_to_adoc("<p>include::secret[]</p>");
@@ -6529,5 +6550,198 @@ mod tests {
             fs::read_to_string(dir.path().join("input.html")).unwrap(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
         )
+    }
+
+    /// HTML elements a live inline injection would produce. A neutralized
+    /// construct renders every one of these vocabularies as inert text instead,
+    /// so their *absence* from Asciidoctor's output is the proof of neutralization
+    /// that holds uniformly across the whole macro vocabulary.
+    fn assert_no_live_inline_construct(converted: &str, context: &str) {
+        for live in [
+            "<script",
+            "<iframe",
+            "<img",
+            "<a href",
+            "<a id",
+            "<span class=\"image\"",
+            "<span class=\"icon\"",
+            "class=\"footnote\"",
+            // Math renderers (stem/latexmath/asciimath) emit these delimiters.
+            "\\(",
+            "\\$",
+        ] {
+            assert!(
+                !converted.contains(live),
+                "live inline construct {live:?} survived for {context}: {converted}"
+            );
+        }
+    }
+
+    /// The load-bearing gate: a broad adversarial matrix fed through the real
+    /// renderer and a real Asciidoctor, proving the injection-neutralization
+    /// *class* is closed rather than the four reproductions that motivated it.
+    ///
+    /// Covers every builtin inline-macro name × every name-continuation prefix
+    /// byte × a `javascript:`, a remote `https:`, and each macro's own natural
+    /// target; the targetless math/index family (whose `indexterm` deletes text);
+    /// and authored attribute references in prose. Inline anchors `[[id]]` and
+    /// angle-xrefs `<<id>>` are a documented residual (see `AGENTS.md` Known
+    /// Limitations): they cannot fetch, script, or delete a following construct's
+    /// text, which is all this asserts of them.
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn adversarial_differential_inline_injection_class_is_closed() {
+        const PREFIXES: [&str; 6] = ["", "z", "9", "_", ".", "-"];
+
+        // H2 — target-form builtins. Each target would fire live if the escape
+        // landed at the token boundary instead of before the name.
+        let target_form = [
+            ("image", "https://evil.example/beacon.png"),
+            ("image", "javascript:alert(1)"),
+            ("icon", "home"),
+            ("link", "javascript:alert(document.domain)"),
+            ("link", "https://evil.example/x"),
+            ("xref", "1.adoc"),
+            ("xref", "javascript:alert(1)"),
+            ("mailto", "evil@evil.example"),
+            ("anchor", "anchorid"),
+        ];
+        for (name, target) in target_form {
+            for prefix in PREFIXES {
+                let html = format!("<p>{prefix}{name}:{target}[label]</p>");
+                let converted = convert_with_asciidoctor(&html_to_adoc(&html));
+                assert_no_live_inline_construct(&converted, &format!("H2 {html:?}"));
+            }
+        }
+
+        // H3 — targetless math/index family. The macro name surviving as literal
+        // text proves the construct was neutralized; the marker surviving proves
+        // no text was deleted (the `indexterm` content-loss).
+        let targetless = [
+            "footnote",
+            "stem",
+            "latexmath",
+            "asciimath",
+            "indexterm",
+            "indexterm2",
+        ];
+        for name in targetless {
+            for prefix in PREFIXES {
+                let marker = "SENTINELtext";
+                let html = format!("<p>lead {prefix}{name}:[{marker}] tail</p>");
+                let converted = convert_with_asciidoctor(&html_to_adoc(&html));
+                assert_no_live_inline_construct(&converted, &format!("H3 {html:?}"));
+                assert!(
+                    converted.contains(&format!("{name}:")),
+                    "targetless {name:?} was not neutralized: {converted}"
+                );
+                assert!(
+                    converted.contains(marker),
+                    "targetless {name:?} deleted its text: {converted}"
+                );
+            }
+        }
+
+        // H4 (documented residual) — inline anchors and angle-xrefs. They cannot
+        // script, fetch, or hijack; assert exactly that, not full inertness.
+        for html in [
+            "<p>lead [[SENTINELid]] tail</p>",
+            "<p>lead [[SENTINELid,ref]] tail</p>",
+            "<p>lead &lt;&lt;SENTINELref&gt;&gt; tail</p>",
+            "<p>lead &lt;&lt;SENTINELref,Label&gt;&gt; tail</p>",
+        ] {
+            let converted = convert_with_asciidoctor(&html_to_adoc(html));
+            for live in [
+                "<script",
+                "<iframe",
+                "<img",
+                "href=\"javascript:",
+                "href=\"http",
+            ] {
+                assert!(
+                    !converted.contains(live),
+                    "H4 {html:?} produced dangerous {live:?}: {converted}"
+                );
+            }
+        }
+
+        // Authored attribute references in prose. `{set:…}` is the H1 primitive;
+        // it, `{counter:…}` and a plain `{attr}` must all survive as literal text
+        // (a live reference is consumed) and never open a `javascript:` sink.
+        let attr_prose = concat!(
+            "<p>{set:lj-archiver-post-link-prefix:javascript:alert(1)//} ",
+            "{counter:owned} {plain-attr}</p>"
+        );
+        let converted = convert_with_asciidoctor(&html_to_adoc(attr_prose));
+        for marker in ["{set:", "{counter:", "{plain-attr}"] {
+            assert!(
+                converted.contains(marker),
+                "attribute reference {marker:?} was consumed: {converted}"
+            );
+        }
+        assert!(
+            !converted.contains("<script") && !converted.contains("href=\"javascript:"),
+            "attribute reference opened a live sink: {converted}"
+        );
+    }
+
+    /// H1: an authored AsciiDoc attribute reference smuggled into a *macro target*
+    /// — where authored prose escaping never reaches it — must not survive to
+    /// `{set:}` the post-link prefix and hijack a later localized image link. The
+    /// renderer's own `{lj-archiver-post-link-prefix}` (composed outside
+    /// `sanitize_macro_target`) must still localize correctly.
+    #[test]
+    #[ignore = "requires asciidoctor; exercised explicitly by final integration gates"]
+    fn adversarial_differential_attribute_reference_in_target_cannot_hijack_localization() {
+        let rewriter = LinkRewriter::new(
+            "news",
+            HashSet::from([166512u64]),
+            Url::parse("https://news.livejournal.com/").unwrap(),
+        );
+
+        // The poison sets the prefix to a `javascript:` sink from inside a URL
+        // fragment, query, and path — the `url` crate leaves `{`/`}` intact in all
+        // three. It precedes a same-journal linked image, whose localized
+        // `link={lj-archiver-post-link-prefix}166512.adoc` the poison would hijack
+        // if the reference were still live when Asciidoctor reached it.
+        for sink in [
+            "https://x.example/#{set:lj-archiver-post-link-prefix:javascript:alert(1)//}",
+            "https://x.example/?q={set:lj-archiver-post-link-prefix:javascript:alert(1)//}",
+            "https://x.example/{set:lj-archiver-post-link-prefix:javascript:alert(1)//}/p",
+        ] {
+            let body_html = format!(
+                concat!(
+                    r#"<p><a href="{sink}">poison</a></p>"#,
+                    r#"<p><a href="https://news.livejournal.com/166512.html">"#,
+                    r#"<img src="../assets/p.jpg" alt="pic"></a></p>"#,
+                ),
+                sink = sink
+            );
+            let body = html_to_adoc_with_links(&body_html, Some(&rewriter));
+
+            // The renderer never escapes its own generated prefix reference, so it
+            // is present verbatim and localization is intact.
+            assert!(
+                body.contains("link={lj-archiver-post-link-prefix}166512.adoc"),
+                "localization was broken by the H1 fix: {body:?}"
+            );
+
+            // Mirror the archiver document header that supplies the safe default.
+            let doc = format!(
+                "= Title\n\nifndef::lj-archiver-post-link-prefix[:lj-archiver-post-link-prefix:]\n\n{body}"
+            );
+            let converted = convert_with_asciidoctor(&doc);
+
+            assert!(
+                !converted.contains("href=\"javascript:"),
+                "attribute-reference target hijacked a link ({sink:?}): {converted}"
+            );
+            // The localized image link resolves to the safe empty-prefix default,
+            // not the poisoned `javascript:…` value.
+            assert!(
+                converted.contains("href=\"166512.adoc\""),
+                "localized image link did not resolve safely ({sink:?}): {converted}"
+            );
+        }
     }
 }
