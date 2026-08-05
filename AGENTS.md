@@ -402,7 +402,7 @@ once, so a token cannot represent two local spellings. The consequence is
 recorded under "Known Limitations": a raw link to a post that ultimately fails
 stays a relative `<id>.html` rather than degrading to the hosted URL.
 
-The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized both within a run and across the fragment boundaries a run composes over (see "The composed-fragment rule" below), so inline macros — the target-form builtins `image`/`icon`/`link`/`xref`/`mailto`/`anchor` **and** the targetless math/index family `footnote`/`stem`/`latexmath`/`asciimath`/`indexterm`/`indexterm2` (`indexterm` deletes its text if left live), each escaped immediately before its name so a name-continuation prefix cannot re-anchor it (`word.image:…`, `9xref:…`) — plus attribute references (including `{set:…}`/`{counter:…}`), heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stay inert. The one inline vocabulary deliberately **not** neutralized is a mid-line inline anchor `[[id]]` or angle-bracket xref `<<id>>` — see "Known Limitations". Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
+The renderer also embodies these output conventions — keep them unless a task deliberately changes them: the post body follows the attribute block directly, with no `== Post`/`== Comments` section headings; LiveJournal chrome injected into the body (e.g. `<div class="lj-like…">`, and the generic userhead glyph `<img class="i-ljuser-userhead">` in user mentions, which then render as just the linked username) is stripped; and `<br>` runs collapse — a lone `<br>` renders as an AsciiDoc hard line break (` +`), while two or more consecutive `<br>` become a paragraph break. A hard break only separates content, so a break with nothing before it on its line is dropped at **both** ends — trailing (ending a block/body) and *leading* (starting a block, or landing where output already broke the line), else a leading break's space is trimmed into a stray lone `+` line. Leading-drop lives in `flush_pending_line_breaks` and, for blockquotes, `trim_leading_hard_breaks`; a break *between* content is kept. That kept lone-`<br>` newline is load-bearing — it lands the next content at a line start so a block macro there (`include::`, `:toc:`, a list marker, …) is neutralized; dropping a *leading* break is safe because empty/newline-terminated output is already a line start. Plain user-originated fragments are neutralized both within a run and across the fragment boundaries a run composes over (see "The composed-fragment rule" below), so inline macros — the target-form builtins `image`/`icon`/`link`/`xref`/`mailto`/`anchor` **and** the targetless math/index family `footnote`/`stem`/`latexmath`/`asciimath`/`indexterm`/`indexterm2` (`indexterm` deletes its text if left live), each escaped immediately before its name so a name-continuation prefix cannot re-anchor it (`word.image:…`, `9xref:…`) — the raw-HTML `pass:` passthrough macro, which carries the same no-left-boundary rule (`xpass:[<script>…]` is stored XSS) and is likewise escaped immediately before its name across every qualifier form (`pass:[]`/`pass:c[]`/`pass:q[]`/`pass:a[]` and combinations) while the renderer's own generated `pass:c[]` code spans stay live — the parenthesized index terms, the concealed `(((x)))` (which **deletes** its text) and the flow `((x))`, neutralized by encoding every second `(` of a run as `&#40;` so no `((` doublet opens while the exact visible text is preserved — plus attribute references (including `{set:…}`/`{counter:…}`), heading, list (including `-` list markers), comment (`//`), description list (`term::`), page/thematic break (`<<<`/`'''`), block title, open-block delimiter, table delimiter, and related AsciiDoc syntax stay inert. The one inline vocabulary deliberately **not** neutralized is a mid-line inline anchor `[[id]]` or angle-bracket xref `<<id>>` — see "Known Limitations". Authored prose at block-metadata line starts is escaped rather than allowed to activate roles, substitutions, or other metadata. Inline code remains one semantic code span assembled from special-character-only segments and fixed delimiter fragments, so authored backticks cannot close it or enable substitutions. An `<a>` whose only content is an `<img>` renders as an inline linked image (`image:target[alt,link=href]`), never a block macro inside link brackets.
 
 Renderer-owned inline output (strong, emphasis, code, anchors, linked images) is
 appended through the single `append_generated_inline` path in `src/adoc/mod.rs`.
@@ -448,10 +448,10 @@ would be corrupted.
 ### The composed-fragment rule
 
 Both guards above classify **block-line** syntax only. The *inline* half —
-`neutralize_inline_adoc_syntax`'s four scanners: attribute references,
-passthrough macros, inline macros, passthrough delimiters — is closed by
-`InlineBuffer` (`src/adoc/inline.rs`), the single buffer every inline emission
-path writes into. Rendered inline output is carried as a `Spanned`: text plus
+`neutralize_inline_adoc_syntax`'s five scanners: attribute references,
+passthrough macros, inline macros, parenthesized index terms, passthrough
+delimiters — is closed by `InlineBuffer` (`src/adoc/inline.rs`), the single
+buffer every inline emission path writes into. Rendered inline output is carried as a `Spanned`: text plus
 the **origin** of every byte of it, `Authored` (the post's HTML supplied it) or
 `Generated` (the renderer composed it). A rendered fragment is almost never
 uniformly one — an anchor is a generated `target[` prefix, an authored label and
@@ -472,7 +472,7 @@ concretely — a same-journal `link=` value is a pending-link token, and a
 backslash spliced into it makes `validate_pending_links` fail on every namespace
 and drops the post from the archive. Be precise about what it does *not* say:
 it is a guarantee about *where* an escape may land, not about which constructs
-get recognized. Recognition is entirely the four scanners' vocabulary, and a
+get recognized. Recognition is entirely the five scanners' vocabulary, and a
 construct outside it is still missed (see "Known Limitations").
 
 Boundary tracking alone is not enough for that clause, and a review round proved
@@ -978,6 +978,26 @@ Testing limitation (hard-won): because `init_logging` installs a process-global 
   `[[id]]` alone on a line by the block-metadata escape. The adversarial gate
   `adversarial_differential_inline_injection_class_is_closed` includes both
   constructs and asserts exactly the inertness above.
+- Authored inline **formatting and constrained-passthrough** marks are not
+  neutralized, and this is deliberate: they are active but carry none of the
+  threats this renderer defends. The full 2.0.26 inline vocabulary at the
+  renderer's settings splits into exactly two harm classes, and both are closed —
+  **raw HTML** (the `pass:` macro across every qualifier, and the `+++…+++`
+  delimiter) and **text deletion** (`indexterm:`, the concealed `(((…)))`, and an
+  `anchor:`/`[[id]]`'s consumed label). Everything else Asciidoctor still treats
+  as active is neither: the quote marks `*bold*`/`_italic_`/`` `mono` ``/`^sup^`/
+  `~sub~`/`#mark#` and an inline role `[.class]#text#` **format** their content or
+  add a span class (no script, no navigation, no href/src); the constrained
+  passthroughs `+…+`/`++…++`/`$$…$$` **specialchar-escape** their content (so a
+  `<script>` inside becomes inert text) and merely consume their own delimiters;
+  and the replacements `(C)`/`(TM)`/`--`/`…` are cosmetic. All preserve the
+  author's text (no deletion) and cannot inject a fetch, a script, or a
+  `javascript:`/`data:` sink. They are a fidelity residual, not a security one:
+  a literal `*hugs*` renders bold and a ` +x+ ` loses its plus signs. Closing
+  them would need the renderer's own generated formatting (its `*bold*` for
+  `<strong>`, its `` `pass:c[]` `` code spans) kept live by provenance while the
+  authored marks are escaped — a large, benign, separate change, out of scope for
+  the injection-neutralization work.
 - **Bug, not a trade-off:** `render_list` (`src/adoc/mod.rs`) drops every direct
   child of a `ul`/`ol` that is not an `li`. `<ul><div>x</div></ul>` renders as
   the empty string, and `<ul><li>a</li><div>x</div><li>b</li></ul>` renders

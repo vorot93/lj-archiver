@@ -185,7 +185,7 @@ pub(crate) fn render_inline_wrapper_with_label(
 /// target cannot be corrupted no matter what authored text abuts them. It is a
 /// property of *where* the escape may land, not a claim about which constructs
 /// the scanners recognize — a construct whose vocabulary the scanners do not
-/// cover is still missed, and the four scanners are the whole guarantee there.
+/// cover is still missed, and the five scanners are the whole guarantee there.
 ///
 /// The second clause is what keeps an authored run's own already-neutralized
 /// output — and the `pass:[:]` a description-list rewrite leaves inside it —
