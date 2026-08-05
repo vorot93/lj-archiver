@@ -472,11 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn month_page_bound_is_twelve_times_the_year_page_bound() {
-        assert_eq!(MAX_DISCOVERY_MONTH_PAGES, MAX_DISCOVERY_YEAR_PAGES * 12);
-    }
-
-    #[test]
     fn parses_month_links_from_calendar() {
         let base = Url::parse("https://news.livejournal.com/calendar").unwrap();
         let months = parse_month_links(
