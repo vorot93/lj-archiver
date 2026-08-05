@@ -1148,9 +1148,14 @@ mod tests {
         // single draw correct; without asserting it, `calls == 1` would pass
         // just as well if the renderer had stopped emitting the authored text
         // at all.
+        // The forged `…-link:` reaches the generated `[Seven]` and re-anchors as
+        // a live `link:` macro; Asciidoctor's macro regexes carry no left word
+        // boundary, so the neutralizing escape belongs immediately before the
+        // name — `lj-archiver-\link:` — not at the surrounding token boundary,
+        // where it would break byte-equality yet leave the macro live.
         assert!(
             rendered.contents.contains(&format!(
-                "{PENDING_SEPARATOR}\\lj-archiver-link:{COLLIDING_NAMESPACE}:7:0"
+                "{PENDING_SEPARATOR}lj-archiver-\\link:{COLLIDING_NAMESPACE}:7:0"
             )),
             "authored prefix was not neutralized: {:?}",
             rendered.contents
@@ -1171,8 +1176,8 @@ mod tests {
         // retry and the two bodies are the same string, so state the property
         // the check was after directly and namespace-independently: nothing that
         // reads as the opening of a pending token survives resolution. The
-        // escaped authored residue does not, because the escape sits between the
-        // separator and the marker.
+        // escaped authored residue does not, because the escape sits inside the
+        // marker (`lj-archiver-\link:`), so the unescaped opening never appears.
         assert!(
             !resolved.contains(&format!("{PENDING_SEPARATOR}lj-archiver-link:")),
             "a pending-token opening survived resolution: {resolved:?}"

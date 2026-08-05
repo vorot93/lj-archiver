@@ -413,15 +413,10 @@ fn neutralize_inline_macros_scanned(text: &str, scan_steps: &mut MacroScanSteps)
     while cursor < bytes.len() {
         scan_steps.add(1);
 
-        if bytes[cursor].is_ascii_alphabetic() && is_inline_macro_token_boundary(bytes, cursor) {
-            let name_end = inline_macro_name_end(bytes, cursor, scan_steps);
-            scan_steps.add(1);
-
-            if is_inline_macro_at(bytes, cursor, name_end, &bracket_before_whitespace)
-                && !is_immediately_escaped(bytes, cursor)
-            {
-                output.push('\\');
-            }
+        if inline_macro_anchored_at(bytes, cursor, &bracket_before_whitespace, scan_steps)
+            && !is_immediately_escaped(bytes, cursor)
+        {
+            output.push('\\');
         }
 
         let character = text[cursor..]
@@ -433,6 +428,43 @@ fn neutralize_inline_macros_scanned(text: &str, scan_steps: &mut MacroScanSteps)
     }
 
     output
+}
+
+/// True when an inline macro Asciidoctor would fire anchors exactly at `cursor`.
+///
+/// Two sources, deliberately in this order:
+///
+/// * A **builtin** macro anchored here, recognized at any offset because the
+///   macro regexes have no left word boundary. Its escape belongs immediately
+///   before the name, which is `cursor`.
+/// * The **generic** `name:target[…]` over-approximation at a token boundary —
+///   the safe superset that also neutralizes bare URLs (`https:…[x]`) and every
+///   non-builtin `name:` shape — but only where no builtin is its suffix. When a
+///   builtin *is* the suffix, the first source already neutralizes it at the
+///   right offset, and a second escape at the boundary would sit one byte too far
+///   left and leave the macro live.
+fn inline_macro_anchored_at(
+    bytes: &[u8],
+    cursor: usize,
+    bracket_before_whitespace: &[usize],
+    scan_steps: &mut MacroScanSteps,
+) -> bool {
+    if firing_inline_macro_bracket(bytes, cursor, bracket_before_whitespace).is_some() {
+        return true;
+    }
+
+    if bytes[cursor].is_ascii_alphabetic() && is_inline_macro_token_boundary(bytes, cursor) {
+        let name_end = inline_macro_name_end(bytes, cursor, scan_steps);
+        scan_steps.add(1);
+
+        if is_inline_macro_at(bytes, cursor, name_end, bracket_before_whitespace)
+            && !name_run_ends_with_firing_macro(bytes, cursor, name_end)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[derive(Default)]
@@ -522,8 +554,87 @@ fn inline_macro_bracket(
         .filter(|bracket| *bracket < bytes.len())
 }
 
+/// The builtin inline macros Asciidoctor fires with a *target*
+/// (`name:target[label]`). Their regexes carry no left word boundary, so a name
+/// preceded by a letter, digit, `_`, `.` or `-` still fires — `word.image:…[x]`,
+/// `9xref:…[z]` and `a-link:javascript:…[c]` are all live (confirmed on 2.0.26).
+/// The neutralizing escape must sit immediately before the name; one at the
+/// surrounding token boundary is too far left to break recognition.
+const TARGET_INLINE_MACRO_NAMES: [&[u8]; 6] =
+    [b"image", b"icon", b"link", b"xref", b"mailto", b"anchor"];
+
+/// The builtin macros that fire with an immediate `[` and no target, at the
+/// renderer's substitution settings (`asciidoctor --embedded`, no
+/// `-a experimental`). Confirmed on 2.0.26: `footnote`, the math family
+/// (`stem`/`latexmath`/`asciimath`), and both index forms
+/// (`indexterm`/`indexterm2`) all fire — `indexterm:[secret]` *deletes* its
+/// text — while `menu`/`kbd`/`btn` need `:experimental:` and stay inert. `kbd`
+/// and `btn` are kept anyway: neutralizing an already-inert form is harmless and
+/// keeps the vocabulary stable if a future document ever enables experimental.
+const TARGETLESS_INLINE_MACRO_NAMES: [&[u8]; 8] = [
+    b"footnote",
+    b"kbd",
+    b"btn",
+    b"stem",
+    b"latexmath",
+    b"asciimath",
+    b"indexterm",
+    b"indexterm2",
+];
+
 fn is_targetless_builtin_macro(name: &[u8]) -> bool {
-    matches!(name, b"footnote" | b"kbd" | b"btn")
+    TARGETLESS_INLINE_MACRO_NAMES.contains(&name)
+}
+
+/// The `[` opening the attribute list of a *builtin* inline macro anchored
+/// exactly at `start`, or `None` when no builtin macro begins there.
+///
+/// This recognizes the fixed builtin vocabulary at *any* offset — not only at a
+/// token boundary — because Asciidoctor's macro regexes carry no left word
+/// boundary. It is what closes the name-continuation-prefix hole: the escape it
+/// drives lands immediately before the name, where Asciidoctor's own `\\?`
+/// anchor sits, rather than at the token boundary a preceding word pushed it to.
+fn firing_inline_macro_bracket(
+    bytes: &[u8],
+    start: usize,
+    bracket_before_whitespace: &[usize],
+) -> Option<usize> {
+    let name_end = firing_inline_macro_name_end(bytes, start)?;
+
+    // `name::…` is block vocabulary, not an inline macro — a builtin inline
+    // target never starts with `:`, and the line-start guard owns the block form.
+    if bytes.get(name_end + 1) == Some(&b':') {
+        return None;
+    }
+
+    inline_macro_bracket(bytes, start, name_end, bracket_before_whitespace)
+}
+
+/// The offset of the `:` ending a builtin macro name that begins *exactly* at
+/// `start`, or `None`. The name must be immediately followed by `:`, so a longer
+/// name run that merely contains a builtin (`imagex:`) does not match.
+fn firing_inline_macro_name_end(bytes: &[u8], start: usize) -> Option<usize> {
+    TARGET_INLINE_MACRO_NAMES
+        .iter()
+        .chain(TARGETLESS_INLINE_MACRO_NAMES.iter())
+        .find_map(|name| {
+            let name_end = start + name.len();
+            (bytes.get(start..name_end) == Some(*name) && bytes.get(name_end) == Some(&b':'))
+                .then_some(name_end)
+        })
+}
+
+/// True when the token-boundary name run `bytes[start..name_end]` ends with a
+/// builtin macro name. Such a run is neutralized at the builtin's own anchor by
+/// [`firing_inline_macro_bracket`], so the generic boundary escape must stand
+/// aside rather than land one byte too far left and leave the macro live.
+fn name_run_ends_with_firing_macro(bytes: &[u8], start: usize, name_end: usize) -> bool {
+    TARGET_INLINE_MACRO_NAMES
+        .iter()
+        .chain(TARGETLESS_INLINE_MACRO_NAMES.iter())
+        .any(|name| {
+            name_end >= start + name.len() && &bytes[name_end - name.len()..name_end] == *name
+        })
 }
 
 fn is_immediately_escaped(bytes: &[u8], start: usize) -> bool {
@@ -854,6 +965,16 @@ pub(crate) fn sanitize_macro_target(text: &str) -> String {
         match character {
             '[' => output.push_str("%5B"),
             ']' => output.push_str("%5D"),
+            // An authored `{`/`}` would otherwise survive into the target as a
+            // live AsciiDoc attribute reference. The `url` crate leaves both
+            // untouched in a URL fragment or query, so a poisoned href such as
+            // `#{set:lj-archiver-post-link-prefix:javascript:alert(1)//}` reaches
+            // here intact; percent-encoding them makes it inert. The renderer's
+            // own `{lj-archiver-post-link-prefix}` reference is composed outside
+            // this function (`links.rs`, `link_metadata.rs`), so localization is
+            // unaffected.
+            '{' => output.push_str("%7B"),
+            '}' => output.push_str("%7D"),
             '\n' => output.push_str("%0A"),
             '\r' => output.push_str("%0D"),
             '\t' => output.push_str("%09"),
@@ -1288,6 +1409,19 @@ fn composed_inline_macro_escapes(
     let bracket_before_whitespace = bracket_before_whitespace(bytes, &mut scan_steps);
 
     for cursor in 0..bytes.len() {
+        // A builtin macro anchors here regardless of the preceding byte, so its
+        // escape belongs immediately before the name — the fix for a name that
+        // abuts a preceding letter, digit, `_`, `.` or `-`. `record` still
+        // applies the origin and containment gates, so a renderer-generated
+        // `image:`/`xref:` (held by one generated span, or generated outright) is
+        // never rewritten, and an authored builtin one span already neutralized
+        // is not escaped twice.
+        if let Some(bracket) =
+            firing_inline_macro_bracket(bytes, cursor, &bracket_before_whitespace)
+        {
+            record(cursor, bracket + 1);
+        }
+
         if !bytes[cursor].is_ascii_alphabetic() || !is_inline_macro_token_boundary(bytes, cursor) {
             continue;
         }
@@ -1319,6 +1453,15 @@ fn composed_inline_macro_escapes(
         // it (`before` + `xref:166512.adoc[t]`). Escaping at the token boundary
         // would then neither deactivate the macro nor stay invisible.
         if (cursor + 1..name_end).any(|anchor| holds(anchor..bracket + 1)) {
+            continue;
+        }
+
+        // A builtin macro that is the run's suffix is neutralized at its own
+        // anchor by [`firing_inline_macro_bracket`] above, whichever fragments it
+        // spans (`lj-archiver-link:…[Seven]` abutting a generated token). The
+        // token-boundary escape here would sit one byte too far left and leave the
+        // re-anchored macro live, so defer to that anchor.
+        if name_run_ends_with_firing_macro(bytes, cursor, name_end) {
             continue;
         }
 

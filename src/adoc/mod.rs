@@ -2716,17 +2716,37 @@ mod tests {
             html_to_adoc("<p>image:evil.png[] xref:1.adoc[x] {secret}</p>"),
             "\\image:evil.png[] \\xref:1.adoc[x] \\{secret}\n\n"
         );
+        // A builtin whose name abuts a preceding name-continuation byte still
+        // fires (no left word boundary), so the escape must sit before the name.
+        assert_eq!(
+            html_to_adoc("<p>x-image:evil.png[] 9xref:1.adoc[y] a-link:javascript:alert(1)[c]</p>"),
+            "x-\\image:evil.png[] 9\\xref:1.adoc[y] a-\\link:\\javascript:alert(1)[c]\n\n"
+        );
     }
 
     #[test]
     fn neutralizes_targetless_builtin_macros_but_leaves_unknown_forms_unchanged() {
-        let input = "<p>before footnote:[note] kbd:[Ctrl+C] btn:[OK] after extension:[literal]</p>";
+        // The math and index families fire at the renderer's settings (no
+        // `-a experimental`); `indexterm:[…]` even deletes its text. All must be
+        // neutralized. `kbd`/`btn` need experimental and are inert, but are kept
+        // in the vocabulary anyway. A genuinely unknown `extension:[…]` is inert
+        // and stays untouched.
+        let input = concat!(
+            "<p>before footnote:[note] kbd:[Ctrl+C] btn:[OK] stem:[x^2] latexmath:[e^x] ",
+            "asciimath:[sqrt(4)] indexterm:[secret] indexterm2:[shown] after extension:[literal]</p>"
+        );
         let expected = concat!(
-            "before \\footnote:[note] \\kbd:[Ctrl+C] \\btn:[OK] ",
-            "after extension:[literal]\n\n"
+            "before \\footnote:[note] \\kbd:[Ctrl+C] \\btn:[OK] \\stem:[x^2] \\latexmath:[e^x] ",
+            "\\asciimath:[sqrt(4)] \\indexterm:[secret] \\indexterm2:[shown] after extension:[literal]\n\n"
         );
 
         assert_eq!(html_to_adoc(input), expected);
+
+        // The same builtins fire when the name abuts a preceding name byte, too.
+        assert_eq!(
+            html_to_adoc("<p>x-indexterm:[secret] 9stem:[x^2]</p>"),
+            "x-\\indexterm:[secret] 9\\stem:[x^2]\n\n"
+        );
     }
 
     #[test]
@@ -2773,11 +2793,19 @@ mod tests {
         );
     }
 
+    /// Asciidoctor's inline-macro regexes carry no left word boundary, so a
+    /// builtin name that abuts a preceding digit, `.`, `-` or `_` still fires
+    /// (`9image:evil.png[]` is a live image). The escape must therefore sit
+    /// immediately before the name, not at the surrounding token boundary.
     #[test]
-    fn keeps_inline_macro_names_embedded_after_name_bytes_unchanged() {
+    fn neutralizes_inline_macro_names_embedded_after_name_bytes() {
         assert_eq!(
             html_to_adoc("<p>9image:evil.png[]</p>"),
-            "9image:evil.png[]\n\n"
+            "9\\image:evil.png[]\n\n"
+        );
+        assert_eq!(
+            html_to_adoc("<p>word.xref:1.adoc[t]</p>"),
+            "word.\\xref:1.adoc[t]\n\n"
         );
     }
 
