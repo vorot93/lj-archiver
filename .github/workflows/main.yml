@@ -27,7 +27,7 @@ jobs:
       - name: Validate citation metadata
         run: /tmp/lj-archiver-cff-validator/bin/cffconvert --validate
       - run: cargo fmt --all --check -- --config=imports_granularity=Crate
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: cargo-hack
           fallback: none
@@ -41,7 +41,7 @@ jobs:
         run: cargo test -p lj-archiver --lib -- --ignored --test-threads=1
       - name: Test assembled book rendering
         run: cargo test -p lj-archiver --test book_render_smoke -- --ignored --test-threads=1
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: cargo-audit
           fallback: none
