@@ -1,0 +1,586 @@
+use assert_cmd::Command;
+use predicates::prelude::*;
+use std::path::Path;
+use tempfile::tempdir;
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
+};
+
+#[tokio::test]
+async fn cli_reports_a_busy_archive_instead_of_interleaving_an_update() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("out");
+    let archive = lj_archiver::archive::Archive::new(&out, "news");
+    let _guard = archive.acquire_update_lock().unwrap();
+
+    let mut cmd = Command::cargo_bin("lj-archiver").unwrap();
+    cmd.arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(&out)
+        .arg("--no-media")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("another lj-archiver process"));
+
+    assert!(
+        !out.join("posts/166511.adoc").exists(),
+        "a busy archive must not be written"
+    );
+}
+
+#[tokio::test]
+async fn cli_archives_single_post() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("lj-archiver").unwrap();
+    cmd.arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .success();
+
+    let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
+    assert!(post.contains("= Post Title"));
+}
+
+#[tokio::test]
+async fn cli_archives_poster_and_date_from_site_entry() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/post_with_metadata.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("lj-archiver").unwrap();
+    cmd.arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .success();
+
+    let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
+    assert!(post.contains(":lj-poster: livejournal"), "got: {post}");
+    assert!(
+        post.contains(":lj-date: 2025-12-17T16:01:00Z"),
+        "got: {post}"
+    );
+}
+
+#[tokio::test]
+async fn cli_journal_archive_exits_nonzero_when_a_month_page_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/calendar"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<a href="/2024/12/">December 2024</a><a href="/2025/01/">January 2025</a>"#,
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2024/12/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"<a href="/news/166511.html">Good post</a>"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2025/01/"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("lj-archiver").unwrap();
+    cmd.arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg("news")
+        .assert()
+        .failure();
+
+    // The successfully-discovered post is still archived even though the
+    // command as a whole must report failure via its exit status.
+    let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
+    assert!(post.contains("= Post Title"));
+}
+
+#[test]
+fn cli_reports_invalid_bare_id() {
+    let mut cmd = Command::cargo_bin("lj-archiver").unwrap();
+    cmd.arg("@166511")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--journal"));
+}
+
+#[tokio::test]
+async fn cli_archives_correct_output_for_images_mentions_and_author() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/canonical-lj/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/post_output_correctness.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("lj-archiver").unwrap();
+    cmd.arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg(format!("{}/canonical-lj/166511.html", server.uri()))
+        .assert()
+        .success();
+
+    let post = std::fs::read_to_string(dir.path().join("out/posts/166511.adoc")).unwrap();
+
+    // Fix 3: author is the canonical Site.entry.journal, not the request path.
+    // The request spells the journal `canonical-lj` and Site.entry spells it
+    // `canonical_lj`; LiveJournal serves an underscore username at the hyphen
+    // subdomain, so the two alias, which is what lets delivered-post identity
+    // validation accept the page while `:lj-author:` still records the
+    // canonical spelling.
+    assert!(post.contains(":lj-author: canonical_lj"), "author: {post}");
+    // Fix 1b: user mention is the clean linked username; userhead glyph dropped.
+    assert!(
+        post.contains("https://canonical-lj.livejournal.com/[*canonical_lj*]"),
+        "user mention: {post}"
+    );
+    assert!(
+        !post.contains("userinfo_v8.svg"),
+        "userhead not dropped: {post}"
+    );
+    // Fix 1: linked image is an inline image macro with link=, never a block
+    // macro embedded in link brackets.
+    assert!(
+        post.contains("[pic,link=https://ic.pics.livejournal.com/canonical_lj/1/original.jpg]"),
+        "linked image: {post}"
+    );
+    assert!(
+        !post.contains("[image::"),
+        "block image macro in brackets: {post}"
+    );
+    // Fix 2: no dangling trailing hard break before the stripped widget.
+    assert!(post.contains("Trailing text."), "body text: {post}");
+    assert!(!post.contains("Trailing text. +"), "dangling +: {post}");
+    assert!(!post.contains("+\n+"), "double hard break: {post}");
+}
+
+#[tokio::test]
+async fn cli_writes_nothing_when_the_delivered_post_identity_does_not_match() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+            r#"<html><body><article data-journal="other" data-itemid="166511">"#,
+            r#"<div class="entry-content">body</div>"#,
+            r#"</article></body></html>"#,
+        )))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("out");
+    let mut cmd = Command::cargo_bin("lj-archiver").unwrap();
+    cmd.arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(&out)
+        .arg("--no-media")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("post identity mismatch"));
+
+    assert!(
+        !out.join("posts/166511.adoc").exists(),
+        "a mismatched post must not be published"
+    );
+}
+
+#[tokio::test]
+async fn cli_journal_shows_progress_on_stderr() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/calendar"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2024/12/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<a href="/news/166511.html">a</a><a href="/news/166512.html">b</a>"#,
+        ))
+        .mount(&server)
+        .await;
+    // Distinct fixtures whose data-itemid matches each URL (the parser resolves
+    // the id from data-itemid first), so the two posts do not collide.
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/news/166512.html"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/post_with_comments.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    Command::cargo_bin("lj-archiver")
+        .unwrap()
+        .arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg("news")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("discovered 2 posts"))
+        .stderr(predicate::str::contains("archived 166511"))
+        .stderr(predicate::str::contains("done: 2 archived"));
+}
+
+#[tokio::test]
+async fn cli_progress_sanitizes_remote_title_controls_without_changing_archive_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/calendar"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2024/12/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"<a href="/news/1.html">Hostile</a>"#),
+        )
+        .mount(&server)
+        .await;
+    let title = "Safe&#27;]0;owned&#7; text&#x85;&#x202e;spoof&#x2066;x&#x2069;";
+    Mock::given(method("GET"))
+        .and(path("/news/1.html"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            concat!(
+                r#"<article class="lj-post" data-journal="news" data-itemid="1">"#,
+                r#"<h1 class="entry-title">{}</h1>"#,
+                r#"<a class="entry-author" href="https://news.livejournal.com/">news</a>"#,
+                r#"<div class="entry-content"><p>Body.</p></div></article>"#,
+            ),
+            title,
+        )))
+        .mount(&server)
+        .await;
+    let dir = tempdir().unwrap();
+
+    let assert = archive_command(&server, &dir.path().join("out"))
+        .arg("news")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "archived 1  \"Safe]0;owned text…spoofx\"",
+        ));
+    let stderr = assert.get_output().stderr.as_slice();
+    assert!(!stderr.contains(&0x1b));
+    assert!(!stderr.contains(&0x07));
+    assert!(!stderr.windows(3).any(|bytes| bytes == [0xe2, 0x80, 0xae]));
+    let post = std::fs::read(dir.path().join("out/posts/1.adoc")).unwrap();
+    assert!(post.contains(&0x1b));
+    assert!(post.contains(&0x07));
+    assert!(post.windows(3).any(|bytes| bytes == [0xe2, 0x80, 0xae]));
+}
+
+#[tokio::test]
+async fn cli_quiet_suppresses_all_progress() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    Command::cargo_bin("lj-archiver")
+        .unwrap()
+        .arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg("--quiet")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+}
+
+#[tokio::test]
+async fn cli_book_flag_writes_book_adoc() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    Command::cargo_bin("lj-archiver")
+        .unwrap()
+        .arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg("--book")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .success();
+
+    let book = std::fs::read_to_string(dir.path().join("out/book.adoc")).unwrap();
+    assert_eq!(
+        book,
+        "= news Archive\n:doctype: book\n:toc:\n:lj-archiver-book:\n:imagesdir: posts\n:lj-archiver-post-link-prefix: posts/\n\ninclude::index.adoc[leveloffset=+1]\n\ninclude::posts/166511.adoc[leveloffset=+1]\n"
+    );
+}
+
+#[tokio::test]
+async fn cli_without_book_flag_writes_no_book_adoc() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/166511.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(include_str!("fixtures/post_basic.html")),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    Command::cargo_bin("lj-archiver")
+        .unwrap()
+        .arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(dir.path().join("out"))
+        .arg("--no-media")
+        .arg(format!("{}/news/166511.html", server.uri()))
+        .assert()
+        .success();
+
+    assert!(!dir.path().join("out/book.adoc").exists());
+}
+
+#[tokio::test]
+async fn cli_archive_updates_preserve_the_full_manifest_without_a_book() {
+    assert_cross_run_archive_updates(false).await;
+}
+
+#[tokio::test]
+async fn cli_archive_updates_regenerate_a_preexisting_book() {
+    assert_cross_run_archive_updates(true).await;
+}
+
+async fn assert_cross_run_archive_updates(initial_book: bool) {
+    let initial_server = MockServer::start().await;
+    mount_journal(&initial_server, &[(1, "One Original"), (2, "Two Original")]).await;
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("out");
+
+    let mut initial = archive_command(&initial_server, &output);
+    if initial_book {
+        initial.arg("--book");
+    }
+    initial.arg("news").assert().success();
+
+    let post_one = std::fs::read_to_string(output.join("posts/1.adoc")).unwrap();
+    let original_post_two = std::fs::read_to_string(output.join("posts/2.adoc")).unwrap();
+
+    let update_server = MockServer::start().await;
+    mount_post(&update_server, 2, "Two Updated").await;
+    archive_command(&update_server, &output)
+        .arg(format!("{}/news/2.html", update_server.uri()))
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(output.join("posts/1.adoc")).unwrap(),
+        post_one
+    );
+    let updated_post_two = std::fs::read_to_string(output.join("posts/2.adoc")).unwrap();
+    assert_ne!(updated_post_two, original_post_two);
+    assert!(
+        updated_post_two.contains("= Two Updated"),
+        "{updated_post_two}"
+    );
+
+    let addition_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/news/3.html"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(post_html_with_body(
+                3,
+                "Three Added",
+                r#"<p><a href="https://news.livejournal.com/1.html">Post one</a></p>"#,
+            )),
+        )
+        .mount(&addition_server)
+        .await;
+    archive_command(&addition_server, &output)
+        .arg(format!("{}/news/3.html", addition_server.uri()))
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(output.join("posts/1.adoc")).unwrap(),
+        post_one
+    );
+    assert_eq!(
+        std::fs::read_to_string(output.join("posts/2.adoc")).unwrap(),
+        updated_post_two
+    );
+    let post_three = std::fs::read_to_string(output.join("posts/3.adoc")).unwrap();
+    assert!(post_three.contains("= Three Added"), "{post_three}");
+    assert!(post_three.contains("xref:1.adoc[Post one]"), "{post_three}");
+
+    assert_eq!(
+        std::fs::read_to_string(output.join("index.adoc")).unwrap(),
+        concat!(
+            "= news Archive\n\n",
+            "|===\n|Post ID |Title\n\n",
+            "|1 |xref:posts/1.adoc[One Original]\n",
+            "|2 |xref:posts/2.adoc[Two Updated]\n",
+            "|3 |xref:posts/3.adoc[Three Added]\n",
+            "|===\n",
+        )
+    );
+
+    let book_path = output.join("book.adoc");
+    if initial_book {
+        assert_eq!(
+            std::fs::read_to_string(book_path).unwrap(),
+            concat!(
+                "= news Archive\n",
+                ":doctype: book\n",
+                ":toc:\n",
+                ":lj-archiver-book:\n",
+                ":imagesdir: posts\n",
+                ":lj-archiver-post-link-prefix: posts/\n\n",
+                "include::index.adoc[leveloffset=+1]\n",
+                "\ninclude::posts/1.adoc[leveloffset=+1]\n",
+                "\ninclude::posts/2.adoc[leveloffset=+1]\n",
+                "\ninclude::posts/3.adoc[leveloffset=+1]\n",
+            )
+        );
+    } else {
+        assert!(!book_path.exists());
+    }
+}
+
+fn archive_command(server: &MockServer, output: &Path) -> Command {
+    let mut command = Command::cargo_bin("lj-archiver").unwrap();
+    command
+        .arg("--base-url")
+        .arg(server.uri())
+        .arg("--output-dir")
+        .arg(output)
+        .arg("--no-media");
+    command
+}
+
+async fn mount_journal(server: &MockServer, posts: &[(u64, &str)]) {
+    Mock::given(method("GET"))
+        .and(path("/news/calendar"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"<a href="/2024/12/">Dec</a>"#))
+        .mount(server)
+        .await;
+    let links = posts
+        .iter()
+        .map(|(id, title)| format!(r#"<a href="/news/{id}.html">{title}</a>"#))
+        .collect::<String>();
+    Mock::given(method("GET"))
+        .and(path("/2024/12/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(links))
+        .mount(server)
+        .await;
+    for &(id, title) in posts {
+        mount_post(server, id, title).await;
+    }
+}
+
+async fn mount_post(server: &MockServer, id: u64, title: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/news/{id}.html")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(post_html(id, title)))
+        .mount(server)
+        .await;
+}
+
+fn post_html(id: u64, title: &str) -> String {
+    post_html_with_body(id, title, &format!("<p>Body for {title}.</p>"))
+}
+
+fn post_html_with_body(id: u64, title: &str, body: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<article class="lj-post" data-journal="news" data-itemid="{id}">
+  <h1 class="entry-title">{title}</h1>
+  <a class="entry-author" href="https://news.livejournal.com/">news</a>
+  <div class="entry-content">{body}</div>
+</article>"#
+    )
+}

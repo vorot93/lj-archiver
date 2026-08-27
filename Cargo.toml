@@ -1,0 +1,61 @@
+[workspace]
+members = ["gui"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[package]
+name = "lj-archiver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "std",
+] }
+clap = { version = "4", features = ["derive"] }
+ego-tree = "0.11"
+futures = "0.3"
+getrandom = "0.4"
+hex = "0.4"
+html5ever = "0.39"
+indicatif = "0.18"
+reqwest = { version = "0.13", default-features = false, features = [
+    "charset",
+    "cookies",
+    "gzip",
+    "http2",
+    "rustls-no-provider",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+scraper = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "fs",
+    "macros",
+    "rt-multi-thread",
+    "time",
+] }
+tracing = "0.1"
+tracing-indicatif = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+webpki-roots = "1"
+
+[dev-dependencies]
+assert_cmd = "2"
+flate2 = "1"
+predicates = "3"
+wiremock = "0.6"

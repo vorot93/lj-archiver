@@ -1,0 +1,1155 @@
+use crate::{
+    error::{LjError, Result},
+    models::{Comment, Post},
+};
+use chrono::{DateTime, Utc};
+use scraper::{ElementRef, Html, Selector, node::Node};
+use std::{collections::HashSet, sync::LazyLock};
+use url::Url;
+
+static ENTRY_TITLE: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse(".aentry-post__title-text, .entry-title").expect("static selector must parse")
+});
+static DOCUMENT_TITLE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("title").expect("static selector must parse"));
+static ENTRY_DATE: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse("time.entry-date[datetime]").expect("static selector must parse")
+});
+static ENTRY_CONTENT: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse(".aentry-post__text, .entry-content").expect("static selector must parse")
+});
+static COMMENT_LIST: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("#comments .comment").expect("static selector must parse"));
+static COMMENT_CONTENT: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".comment-content").expect("static selector must parse"));
+static COMMENT_AUTHOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".comment-author").expect("static selector must parse"));
+static COMMENT_SUBJECT: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".comment-subject").expect("static selector must parse"));
+static COMMENT_DATE: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse(".comment-date[datetime]").expect("static selector must parse")
+});
+static ARTICLE_WITH_JOURNAL_AND_ITEMID: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse("article[data-journal][data-itemid]").expect("static selector must parse")
+});
+static ARTICLE_WITH_ITEMID: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("article[data-itemid]").expect("static selector must parse"));
+static ARTICLE_WITH_JOURNAL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("article[data-journal]").expect("static selector must parse"));
+static ARTICLE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("article").expect("static selector must parse"));
+static ENTRY_TAGS: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse(".aentry-tags a, .entry-tags a, a[rel=tag]")
+        .expect("static selector must parse")
+});
+static SCRIPT: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("script").expect("static selector must parse"));
+static FORM_WITH_ACTION: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("form[action]").expect("static selector must parse"));
+
+#[derive(serde::Deserialize)]
+struct SiteEntry {
+    #[serde(default)]
+    ditemid: Option<u64>,
+    #[serde(default)]
+    journal: Option<String>,
+    #[serde(default)]
+    poster: Option<String>,
+    #[serde(default)]
+    eventtime: Option<i64>,
+}
+
+/// The `<script>` `type` attribute values (case-insensitive, after trimming
+/// ASCII whitespace) that the HTML classic-script-or-module determination
+/// treats as JavaScript: the JavaScript MIME type essence matches from the
+/// WHATWG MIME Sniffing Standard, plus `module`. An absent or empty `type`
+/// attribute is classic script too but is handled separately, since it is not
+/// a member of this list. Anything else — `application/json`, `importmap`,
+/// `text/template`, ... — is a data block a browser never executes.
+const JAVASCRIPT_SCRIPT_TYPES: &[&str] = &[
+    "text/javascript",
+    "application/javascript",
+    "application/ecmascript",
+    "application/x-ecmascript",
+    "application/x-javascript",
+    "text/ecmascript",
+    "text/javascript1.0",
+    "text/javascript1.1",
+    "text/javascript1.2",
+    "text/javascript1.3",
+    "text/javascript1.4",
+    "text/javascript1.5",
+    "text/jscript",
+    "text/livescript",
+    "text/x-ecmascript",
+    "text/x-javascript",
+    "module",
+];
+
+/// Whether a browser would run `script` as JavaScript: its `type` attribute is
+/// absent, empty, or one of [`JAVASCRIPT_SCRIPT_TYPES`] (ASCII case-insensitive,
+/// trimmed), and it is not nested inside a `<template>` element. A `<template>`'s
+/// content is an inert `DocumentFragment` that is never inserted into the
+/// rendered document, so scripts in it never run even though `scraper`'s
+/// `select` walks into them like any other descendant.
+fn is_executable_script(script: ElementRef<'_>) -> bool {
+    let script_type = script.attr("type").map(str::trim_ascii).unwrap_or("");
+    let is_javascript = script_type.is_empty()
+        || JAVASCRIPT_SCRIPT_TYPES
+            .iter()
+            .any(|candidate| script_type.eq_ignore_ascii_case(candidate));
+
+    is_javascript && !is_inside_template(script)
+}
+
+fn is_inside_template(script: ElementRef<'_>) -> bool {
+    script.ancestors().any(|ancestor| {
+        ancestor
+            .value()
+            .as_element()
+            .is_some_and(|element| element.name() == "template")
+    })
+}
+
+/// Extracts the server-rendered `Site.entry = {…}` JSON object from a post page.
+///
+/// Candidate scripts are narrowed to ones a browser would actually execute
+/// (see [`is_executable_script`]); within those, candidate positions come from
+/// a focused JavaScript lexical scanner, so only an assignment in genuinely
+/// executable code qualifies. The object itself is still deserialized by
+/// `serde_json` and still trusted only when its `ditemid` equals the resolved
+/// post id. A malformed or wrong-id candidate does not stop the scan, so a
+/// later valid assignment is still found.
+fn site_entry(document: &Html, expected_id: u64) -> Option<SiteEntry> {
+    for script in document
+        .select(&SCRIPT)
+        .filter(|script| is_executable_script(*script))
+    {
+        let text = script.text().collect::<String>();
+
+        for object_start in crate::js_scan::site_entry_object_starts(&text) {
+            let entry = serde_json::Deserializer::from_str(&text[object_start..])
+                .into_iter::<SiteEntry>()
+                .next()
+                .and_then(std::result::Result::ok);
+            if entry.as_ref().and_then(|entry| entry.ditemid) == Some(expected_id) {
+                return entry;
+            }
+        }
+    }
+
+    None
+}
+
+fn is_age_gate(document: &Html, page_url: &Url) -> bool {
+    document.select(&FORM_WITH_ACTION).any(|form| {
+        form.attr("action")
+            .and_then(|action| page_url.join(action).ok())
+            .is_some_and(|action| action.path().ends_with("/misc/adult_explicit.bml"))
+    })
+}
+
+pub fn parse_post_page(html: &str, url: &Url) -> Result<Post> {
+    let document = Html::parse_document(html);
+    if is_age_gate(&document, url) {
+        return Err(LjError::AgeGated {
+            url: url.to_string(),
+        });
+    }
+    let article = source_article(&document);
+
+    let id = article
+        .and_then(|article| non_empty_attr(article, "data-itemid"))
+        .map(|id| parse_id(&id))
+        .transpose()
+        .map_err(|_| parse_error(url, "invalid data-itemid"))?
+        .or_else(|| id_from_url(url))
+        .ok_or_else(|| parse_error(url, "missing post id"))?;
+
+    let entry = site_entry(&document, id);
+
+    let journal = entry
+        .as_ref()
+        .and_then(|entry| entry.journal.as_deref())
+        .map(str::trim)
+        .filter(|journal| !journal.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| article.and_then(|article| non_empty_attr(article, "data-journal")))
+        .or_else(|| journal_from_url(url))
+        .ok_or_else(|| parse_error(url, "missing journal"))?;
+
+    let title = article
+        .and_then(|article| first_text_in(article, &ENTRY_TITLE))
+        .or_else(|| first_text(&document, &DOCUMENT_TITLE))
+        .unwrap_or_else(|| format!("LiveJournal post {id}"));
+    let author = journal.clone();
+
+    let poster = entry
+        .as_ref()
+        .and_then(|entry| entry.poster.as_deref())
+        .map(str::trim)
+        .filter(|poster| !poster.is_empty())
+        .map(ToOwned::to_owned);
+
+    let published_at = match entry.as_ref().and_then(|entry| entry.eventtime) {
+        Some(seconds) => DateTime::from_timestamp(seconds, 0),
+        None => article
+            .map(|article| first_datetime_in_result(article, &ENTRY_DATE, url))
+            .transpose()?
+            .flatten(),
+    };
+    let body = match article {
+        Some(article) => article.select(&ENTRY_CONTENT).next(),
+        None => document.select(&ENTRY_CONTENT).next(),
+    }
+    .ok_or_else(|| parse_error(url, "missing post body"))?;
+    let body_html = inner_html(body);
+
+    if body_html.trim().is_empty() {
+        return Err(parse_error(url, "missing post body"));
+    }
+
+    Ok(Post {
+        journal,
+        id,
+        url: url.clone(),
+        title,
+        author,
+        poster,
+        published_at,
+        tags: article.map(tags_in).unwrap_or_else(|| tags(&document)),
+        body_html,
+        comments: comments(&document),
+    })
+}
+
+fn comments(document: &Html) -> Vec<Comment> {
+    document
+        .select(&COMMENT_LIST)
+        .map(|comment| {
+            let body_html = comment
+                .select(&COMMENT_CONTENT)
+                .next()
+                .map(inner_html)
+                .unwrap_or_default();
+            let body_text = comment
+                .select(&COMMENT_CONTENT)
+                .next()
+                .map(text_content)
+                .unwrap_or_default();
+
+            Comment {
+                id: non_empty_attr(comment, "id"),
+                parent_id: non_empty_attr(comment, "data-parent"),
+                depth: non_empty_attr(comment, "data-depth")
+                    .and_then(|depth| depth.parse::<usize>().ok())
+                    .unwrap_or_default(),
+                author: first_text_in(comment, &COMMENT_AUTHOR)
+                    .unwrap_or_else(|| "anonymous".to_string()),
+                subject: first_text_in(comment, &COMMENT_SUBJECT),
+                posted_at: first_datetime_in(comment, &COMMENT_DATE),
+                body_html,
+                deleted: has_class(comment, "deleted")
+                    || is_deleted_comment_placeholder(&body_text),
+            }
+        })
+        .collect()
+}
+
+fn is_deleted_comment_placeholder(text: &str) -> bool {
+    text.split_whitespace().collect::<Vec<_>>().join(" ") == "Deleted comment"
+}
+
+fn source_article(document: &Html) -> Option<ElementRef<'_>> {
+    document
+        .select(&ARTICLE_WITH_JOURNAL_AND_ITEMID)
+        .next()
+        .or_else(|| document.select(&ARTICLE_WITH_ITEMID).next())
+        .or_else(|| document.select(&ARTICLE_WITH_JOURNAL).next())
+        .or_else(|| document.select(&ARTICLE).next())
+}
+
+fn tags(document: &Html) -> Vec<String> {
+    collect_tags(document.select(&ENTRY_TAGS))
+}
+
+fn tags_in(element: ElementRef<'_>) -> Vec<String> {
+    collect_tags(element.select(&ENTRY_TAGS))
+}
+
+fn collect_tags<'a>(elements: impl Iterator<Item = ElementRef<'a>>) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut seen = HashSet::new();
+
+    for tag in elements {
+        let tag = text_content(tag);
+        if !tag.is_empty() && seen.insert(tag.clone()) {
+            tags.push(tag);
+        }
+    }
+
+    tags
+}
+
+fn first_text(document: &Html, selector: &Selector) -> Option<String> {
+    document
+        .select(selector)
+        .map(text_content)
+        .find(|text| !text.is_empty())
+}
+
+fn first_text_in(element: ElementRef<'_>, selector: &Selector) -> Option<String> {
+    element
+        .select(selector)
+        .map(text_content)
+        .find(|text| !text.is_empty())
+}
+
+fn first_datetime_in_result(
+    element: ElementRef<'_>,
+    selector: &Selector,
+    url: &Url,
+) -> Result<Option<DateTime<Utc>>> {
+    match element
+        .select(selector)
+        .find_map(|element| non_empty_attr(element, "datetime"))
+    {
+        Some(value) => parse_datetime(&value)
+            .map(Some)
+            .map_err(|_| parse_error(url, "invalid post datetime")),
+        None => Ok(None),
+    }
+}
+
+fn first_datetime_in(element: ElementRef<'_>, selector: &Selector) -> Option<DateTime<Utc>> {
+    element
+        .select(selector)
+        .find_map(|element| non_empty_attr(element, "datetime"))
+        .and_then(|value| parse_datetime(&value).ok())
+}
+
+fn parse_datetime(value: &str) -> std::result::Result<DateTime<Utc>, chrono::ParseError> {
+    DateTime::parse_from_rfc3339(value).map(|datetime| datetime.with_timezone(&Utc))
+}
+
+fn inner_html(element: ElementRef<'_>) -> String {
+    element
+        .children()
+        .map(|child| match child.value() {
+            Node::Text(text) => escape_html_text(text),
+            Node::Element(_) => ElementRef::wrap(child)
+                .map(|element| element.html())
+                .unwrap_or_default(),
+            _ => String::new(),
+        })
+        .collect()
+}
+
+fn escape_html_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn text_content(element: ElementRef<'_>) -> String {
+    element
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn non_empty_attr(element: ElementRef<'_>, name: &str) -> Option<String> {
+    element
+        .attr(name)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn journal_from_url(url: &Url) -> Option<String> {
+    let host = crate::net::normalized_domain_host(url)?;
+    if host.eq_ignore_ascii_case("users.livejournal.com") {
+        return url
+            .path_segments()?
+            .find(|segment| !segment.is_empty())
+            .map(ToOwned::to_owned);
+    }
+
+    host.strip_suffix(".livejournal.com")
+        .filter(|journal| !journal.is_empty() && *journal != "www")
+        .map(ToOwned::to_owned)
+}
+
+fn id_from_url(url: &Url) -> Option<u64> {
+    let segment = url.path_segments()?.next_back()?;
+    let id = segment.strip_suffix(".html").unwrap_or(segment);
+    parse_id(id).ok()
+}
+
+fn parse_id(value: &str) -> std::result::Result<u64, std::num::ParseIntError> {
+    value.parse::<u64>()
+}
+
+fn has_class(element: ElementRef<'_>, class_name: &str) -> bool {
+    element
+        .attr("class")
+        .is_some_and(|classes| classes.split_whitespace().any(|class| class == class_name))
+}
+
+fn parse_error(url: &Url, reason: impl Into<String>) -> LjError {
+    LjError::Parse {
+        url: url.to_string(),
+        reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_basic_post() {
+        let html = include_str!("../tests/fixtures/post_basic.html");
+        let url = Url::parse("https://news.livejournal.com/166511.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "news");
+        assert_eq!(post.id, 166511);
+        assert_eq!(post.title, "Post Title");
+        assert_eq!(post.author, "news");
+        assert_eq!(post.tags, vec!["updates", "release-notes"]);
+        assert!(post.body_html.contains("<strong>world</strong>"));
+        assert!(post.comments.is_empty());
+        assert!(post.poster.is_none());
+        assert_eq!(
+            post.published_at,
+            Some(
+                DateTime::parse_from_rfc3339("2024-12-17T16:01:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+    }
+
+    #[test]
+    fn parses_real_livejournal_aentry_markup() {
+        // Real LiveJournal post markup (as served at news.livejournal.com/166511.html):
+        // `<article class="aentry-post">` with `.aentry-post__title-text` and
+        // `.aentry-post__text` — not the synthetic `.entry-title`/`.entry-content`.
+        let html = include_str!("../tests/fixtures/post_real.html");
+        let url = Url::parse("https://news.livejournal.com/166511.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "news");
+        assert_eq!(post.id, 166511);
+        assert_eq!(
+            post.title,
+            "Join in and create your own personal calendar for 2026! 🌟🎄📅"
+        );
+        assert_eq!(post.author, "news");
+        assert_eq!(post.poster.as_deref(), Some("livejournal"));
+        assert_eq!(post.published_at, DateTime::from_timestamp(1765987260, 0));
+        assert!(post.body_html.contains("Dear friends"));
+        assert!(post.body_html.contains("create your own calendar"));
+        assert!(post.body_html.contains("aentry-post__figure"));
+        assert_eq!(
+            post.tags,
+            vec!["#mycalendar2026", "christmas", "new year", "photos"]
+        );
+        // Comments are JS-loaded on modern LiveJournal and absent from static
+        // HTML, so they degrade to empty rather than failing the archive.
+        assert!(post.comments.is_empty());
+    }
+
+    #[test]
+    fn parses_threaded_comments() {
+        let html = include_str!("../tests/fixtures/post_with_comments.html");
+        let url = Url::parse("https://news.livejournal.com/166512.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.comments.len(), 3);
+        assert_eq!(post.comments[0].id.as_deref(), Some("t1"));
+        assert_eq!(post.comments[0].depth, 0);
+        assert_eq!(post.comments[1].parent_id.as_deref(), Some("t1"));
+        assert_eq!(post.comments[1].depth, 1);
+        assert!(post.comments[2].deleted);
+    }
+
+    #[test]
+    fn deleted_comment_words_inside_prose_do_not_delete_the_comment() {
+        let html = r#"
+            <article data-journal="news" data-itemid="1">
+              <div class="entry-content">post</div>
+            </article>
+            <section id="comments">
+              <div class="comment" id="t1">
+                <span class="comment-author">alice</span>
+                <div class="comment-content"><p>The Deleted comment label is confusing.</p></div>
+              </div>
+              <div class="comment" id="t2">
+                <span class="comment-author">bob</span>
+                <div class="comment-content"> Deleted
+                    comment </div>
+              </div>
+            </section>
+        "#;
+        let post = parse_post_page(
+            html,
+            &Url::parse("https://news.livejournal.com/1.html").unwrap(),
+        )
+        .unwrap();
+
+        assert!(!post.comments[0].deleted);
+        assert!(post.comments[0].body_html.contains("label is confusing"));
+        assert!(post.comments[1].deleted);
+    }
+
+    #[test]
+    fn preserves_entities_in_post_body_html() {
+        let html = r#"
+            <html>
+                <body>
+                    <article data-journal="news" data-itemid="166512">
+                        <div class="entry-content">A &lt; B &amp; C</div>
+                    </article>
+                </body>
+            </html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/166512.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert!(post.body_html.contains("A &lt; B &amp; C"));
+        assert!(!post.body_html.contains("A < B & C"));
+    }
+
+    #[test]
+    fn preserves_entities_in_comment_body_html() {
+        let html = r#"
+            <html>
+                <body>
+                    <article data-journal="news" data-itemid="166512">
+                        <div class="entry-content"><p>body</p></div>
+                    </article>
+                    <div id="comments">
+                        <div class="comment" id="t1">
+                            <span class="comment-author">reader</span>
+                            <div class="comment-content">A &lt; B &amp; C</div>
+                        </div>
+                    </div>
+                </body>
+            </html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/166512.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.comments.len(), 1);
+        assert!(post.comments[0].body_html.contains("A &lt; B &amp; C"));
+        assert!(!post.comments[0].body_html.contains("A < B & C"));
+    }
+
+    #[test]
+    fn parses_post_from_article_with_source_attrs() {
+        let html = r#"
+            <html>
+                <body>
+                    <article>
+                        <div class="entry-content"><p>wrong</p></div>
+                    </article>
+                    <article data-journal="news" data-itemid="166513">
+                        <div class="entry-content"><p>right</p></div>
+                    </article>
+                </body>
+            </html>
+        "#;
+        let url = Url::parse("https://example.com/post.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "news");
+        assert_eq!(post.id, 166513);
+        assert!(post.body_html.contains("<p>right</p>"));
+        assert!(!post.body_html.contains("<p>wrong</p>"));
+    }
+
+    #[test]
+    fn uses_single_source_article_for_attrs_and_body() {
+        let html = r#"
+            <html>
+                <body>
+                    <article data-journal="wrong">
+                        <div class="entry-content"><p>wrong journal only</p></div>
+                    </article>
+                    <article data-itemid="999">
+                        <div class="entry-content"><p>wrong id only</p></div>
+                    </article>
+                    <article data-journal="news" data-itemid="166514">
+                        <div class="entry-content"><p>right</p></div>
+                    </article>
+                </body>
+            </html>
+        "#;
+        let url = Url::parse("https://example.com/post.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "news");
+        assert_eq!(post.id, 166514);
+        assert!(post.body_html.contains("<p>right</p>"));
+        assert!(!post.body_html.contains("wrong journal only"));
+        assert!(!post.body_html.contains("wrong id only"));
+    }
+
+    #[test]
+    fn uses_selected_article_for_post_metadata() {
+        let html = r#"
+            <html>
+                <head>
+                    <title>Document fallback title</title>
+                </head>
+                <body>
+                    <article>
+                        <h1 class="entry-title">Wrong title</h1>
+                        <span class="entry-author">wrong-author</span>
+                        <time class="entry-date" datetime="2001-01-01T00:00:00Z">old</time>
+                        <a rel="tag">wrong-tag</a>
+                        <div class="entry-content"><p>wrong body</p></div>
+                    </article>
+                    <article data-journal="news" data-itemid="166515">
+                        <h1 class="entry-title">Right title</h1>
+                        <span class="entry-author">right-author</span>
+                        <time class="entry-date" datetime="2026-07-02T12:34:56Z">new</time>
+                        <a rel="tag">alpha</a>
+                        <div class="entry-tags">
+                            <a href="/tags/beta">beta</a>
+                            <a rel="tag">alpha</a>
+                        </div>
+                        <div class="entry-content"><p>right body</p></div>
+                    </article>
+                </body>
+            </html>
+        "#;
+        let url = Url::parse("https://example.com/post.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "news");
+        assert_eq!(post.id, 166515);
+        assert_eq!(post.title, "Right title");
+        assert_eq!(post.author, "news");
+        assert_eq!(
+            post.published_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-07-02T12:34:56Z")
+                    .unwrap()
+                    .into()
+            )
+        );
+        assert_eq!(post.tags, vec!["alpha", "beta"]);
+        assert!(post.body_html.contains("<p>right body</p>"));
+        assert!(!post.body_html.contains("wrong body"));
+    }
+
+    #[test]
+    fn parses_tags_in_document_order_without_duplicates() {
+        let html = r#"
+            <html>
+                <body>
+                    <article data-journal="news" data-itemid="166514">
+                        <a rel="tag">alpha</a>
+                        <div class="entry-tags">
+                            <a href="/tags/beta">beta</a>
+                            <a href="/tags/alpha">alpha</a>
+                        </div>
+                        <a rel="tag">gamma</a>
+                        <div class="entry-tags">
+                            <a href="/tags/delta">delta</a>
+                        </div>
+                        <div class="entry-content"><p>body</p></div>
+                    </article>
+                </body>
+            </html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/166514.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.tags, vec!["alpha", "beta", "gamma", "delta"]);
+    }
+
+    #[test]
+    fn extracts_poster_and_date_from_site_entry() {
+        let html = r#"
+            <html><body>
+                <article data-journal="news" data-itemid="166511">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>
+                Site.entry = {"ditemid":166511,"poster":"livejournal","poster_display_name":"livejournal","journal":"news","eventtime":1765987260};
+                </script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/166511.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.author, "news");
+        assert_eq!(post.poster.as_deref(), Some("livejournal"));
+        assert_eq!(post.published_at, DateTime::from_timestamp(1765987260, 0));
+    }
+
+    #[test]
+    fn body_site_entry_prose_does_not_shadow_real_script_assignment() {
+        let html = r#"
+            <html><body>
+                <article data-journal="news" data-itemid="123">
+                    <div class="entry-content">
+                        <p>Site.entry {"ditemid":999,"poster":"fake"}</p>
+                    </div>
+                </article>
+                <script>
+                Site.entry = {"ditemid":123,"journal":"news","poster":"real_poster","eventtime":1700000000};
+                </script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "news");
+        assert_eq!(post.author, "news");
+        assert_eq!(post.poster.as_deref(), Some("real_poster"));
+        assert_eq!(post.published_at, DateTime::from_timestamp(1700000000, 0));
+    }
+
+    #[test]
+    fn site_entry_scans_past_malformed_and_unrelated_assignments() {
+        let html = r#"
+            <html><body>
+                <article data-journal="fallback" data-itemid="123">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>
+                NotSite.entry = {"ditemid":1,"journal":"wrong","poster":"wrong"};
+                Site.entryExtra = {"ditemid":2,"journal":"wrong","poster":"wrong"};
+                Site.entry = {"ditemid":999,"journal":"wrong_journal","poster":"wrong_poster","eventtime":1};
+                Site.entry = {"ditemid":
+                Site.entry = {"ditemid":123,"journal":"news","poster":"winner","eventtime":1700000000};
+                </script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "news");
+        assert_eq!(post.author, "news");
+        assert_eq!(post.poster.as_deref(), Some("winner"));
+        assert_eq!(post.published_at, DateTime::from_timestamp(1700000000, 0));
+    }
+
+    #[test]
+    fn canonical_journal_is_not_overridden_by_legacy_author() {
+        let html = r#"
+            <html><body>
+                <article data-journal="community" data-itemid="1">
+                    <span class="entry-author">alice</span>
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>
+                Site.entry = {"ditemid":1,"journal":"community","poster":"alice"};
+                </script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://community.livejournal.com/1.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "community");
+        assert_eq!(post.author, "community");
+        assert_eq!(post.poster.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn ignores_site_entry_when_ditemid_mismatches() {
+        let html = r#"
+            <html><body>
+                <article data-journal="news" data-itemid="166511">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>Site.entry = {"ditemid":999999,"poster":"livejournal","eventtime":1765987260};</script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/166511.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert!(post.poster.is_none());
+        assert!(post.published_at.is_none());
+    }
+
+    #[test]
+    fn missing_site_entry_leaves_poster_and_date_absent() {
+        let html = r#"
+            <html><body>
+                <article data-journal="news" data-itemid="166511">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/166511.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert!(post.poster.is_none());
+        assert!(post.published_at.is_none());
+    }
+
+    #[test]
+    fn malformed_site_entry_json_degrades_gracefully() {
+        let html = r#"
+            <html><body>
+                <article data-journal="news" data-itemid="166511">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>Site.entry = {"ditemid":166511,"poster": };</script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/166511.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert!(post.poster.is_none());
+        assert!(post.published_at.is_none());
+    }
+
+    #[test]
+    fn parses_site_entry_with_braces_and_quotes_in_ignored_fields() {
+        let html = r#"
+            <html><body>
+                <article data-journal="news" data-itemid="166511">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>Site.entry = {"ditemid":166511,"title":"weird } title \" ok","poster":"livejournal","eventtime":1765987260};</script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/166511.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.poster.as_deref(), Some("livejournal"));
+        assert_eq!(post.published_at, DateTime::from_timestamp(1765987260, 0));
+    }
+
+    #[test]
+    fn poster_may_equal_journal_for_personal_journals() {
+        let html = r#"
+            <html><body>
+                <article data-journal="alice" data-itemid="500">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>Site.entry = {"ditemid":500,"poster":"alice","eventtime":1700000000};</script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://alice.livejournal.com/500.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.author, "alice");
+        assert_eq!(post.poster.as_deref(), Some("alice"));
+        assert_eq!(post.published_at, DateTime::from_timestamp(1700000000, 0));
+    }
+
+    #[test]
+    fn extracts_site_entry_for_users_livejournal_scheme() {
+        // Underscore journals live at users.livejournal.com/<journal>/<id>.html;
+        // the post id comes from the URL's last path segment.
+        let html = r#"
+            <html><body>
+                <article data-journal="a_b">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+                <script>Site.entry = {"ditemid":500,"poster":"a_b","eventtime":1700000000};</script>
+            </body></html>
+        "#;
+        let url = Url::parse("https://users.livejournal.com/a_b/500.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.id, 500);
+        assert_eq!(post.poster.as_deref(), Some("a_b"));
+        assert_eq!(post.published_at, DateTime::from_timestamp(1700000000, 0));
+    }
+
+    #[test]
+    fn users_host_fallback_uses_first_path_segment() {
+        let html = r#"
+            <html><body>
+                <article data-itemid="123">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://users.livejournal.com/evo_lutio/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "evo_lutio");
+        assert_eq!(post.author, "evo_lutio");
+    }
+
+    #[test]
+    fn dns_trailing_dot_users_host_fallback_uses_first_path_segment() {
+        let html = r#"
+            <html><body>
+                <article data-itemid="123">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://users.livejournal.com./evo_lutio/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "evo_lutio");
+        assert_eq!(post.author, "evo_lutio");
+    }
+
+    #[test]
+    fn resolves_journal_from_site_entry_for_users_scheme() {
+        // Site.entry.journal remains canonical when the article carries no
+        // data-journal on the users.livejournal.com URL scheme.
+        let html = r#"
+            <html><body>
+                <script>Site.entry = {"ditemid":123,"journal":"some_journal","poster":"some_journal"};</script>
+                <article><div class="entry-content"><p>body</p></div></article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://users.livejournal.com/some_journal/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "some_journal");
+        assert_eq!(post.author, "some_journal");
+    }
+
+    #[test]
+    fn prefers_canonical_site_entry_journal_over_subdomain_spelling() {
+        let html = r#"
+            <html><body>
+                <script>Site.entry = {"ditemid":240331,"journal":"evo_lutio","poster":"evo_lutio"};</script>
+                <article><div class="entry-content"><p>body</p></div></article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://evo-lutio.livejournal.com/240331.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "evo_lutio");
+        assert_eq!(post.author, "evo_lutio");
+    }
+
+    #[test]
+    fn ignores_site_entry_journal_when_ditemid_mismatches() {
+        let html = r#"
+            <html><body>
+                <script>Site.entry = {"ditemid":999,"journal":"wrong_journal"};</script>
+                <article data-journal="right_journal" data-itemid="123">
+                    <div class="entry-content"><p>body</p></div>
+                </article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://right-journal.livejournal.com/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.journal, "right_journal");
+    }
+
+    #[test]
+    fn age_gate_marker_in_prose_or_link_does_not_reject_post() {
+        let html = r#"
+            <html><body>
+                <article data-journal="news" data-itemid="123">
+                    <div class="entry-content">
+                        <p>The path /misc/adult_explicit.bml is discussed here.</p>
+                        <a href="/misc/adult_explicit.bml">ordinary link</a>
+                    </div>
+                </article>
+            </body></html>
+        "#;
+        let url = Url::parse("https://news.livejournal.com/123.html").unwrap();
+        let post = parse_post_page(html, &url).unwrap();
+
+        assert_eq!(post.id, 123);
+        assert!(!post.body_html.trim().is_empty());
+    }
+
+    #[test]
+    fn structural_age_gate_form_is_rejected() {
+        let html = include_str!("../tests/fixtures/post_age_gated.html");
+        let url = Url::parse("https://evo-lutio.livejournal.com/47545.html").unwrap();
+        let err = parse_post_page(html, &url).unwrap_err();
+        match err {
+            LjError::AgeGated { url } => {
+                assert_eq!(url, "https://evo-lutio.livejournal.com/47545.html");
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        let relative_form = r#"<form action="/misc/adult_explicit.bml"></form>"#;
+        let err = parse_post_page(relative_form, &url).unwrap_err();
+        match err {
+            LjError::AgeGated { url } => {
+                assert_eq!(url, "https://evo-lutio.livejournal.com/47545.html");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    fn page_with_script(script: &str) -> String {
+        format!(
+            concat!(
+                r#"<html><body><article data-journal="news" data-itemid="7">"#,
+                r#"<div class="entry-content">body</div>"#,
+                r#"</article><script>{}</script></body></html>"#,
+            ),
+            script
+        )
+    }
+
+    fn parsed_poster(script: &str) -> Option<String> {
+        let url = Url::parse("https://news.livejournal.com/7.html").unwrap();
+        parse_post_page(&page_with_script(script), &url)
+            .unwrap()
+            .poster
+    }
+
+    #[test]
+    fn site_entry_is_ignored_in_non_executing_javascript_text() {
+        for script in [
+            r#"// Site.entry = {"ditemid":7,"poster":"ghost"};"#,
+            r#"/* Site.entry = {"ditemid":7,"poster":"ghost"}; */"#,
+            r#"var s = 'Site.entry = {"ditemid":7,"poster":"ghost"}';"#,
+            r#"var s = "Site.entry = {\"ditemid\":7,\"poster\":\"ghost\"}";"#,
+            r#"var s = `Site.entry = {"ditemid":7,"poster":"ghost"}`;"#,
+            r#"var s = `outer ${`inner Site.entry = {"ditemid":7,"poster":"ghost"}`} end`;"#,
+            r#"var r = /Site.entry = \{"ditemid":7,"poster":"ghost"\}/;"#,
+            r#"var r = /[Site.entry = {"ditemid":7,"poster":"ghost"}]/;"#,
+            r#"Other.Site.entry = {"ditemid":7,"poster":"ghost"};"#,
+            r#"window?.Site.entry = {"ditemid":7,"poster":"ghost"};"#,
+            r#"MySite.entry = {"ditemid":7,"poster":"ghost"};"#,
+            r#"Site.entryPoint = {"ditemid":7,"poster":"ghost"};"#,
+            r#"if (Site.entry == {"ditemid":7,"poster":"ghost"}) {}"#,
+            r#"if (Site.entry === {"ditemid":7,"poster":"ghost"}) {}"#,
+            r#"var f = Site.entry => {"ditemid":7,"poster":"ghost"};"#,
+            r#"var o = {"Site.entry = {\"ditemid\":7,\"poster\":\"ghost\"}": 1};"#,
+        ] {
+            assert_eq!(parsed_poster(script), None, "{script}");
+        }
+    }
+
+    #[test]
+    fn site_entry_is_accepted_in_executable_positions() {
+        for script in [
+            r#"Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"Site . entry  =  {"ditemid":7,"poster":"real"};"#,
+            r#"// comment
+Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"var q = a / b; Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"var r = /x/g; Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"var t = `x ${1 + 1} y`; Site.entry = {"ditemid":7,"poster":"real"};"#,
+        ] {
+            assert_eq!(parsed_poster(script), Some("real".to_string()), "{script}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_or_wrong_id_candidate_does_not_stop_the_scan() {
+        for script in [
+            r#"Site.entry = {not json; Site.entry = {"ditemid":7,"poster":"real"};"#,
+            r#"Site.entry = {"ditemid":9,"poster":"other"}; Site.entry = {"ditemid":7,"poster":"real"};"#,
+        ] {
+            assert_eq!(parsed_poster(script), Some("real".to_string()), "{script}");
+        }
+    }
+
+    fn page_with_raw_script_markup(script_markup: &str) -> String {
+        format!(
+            concat!(
+                r#"<html><body><article data-journal="news" data-itemid="7">"#,
+                r#"<div class="entry-content">body</div>"#,
+                r#"</article>{}</body></html>"#,
+            ),
+            script_markup
+        )
+    }
+
+    fn parsed_poster_from_markup(script_markup: &str) -> Option<String> {
+        let url = Url::parse("https://news.livejournal.com/7.html").unwrap();
+        parse_post_page(&page_with_raw_script_markup(script_markup), &url)
+            .unwrap()
+            .poster
+    }
+
+    const EVIL_ENTRY: &str = r#"Site.entry = {"ditemid":7,"poster":"evil"};"#;
+    const REAL_ENTRY: &str = r#"Site.entry = {"ditemid":7,"poster":"real"};"#;
+
+    #[test]
+    fn ignores_scripts_a_browser_would_never_execute_as_javascript() {
+        for markup in [
+            // A non-JavaScript MIME type: the browser treats this as an inert
+            // data block and never runs it.
+            format!(r#"<script type="application/json">{EVIL_ENTRY}</script>"#),
+            // Not a JavaScript MIME type either, despite the "script"-ish name.
+            format!(r#"<script type="text/template">{EVIL_ENTRY}</script>"#),
+            // An import map is parsed as JSON configuration, not executed.
+            format!(r#"<script type="importmap">{EVIL_ENTRY}</script>"#),
+            // Case/whitespace variants of a non-JavaScript type still reject.
+            format!(r#"<script type=" APPLICATION/JSON ">{EVIL_ENTRY}</script>"#),
+            // A leading non-breaking space (U+00A0) is Unicode whitespace but
+            // *not* ASCII whitespace. The HTML spec strips only ASCII
+            // whitespace from `type`, so the browser sees the non-JavaScript
+            // essence `"\u{a0}text/javascript"` and never runs it.
+            format!("<script type=\"\u{a0}text/javascript\">{EVIL_ENTRY}</script>"),
+            // `<template>` content is an inert DocumentFragment, never part of
+            // the rendered document, so a script inside one never runs — even
+            // though scraper's `select` walks into it like any other element.
+            format!(r#"<template><script>{EVIL_ENTRY}</script></template>"#),
+            // Nested templates: still inert at any depth.
+            format!(
+                r#"<template><div><template><script>{EVIL_ENTRY}</script></template></div></template>"#
+            ),
+        ] {
+            assert_eq!(parsed_poster_from_markup(&markup), None, "{markup}");
+        }
+    }
+
+    #[test]
+    fn accepts_scripts_a_browser_would_execute_as_javascript() {
+        for markup in [
+            // No `type` attribute: the classic-script default.
+            format!(r#"<script>{REAL_ENTRY}</script>"#),
+            // Empty `type`: also the classic-script default.
+            format!(r#"<script type="">{REAL_ENTRY}</script>"#),
+            // A JavaScript MIME type, whitespace- and case-varied.
+            format!(r#"<script type=" TEXT/JAVASCRIPT ">{REAL_ENTRY}</script>"#),
+            format!(r#"<script type="application/ecmascript">{REAL_ENTRY}</script>"#),
+            // `module` scripts execute too (deferred, strict mode, but a plain
+            // property assignment like `Site.entry = {{...}}` behaves the same).
+            format!(r#"<script type="module">{REAL_ENTRY}</script>"#),
+            format!(r#"<script type="MODULE">{REAL_ENTRY}</script>"#),
+        ] {
+            assert_eq!(
+                parsed_poster_from_markup(&markup),
+                Some("real".to_string()),
+                "{markup}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_script_element_survives_inside_rendered_post_content() {
+        // A plain classic script positioned inside the post body still
+        // executes in a real browser exactly as one in page chrome would —
+        // DOM position doesn't gate script execution, only `type` and
+        // `<template>`/`<noscript>` nesting do. This is not a residual gap in
+        // the type/template fix above: excluding scripts by *where* they sit
+        // in the document would be a different, broader restriction than "is
+        // this browser-executable JavaScript", and isn't what was asked for.
+        let markup = format!(r#"<div class="entry-content"><script>{EVIL_ENTRY}</script></div>"#);
+        assert_eq!(parsed_poster_from_markup(&markup), Some("evil".to_string()));
+    }
+
+    #[test]
+    fn noscript_wrapped_script_is_still_ignored() {
+        // Pre-existing, unaffected by this fix: with scripting considered
+        // enabled (the default HTML parsing mode used here), `<noscript>`
+        // content is raw text, not a parsed `<script>` element.
+        let markup = format!(r#"<noscript><script>{EVIL_ENTRY}</script></noscript>"#);
+        assert_eq!(parsed_poster_from_markup(&markup), None);
+    }
+}

@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Install CFF validator
+        run: |
+          python3 -m venv /tmp/lj-archiver-cff-validator
+          /tmp/lj-archiver-cff-validator/bin/pip install cffconvert==2.0.0
+      - name: Validate citation metadata
+        run: /tmp/lj-archiver-cff-validator/bin/cffconvert --validate
+      - run: cargo fmt --all --check -- --config=imports_granularity=Crate
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-hack
+          fallback: none
+      - run: cargo hack clippy -p lj-archiver --each-feature --all-targets -- -D warnings
+      - run: cargo hack test -p lj-archiver --each-feature
+      - name: Install Asciidoctor
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes asciidoctor
+      - name: Test renderer semantics with Asciidoctor
+        run: cargo test -p lj-archiver --lib -- --ignored --test-threads=1
+      - name: Test assembled book rendering
+        run: cargo test -p lj-archiver --test book_render_smoke -- --ignored --test-threads=1
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-audit
+          fallback: none
+      - run: cargo audit
+
+  gui:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy -p lj-archiver-gui --all-targets -- -D warnings
+      - run: cargo test -p lj-archiver-gui
+      - run: cargo build -p lj-archiver-gui
+
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - run: cargo test -p lj-archiver storage::tests
+      - run: cargo test -p lj-archiver archive::tests
+      - run: cargo test -p lj-archiver media::tests::concurrent_rewrites_share_one_final_asset_without_temporary_files
+      - run: cargo test -p lj-archiver media::tests::portable_

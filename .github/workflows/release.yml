@@ -1,0 +1,215 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - name: Validate exact version tag and commit provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lj-archiver") | .version')"
+          test -n "$version"
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF_NAME" = "v$version"
+          tag_commit="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          test "$tag_commit" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/master
+
+  gates:
+    needs: validate
+    uses: ./.github/workflows/main.yml
+    permissions:
+      contents: read
+
+  package:
+    needs: gates
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            formats: deb,appimage
+            artifact: installers-linux
+          - os: macos-latest
+            formats: dmg
+            artifact: installers-macos
+          - os: windows-latest
+            formats: nsis,wix
+            artifact: installers-windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - name: Install AppImage runtime dependencies
+        if: runner.os == 'Linux'
+        # ubuntu-latest (24.04) renamed libfuse2 -> libfuse2t64; try both.
+        run: sudo apt-get update && (sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64)
+
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-packager
+          fallback: none
+
+      - name: Build GUI
+        run: cargo build --release -p lj-archiver-gui
+
+      - name: Package installers
+        run: cargo packager --release -p lj-archiver-gui --formats ${{ matrix.formats }}
+
+      - name: Select the exact platform artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir dist
+          case "$RUNNER_OS" in
+            Linux)
+              deb=(target/release/*.deb)
+              appimage=(target/release/*.AppImage)
+              test "${#deb[@]}" -eq 1
+              test "${#appimage[@]}" -eq 1
+              installers=("${deb[0]}" "${appimage[0]}")
+              ;;
+            macOS)
+              dmg=(target/release/*.dmg)
+              test "${#dmg[@]}" -eq 1
+              installers=("${dmg[0]}")
+              ;;
+            Windows)
+              setup=(target/release/*-setup.exe)
+              msi=(target/release/*.msi)
+              test "${#setup[@]}" -eq 1
+              test "${#msi[@]}" -eq 1
+              installers=("${setup[0]}" "${msi[0]}")
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+          cp "${installers[@]}" dist/
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq "${#installers[@]}"
+
+      - name: Upload exact platform installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Download all platform installers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: dist
+      - name: Validate the complete release artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          all=(dist/*)
+          deb=(dist/*.deb)
+          appimage=(dist/*.AppImage)
+          dmg=(dist/*.dmg)
+          setup=(dist/*-setup.exe)
+          msi=(dist/*.msi)
+          test "${#all[@]}" -eq 5
+          test "${#deb[@]}" -eq 1
+          test "${#appimage[@]}" -eq 1
+          test "${#dmg[@]}" -eq 1
+          test "${#setup[@]}" -eq 1
+          test "${#msi[@]}" -eq 1
+          expected=("${deb[@]}" "${appimage[@]}" "${dmg[@]}" "${setup[@]}" "${msi[@]}")
+          test "${#expected[@]}" -eq "${#all[@]}"
+          for artifact in "${all[@]}"; do
+            printf '%s\n' "${expected[@]}" | grep -Fqx -- "$artifact"
+          done
+      - name: Publish one immutable complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_object="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq '[.object.type, .object.sha] | @tsv')"
+          IFS=$'\t' read -r tag_type tag_sha <<< "$tag_object"
+          test -n "$tag_type"
+          test -n "$tag_sha"
+          seen_tag_shas=" "
+          for peel_depth in 1 2 3 4 5 6 7 8; do
+            if test "$tag_type" = commit; then
+              break
+            fi
+            test "$tag_type" = tag
+            case "$seen_tag_shas" in
+              *" $tag_sha "*) echo "release tag peel cycle" >&2; exit 1 ;;
+            esac
+            seen_tag_shas="$seen_tag_shas$tag_sha "
+            tag_object="$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq '[.object.type, .object.sha] | @tsv')"
+            IFS=$'\t' read -r tag_type tag_sha <<< "$tag_object"
+            test -n "$tag_type"
+            test -n "$tag_sha"
+          done
+          test "$tag_type" = commit
+          test "$tag_sha" = "$GITHUB_SHA"
+          master_object="$(gh api "repos/$GH_REPO/git/ref/heads/master" --jq '[.object.type, .object.sha] | @tsv')"
+          IFS=$'\t' read -r master_type master_sha <<< "$master_object"
+          test "$master_type" = commit
+          printf '%s' "$master_sha" | grep -Eqx '[0-9a-f]{40}'
+          # Unpaginated compare: GitHub guarantees the last entry of .commits is
+          # the true head of the whole comparison here. That guarantee only
+          # holds without per_page/page, so this call must never add --paginate.
+          comparison="$(gh api "repos/$GH_REPO/compare/$GITHUB_SHA...$master_sha" --jq '[.status, .base_commit.sha, .merge_base_commit.sha, (.commits | length), (.commits | last | .sha // "")] | @tsv')"
+          IFS=$'\t' read -r compare_status base_sha merge_base_sha commit_count head_sha <<< "$comparison"
+          test "$base_sha" = "$GITHUB_SHA"
+          test "$merge_base_sha" = "$GITHUB_SHA"
+          case "$compare_status" in
+            identical)
+              test "$commit_count" -eq 0
+              test "$master_sha" = "$GITHUB_SHA"
+              ;;
+            ahead)
+              test "$commit_count" -ge 1
+              test "$head_sha" = "$master_sha"
+              ;;
+            *)
+              echo "release commit is not currently an ancestor of master (status: $compare_status)" >&2
+              exit 1
+              ;;
+          esac
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release already exists" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
